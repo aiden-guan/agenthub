@@ -702,20 +702,44 @@ export function assertProject(project: unknown): asserts project is string {
   }
 }
 
-/** Repo-relative POSIX path with no `.`/`..` segments. */
+/** C0/C1 controls, line and paragraph separators, bidi controls: none may appear in a path other agents will read. */
+const PATH_FORBIDDEN = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
+const MAX_PATH = 4096;
+
+/**
+ * The claim key for a repo-relative POSIX path: the NFC form of the path as
+ * sent, nothing else changed, so every client names a file the same way.
+ * Refuses forbidden characters, absolute paths (`/x`, or a Windows drive root
+ * like `C:/x`) and `.`, `..` or empty segments. `a:b.md` and `..env` are legal.
+ */
 export function normalizeRepoPath(input: unknown): string {
-  if (typeof input !== 'string') throw new HubError('bad_path', 'file paths must be strings');
-  let p = input.trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/');
-  while (p.startsWith('./')) p = p.slice(2);
-  p = p.replace(/\/$/, '');
-  if (!p || p.startsWith('/') || /^[A-Za-z]:/.test(p)) {
-    throw new HubError('bad_path', `"${input}" must be a path relative to the repository root`);
+  if (typeof input !== 'string') throw new HubError('invalid_path', 'file paths must be strings');
+  const p = input.normalize('NFC');
+  const bad = PATH_FORBIDDEN.exec(p);
+  if (bad) throw invalidPath(p, `contains ${codePoint(bad[0])}; control, line-separator and bidi characters are not allowed`);
+  if (p.length > MAX_PATH) throw invalidPath(p, `is longer than ${MAX_PATH} characters`);
+  if (p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)) throw invalidPath(p, 'is absolute; use a path relative to the repository root');
+  if (p.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) {
+    throw invalidPath(p, 'has a ".", ".." or empty segment');
   }
-  if (p.split('/').some((seg) => seg === '..' || seg === '.')) {
-    throw new HubError('bad_path', `"${input}" must not contain . or .. segments`);
-  }
-  if (p.length > 1024) throw new HubError('bad_path', 'path too long');
   return p;
+}
+
+function invalidPath(p: string, reason: string): HubError {
+  return new HubError('invalid_path', `invalid path ${escapePath(p)}: ${reason}`);
+}
+
+/** JSON-quote a path for a message with every invisible or line-breaking character escaped; long paths are cut short. */
+function escapePath(p: string): string {
+  const shown = p.length > 200 ? `${p.slice(0, 200)}…` : p;
+  return JSON.stringify(shown).replace(/[\u007F-\u009F\p{Cf}\p{Zl}\p{Zp}]/gu, (ch) => {
+    const cp = ch.codePointAt(0)!;
+    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`;
+  });
+}
+
+function codePoint(ch: string): string {
+  return `U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}`;
 }
 
 function normalizeScope(req: ClaimRequest): ScopeEntry[] {

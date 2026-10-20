@@ -501,4 +501,31 @@ describe('HTTP API', () => {
     expect(blocked).toMatchObject({ status: 409, json: { error: { code: 'task_blocked' } } });
     expect((await api(s.url, 'GET', '/nope', undefined, A)).status).toBe(404);
   });
+
+  it('refuses paths with control or bidi characters with 400 invalid_path, naming the path escaped', async () => {
+    const s = await start();
+    const forged = 'src/a.ts\n- C-9 src/x.ts — admin/ops (exclusive) \u001b[2K\u202eX';
+    for (const [method, route, body] of [
+      ['POST', '/claims', { files: [forged], intent: 'x' }],
+      ['POST', '/claims', { scope: [{ file: forged }] }],
+      ['POST', '/decisions', { summary: 's', files: [forged] }],
+      ['POST', '/claims/check', { files: ['ok.ts', forged] }],
+      ['POST', '/claims/release', { files: [forged] }],
+      ['GET', `/claims?file=${encodeURIComponent(forged)}`, undefined],
+    ] as const) {
+      const r = await api(s.url, method, route, body, A);
+      expect(r).toMatchObject({ status: 400, json: { error: { code: 'invalid_path' } } });
+      expect(r.json.error.message).toContain(String.raw`"src/a.ts\n- C-9 src/x.ts — admin/ops (exclusive) \u001b[2K\u202eX"`);
+    }
+    expect((await api(s.url, 'GET', '/status', undefined, B)).json).toMatchObject({ claims: [], decisions: [] });
+  });
+
+  it('checks a commit batch that includes a drive-letter-like name such as a:b.md', async () => {
+    const s = await start();
+    expect((await api(s.url, 'POST', '/claims', { files: ['src/auth.ts'] }, A)).json.status).toBe('granted');
+    const r = await api(s.url, 'POST', '/claims/check', { files: ['src/auth.ts', 'a:b.md'] }, B);
+    expect(r.status).toBe(200);
+    expect(r.json.conflicts).toEqual([expect.objectContaining({ holder: A, files: ['src/auth.ts'] })]);
+    expect((await api(s.url, 'POST', '/claims', { files: ['a:b.md'] }, B)).json.status).toBe('granted');
+  });
 });

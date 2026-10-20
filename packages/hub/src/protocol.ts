@@ -9,6 +9,11 @@ export type ClaimStatus = 'active' | 'queued' | 'released' | 'expired';
 
 /** One entry of a claim's scope. Phase 1 compares files only; `symbol` is stored for Phase 3. */
 export interface ScopeEntry {
+  /**
+   * Repo-relative POSIX path, stored and compared in NFC form. The hub answers
+   * 400 `invalid_path` for control, line-separator or bidi characters, an
+   * absolute path, or a `.`, `..` or empty segment.
+   */
   file: string;
   symbol?: string;
 }
