@@ -2,6 +2,8 @@ import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { HubClient } from '../src/client.js';
+import { deriveProject } from '../src/git.js';
 import { init } from '../src/init.js';
 import {
   A,
@@ -366,6 +368,79 @@ describe('hub hook pre-edit: a file in a submodule of the worktree', () => {
     expect(await hook('settle', r.wtA, sessionEventInput(r.wtA, 'Stop', 'sess-maya'))).toEqual(quiet);
     const held = (await client(ctx.hub.url, A).status()).claims.map((c) => c.scope[0].file);
     expect(held).toEqual(['vendor/lib/x.ts']);
+  });
+});
+
+describe("hub hook pre-edit: a file in another repository than the session's (an --add-dir dependency, dotfiles)", () => {
+  const ctx = sandbox();
+  // README setup, with the team hub given by HUB_URL as scripts/demo.sh does.
+  const env = (wt: string, extra: Record<string, string | undefined> = {}) => testEnv({ CLAUDE_PROJECT_DIR: wt, HUB_URL: ctx.hub.url, ...extra });
+  const edit = (wt: string, file: string, extra: Record<string, string | undefined> = {}, cwd = wt) =>
+    hubCli(['hook', 'pre-edit'], { cwd, env: env(wt, extra), input: preToolUseInput(cwd, file) });
+  const quiet = { code: 0, stdout: '', stderr: '' };
+  const repoAt = (dir: string) => path.join(ctx.r.dir, dir);
+  const claimsIn = async (project: string) =>
+    (await new HubClient({ url: ctx.hub.url, project, agent: A, token: null, timeoutMs: 3000 }).status()).claims;
+
+  beforeAll(() => {
+    const { r } = ctx;
+    init({ cwd: r.main, project: PROJECT, url: ctx.hub.url, hooks: false, mcp: false, guard: false, env: {} });
+    git(r.main, 'add', '-A');
+    git(r.main, 'commit', '-q', '-m', 'agenthub setup');
+    for (const [wt, agent] of [[r.wtA, A], [r.wtB, B]]) {
+      git(wt, 'merge', '-q', '--ff-only', 'main');
+      init({ cwd: wt, agent, hooks: false, mcp: false, guard: false, env: {} });
+    }
+    // Each person's own clone of a library nobody set up for agenthub.
+    git(r.dir, 'init', '-q', '-b', 'main', repoAt('upstream-lib'));
+    writeFileSync(path.join(repoAt('upstream-lib'), 'util.ts'), 'export const x = 1;\n');
+    git(repoAt('upstream-lib'), 'add', '-A');
+    git(repoAt('upstream-lib'), 'commit', '-q', '-m', 'lib');
+    for (const clone of ['maya-lib', 'sam-lib']) git(r.dir, 'clone', '-q', repoAt('upstream-lib'), repoAt(clone));
+    // A clone of some other team's agenthub project, where this person never ran `hub init --agent`.
+    git(r.dir, 'init', '-q', '-b', 'main', repoAt('other'));
+    writeFileSync(path.join(repoAt('other'), 'agenthub.json'), JSON.stringify({ project: 'other' }));
+    writeFileSync(path.join(repoAt('other'), 'x.ts'), 'export {};\n');
+    git(repoAt('other'), 'add', '-A');
+    git(repoAt('other'), 'commit', '-q', '-m', 'other');
+  });
+
+  it('leaves files in a repository nobody set up for agenthub alone: no claim, no warning, no denial', async () => {
+    const { r } = ctx;
+    const derived = deriveProject(repoAt('maya-lib'))!;
+    expect(await edit(r.wtA, path.join(repoAt('maya-lib'), 'util.ts'))).toEqual(quiet);
+    expect(await edit(r.wtB, path.join(repoAt('sam-lib'), 'util.ts'))).toEqual(quiet);
+    expect(await edit(r.wtA, path.join(repoAt('maya-lib'), 'util.ts'), {}, repoAt('maya-lib'))).toEqual(quiet); // Claude cd-ed there
+    const down = { HUB_URL: 'http://127.0.0.1:9', HUB_FAIL_CLOSED: '1' };
+    expect(await edit(r.wtB, path.join(repoAt('sam-lib'), 'util.ts'), down)).toEqual(quiet);
+    expect(await claimsIn(derived)).toEqual([]);
+    // The session's own files are still coordinated.
+    expect((await edit(r.wtA, path.join(r.wtA, 'src', 'auth.ts'))).stdout).toBe('');
+    expect(denyReasonOf((await edit(r.wtB, path.join(r.wtB, 'src', 'auth.ts'))).stdout)).toMatch(/^src\/auth\.ts is claimed by maya\/claude-1/);
+  });
+
+  it("does not lend the session's identity to a checkout of another repository", async () => {
+    const { r } = ctx;
+    expectVisibleWarning((await edit(r.wtA, path.join(repoAt('other'), 'x.ts'))).stdout, /no agent identity/);
+    expect(await claimsIn('other')).toEqual([]);
+  });
+});
+
+describe('hub hook pre-edit: a session whose repository has no agenthub settings (HUB_* variables only)', () => {
+  const ctx = sandbox();
+  const env = (agent: string, wt: string) => testEnv({ CLAUDE_PROJECT_DIR: wt, HUB_URL: ctx.hub.url, HUB_PROJECT: PROJECT, HUB_AGENT: agent });
+  const edit = (agent: string, wt: string, file: string) => hubCli(['hook', 'pre-edit'], { cwd: wt, env: env(agent, wt), input: preToolUseInput(wt, file) });
+
+  it('coordinates its files, those of a repository nested in its worktree included, by their path in the worktree', async () => {
+    const { r } = ctx;
+    for (const wt of [r.wtA, r.wtB]) {
+      mkdirSync(path.join(wt, 'vendor', 'lib'), { recursive: true });
+      git(path.join(wt, 'vendor', 'lib'), 'init', '-q');
+    }
+    expect((await edit(A, r.wtA, path.join(r.wtA, 'vendor', 'lib', 'x.ts'))).stdout).toBe('');
+    expect(denyReasonOf((await edit(B, r.wtB, path.join(r.wtB, 'vendor', 'lib', 'x.ts'))).stdout)).toMatch(/^vendor\/lib\/x\.ts is claimed by maya\/claude-1/);
+    expect((await edit(A, r.wtA, path.join(r.wtA, 'src', 'auth.ts'))).stdout).toBe('');
+    expect(denyReasonOf((await edit(B, r.wtB, path.join(r.wtB, 'src', 'auth.ts'))).stdout)).toMatch(/^src\/auth\.ts is claimed by maya\/claude-1/);
   });
 });
 

@@ -71,6 +71,19 @@ function cwdFor(input: Record<string, any>, io: HookIO): string {
   return typeof input.cwd === 'string' && input.cwd ? input.cwd : io.cwd;
 }
 
+/** Where the session runs: Claude Code's project dir, which (unlike cwd) never follows `cd`. */
+function sessionDir(input: Record<string, any>, io: HookIO): string {
+  return io.env.CLAUDE_PROJECT_DIR || cwdFor(input, io);
+}
+
+const commonDirOf = (root: string): string => realish(gitCommonDir(root) ?? root);
+
+/** The git directory shared by every worktree of the repository `dir` is in. */
+function repositoryOf(dir: string): string | null {
+  const root = findRepoRoot(dir);
+  return root ? commonDirOf(root) : null;
+}
+
 /**
  * The checkout whose claims cover the files in `dir`: the nearest repository
  * around it that has agenthub settings. A submodule, or another repository
@@ -78,17 +91,20 @@ function cwdFor(input: Record<string, any>, io: HookIO): string {
  * of the worktree around it (`vendor/lib/x.ts`), on the team's hub. A worktree
  * inside another worktree of the same repository (as Claude Code makes under
  * .claude/worktrees) is a checkout of its own. With no settings anywhere
- * around: the nearest repository.
+ * around (HUB_* variables only), the same for the session's own repository;
+ * null for any other (an added dependency, dotfiles): nobody coordinates it.
  */
-function claimRoot(dir: string): string | null {
+function claimRoot(dir: string, session: string): string | null {
   const nearest = findRepoRoot(dir);
-  const common = (root: string) => realish(gitCommonDir(root) ?? root);
+  const sessionRepo = repositoryOf(session);
   let checkout = nearest; // innermost root of the repository `root` belongs to
+  let own: string | null = null;
   for (let root = nearest; root; root = findRepoRoot(path.dirname(root))) {
-    if (root !== checkout && common(root) !== common(checkout!)) checkout = root;
+    if (root !== checkout && commonDirOf(root) !== commonDirOf(checkout!)) checkout = root;
     if (hasOwnSettings(root)) return checkout;
+    if (!own && commonDirOf(root) === sessionRepo) own = checkout;
   }
-  return nearest;
+  return own;
 }
 
 /**
@@ -96,8 +112,8 @@ function claimRoot(dir: string): string | null {
  * files themselves: Claude's cwd follows `cd` (into a nested repository,
  * another worktree, an added directory), so it can't say which checkout a file
  * is in. Null when nothing needs a claim: no path, a file outside any
- * repository or inside `.git`, or one git ignores (each worktree has its own
- * copy, so it can never conflict).
+ * coordinated repository or inside `.git`, or one git ignores (each worktree
+ * has its own copy, so it can never conflict).
  */
 function editTarget(input: Record<string, any>, io: HookIO): { root: string; files: string[] } | null {
   const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
@@ -105,7 +121,7 @@ function editTarget(input: Record<string, any>, io: HookIO): { root: string; fil
   if (rawPaths.length === 0) return null;
   const cwd = cwdFor(input, io);
   const abs = rawPaths.map((p) => path.resolve(cwd, p));
-  const root = claimRoot(path.dirname(abs[0]));
+  const root = claimRoot(path.dirname(abs[0]), sessionDir(input, io));
   if (!root) return null;
   const inRepo = [...new Set(abs.map((p) => toRepoPath(p, root, root)).filter((p): p is string => p !== null))];
   const files = inRepo.filter((f) => !isIgnored(root, f));
@@ -115,13 +131,16 @@ function editTarget(input: Record<string, any>, io: HookIO): { root: string; fil
 /**
  * Config for edits in the checkout at `root`. A checkout with no identity of
  * its own (a worktree Claude Code created under .claude/worktrees has no
- * .hub.json) takes the session's: from its project dir, else its cwd.
+ * .hub.json) takes the session's, from its project dir, else its cwd, when
+ * that is in the same repository: an identity is never lent to another
+ * project's checkout, or sent to its hub.
  */
 function configFor(root: string, input: Record<string, any>, io: HookIO): HubConfig {
   const cfg = loadConfig({ cwd: root, env: io.env });
   if (cfg.agent) return cfg;
+  const repo = repositoryOf(root);
   for (const dir of [io.env.CLAUDE_PROJECT_DIR, cwdFor(input, io)]) {
-    if (!dir) continue;
+    if (!dir || repositoryOf(dir) !== repo) continue;
     let session: HubConfig;
     try {
       session = loadConfig({ cwd: dir, env: io.env });
@@ -267,7 +286,7 @@ export async function postEditHook(io: HookIO): Promise<HookOutcome> {
   if (!input || !ids?.tool) return ALLOW;
   const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
   const file = [toolInput.file_path, toolInput.notebook_path].find((p): p is string => typeof p === 'string' && p.length > 0);
-  const root = file ? claimRoot(path.dirname(path.resolve(cwdFor(input, io), file))) : null;
+  const root = file ? claimRoot(path.dirname(path.resolve(cwdFor(input, io), file)), sessionDir(input, io)) : null;
   const store = root ? PendingClaims.open(root) : null;
   if (!store) return ALLOW;
   const thread = store.list(ids.session).filter((e) => e.thread === ids.thread);
@@ -290,7 +309,7 @@ export async function settleHook(io: HookIO): Promise<HookOutcome> {
   const wholeSession = input.hook_event_name === 'SessionEnd';
   const seen = new Set<string>();
   for (const dir of [io.env.CLAUDE_PROJECT_DIR, cwdFor(input, io)]) {
-    const root = dir ? claimRoot(dir) : null;
+    const root = dir ? claimRoot(dir, sessionDir(input, io)) : null;
     const store = root ? PendingClaims.open(root) : null;
     if (!store || seen.has(store.dir)) continue;
     seen.add(store.dir);
