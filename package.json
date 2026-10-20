@@ -1,0 +1,26 @@
+{
+  "name": "agenthub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Coordination hub for several people running AI coding agents on one codebase (Phase 1: hub + adapter with enforced file-level leases).",
+  "type": "module",
+  "workspaces": [
+    "packages/hub",
+    "packages/adapter"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "npm run build -w @agenthub/hub -w @agenthub/adapter",
+    "test": "npm run build && vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p packages/hub --noEmit && tsc -p packages/adapter --noEmit",
+    "demo": "bash scripts/demo.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.5"
+  }
+}

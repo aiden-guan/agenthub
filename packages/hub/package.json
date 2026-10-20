@@ -1,0 +1,37 @@
+{
+  "name": "@agenthub/hub",
+  "version": "0.1.0",
+  "description": "Coordination hub: presence, tasks, leases (claims), messages and an append-only decision log, over HTTP + WebSocket.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "default": "./dist/protocol.js"
+    }
+  },
+  "bin": {
+    "hub-server": "bin/hub-server.js"
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/ws": "^8.18.2"
+  }
+}
