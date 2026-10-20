@@ -65,7 +65,10 @@ export function init(opts: InitOptions): string[] {
     const settingsPath = path.join(root, '.claude', 'settings.json');
     const settings = readJson(settingsPath);
     const hooks = (settings.hooks ??= {});
-    let changed = addHook(hooks, 'PreToolUse', PRE_EDIT_MATCHER, `${command} hook pre-edit`);
+    // The hook fails open by itself only when the hub is unreachable. If it can't
+    // run at all (`hub` or node missing, a crash, its timeout), Claude Code must
+    // block the edit rather than let it through uncoordinated.
+    let changed = addHook(hooks, 'PreToolUse', PRE_EDIT_MATCHER, `${command} hook pre-edit`, 'block');
     changed = addHook(hooks, 'SessionStart', undefined, `${command} hook digest`) || changed;
     if (opts.mcp !== false) {
       const enabled: string[] = (settings.enabledMcpjsonServers ??= []);
@@ -119,16 +122,40 @@ export function init(opts: InitOptions): string[] {
 }
 
 export function guardScript(command: string): string {
+  const shown = command.replace(/["'`$\\]/g, '');
   return `#!/bin/sh
 ${GUARD_MARKER} (installed by \`hub init\`)
 # Rejects commits that touch files another agent holds an exclusive claim on.
 # Bypass in an emergency: git commit --no-verify   or   HUB_GUARD=off git commit
+
+# Exit 127: the CLI (or the node it runs on) could not start, so nothing has read
+# the fail-closed setting. Same precedence as the CLI: HUB_FAIL_CLOSED, then
+# failClosed in the global, team and local config files (later files win).
+fail_closed() {
+  case "$(printf '%s' "$HUB_FAIL_CLOSED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+    '') ;;
+    0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+  fc=1
+  for f in "\${HUB_CONFIG:-\${XDG_CONFIG_HOME:-$HOME/.config}/agenthub/config.json}" ${TEAM_CONFIG_FILE_NAME} ${CONFIG_FILE_NAME}; do
+    [ -f "$f" ] || continue
+    grep -Eq '"failClosed"[[:space:]]*:[[:space:]]*true' "$f" && fc=0
+    grep -Eq '"failClosed"[[:space:]]*:[[:space:]]*false' "$f" && fc=1
+  done
+  return "$fc"
+}
+
 ${command} guard
 status=$?
-if [ "$status" -eq 127 ]; then
-  echo "agenthub: '${command.replace(/["'`$\\]/g, '')}' not found on PATH; claim guard skipped" >&2
-  status=0
+if [ "$status" -eq 127 ] && [ "$HUB_GUARD" != off ]; then
+  if fail_closed; then
+    echo "agenthub: could not run '${shown}' (not on PATH, or node is missing); commit blocked (fail-closed)" >&2
+    exit 1
+  fi
+  echo "agenthub: could not run '${shown}' (not on PATH, or node is missing); claim guard skipped" >&2
 fi
+[ "$status" -eq 127 ] && status=0
 [ "$status" -ne 0 ] && exit "$status"
 chained="$(dirname "$0")/${CHAINED_HOOK}"
 if [ -x "$chained" ]; then
@@ -138,12 +165,21 @@ exit 0
 `;
 }
 
-type HookGroup = { matcher?: string; hooks: Array<{ type: string; command: string; timeout?: number }> };
+type HookEntry = { type: string; command: string; timeout?: number; onFailure?: 'block' | 'continue' };
+type HookGroup = { matcher?: string; hooks: HookEntry[] };
 
-function addHook(hooks: Record<string, HookGroup[]>, event: string, matcher: string | undefined, command: string): boolean {
+/** Add the hook unless it's there; an entry from an older `hub init` gets the `onFailure` it lacks (an explicit choice is kept). */
+function addHook(hooks: Record<string, HookGroup[]>, event: string, matcher: string | undefined, command: string, onFailure?: 'block'): boolean {
   const groups = (hooks[event] ??= []);
-  if (groups.some((g) => g.hooks?.some((h) => h.command === command))) return false;
-  const group: HookGroup = { hooks: [{ type: 'command', command, timeout: 30 }] };
+  const existing = groups.flatMap((g) => g.hooks ?? []).find((h) => h.command === command);
+  if (existing) {
+    if (!onFailure || existing.onFailure !== undefined) return false;
+    existing.onFailure = onFailure;
+    return true;
+  }
+  const entry: HookEntry = { type: 'command', command, timeout: 30 };
+  if (onFailure) entry.onFailure = onFailure;
+  const group: HookGroup = { hooks: [entry] };
   if (matcher) group.matcher = matcher;
   groups.push(group);
   return true;

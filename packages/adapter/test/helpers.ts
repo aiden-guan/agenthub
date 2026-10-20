@@ -1,5 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -57,13 +59,41 @@ export function hubCli(args: string[], opts: { cwd: string; env: NodeJS.ProcessE
   return run(process.execPath, [CLI, ...args], opts);
 }
 
-export async function startHub(opts: { leaseTtlMs?: number; sweepIntervalMs?: number } = {}): Promise<RunningServer> {
+export async function startHub(opts: { leaseTtlMs?: number; sweepIntervalMs?: number; token?: string } = {}): Promise<RunningServer> {
   const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: opts.leaseTtlMs });
-  return startServer({ hub, port: 0, sweepIntervalMs: opts.sweepIntervalMs });
+  return startServer({ hub, port: 0, sweepIntervalMs: opts.sweepIntervalMs, token: opts.token });
 }
 
-export function client(url: string, agent: string | null): HubClient {
-  return new HubClient({ url, project: PROJECT, agent, token: null, timeoutMs: 3000 });
+export function client(url: string, agent: string | null, token: string | null = null): HubClient {
+  return new HubClient({ url, project: PROJECT, agent, token, timeoutMs: 3000 });
+}
+
+export interface FakeHub {
+  url: string;
+  close(): Promise<void>;
+}
+
+/** A stand-in for a hub that misbehaves: answers with whatever `handler` does (or never answers). */
+export async function fakeHub(handler: (req: IncomingMessage, res: ServerResponse) => void): Promise<FakeHub> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    close: () =>
+      new Promise((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/** A fake hub that answers every request with this status and the standard error envelope. */
+export function failingHub(status: number, code: string, message: string): Promise<FakeHub> {
+  return fakeHub((req, res) => {
+    req.resume();
+    res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { code, message } }));
+  });
 }
 
 export function git(cwd: string, ...args: string[]): string {

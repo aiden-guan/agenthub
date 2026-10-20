@@ -72,20 +72,28 @@ export function toRepoPath(file: string, root: string, cwd: string): string | nu
   return posix;
 }
 
-/** Paths in the index that differ from HEAD, including both sides of renames and deleted files. */
+/**
+ * Paths in the index that differ from HEAD, including deleted files and both
+ * sides of renames (without rename detection a rename is a deletion plus an
+ * addition, and skipping it keeps big move-and-edit commits fast). Throws when
+ * git fails, so a failure never reads as "nothing staged".
+ */
 export function stagedPaths(root: string): string[] {
-  const out = gitRaw(root, ['diff', '--cached', '--name-status', '-z', '-M']);
-  if (!out) return [];
-  const parts = out.split('\0').filter((s) => s.length > 0);
-  const files = new Set<string>();
-  for (let i = 0; i < parts.length; ) {
-    const status = parts[i++];
-    // Renames and copies list the old path and then the new one.
-    const count = status.startsWith('R') || status.startsWith('C') ? 2 : 1;
-    for (const p of parts.slice(i, i + count)) files.add(p);
-    i += count;
+  let out: string;
+  try {
+    out = execFileSync('git', ['diff', '--cached', '--name-only', '-z', '--no-renames'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 256 * 1024 * 1024,
+      timeout: 120_000,
+    });
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { stderr?: string };
+    const reason = e.code === 'ETIMEDOUT' ? 'no answer within 120 s' : String(e.stderr ?? '').trim().split('\n')[0] || e.message;
+    throw new Error(`git diff --cached failed: ${reason}`);
   }
-  return [...files];
+  return [...new Set(out.split('\0').filter((s) => s.length > 0))];
 }
 
 /** A stable project id shared by every worktree: `owner/repo` from origin, else the main checkout's folder name. */

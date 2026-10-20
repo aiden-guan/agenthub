@@ -1,7 +1,8 @@
+import { rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { A, B, PROJECT, client, hubCli, makeRepo, preToolUseInput, startHub, testEnv, type SampleRepo } from './helpers.js';
+import { A, B, PROJECT, client, fakeHub, failingHub, hubCli, makeRepo, preToolUseInput, startHub, testEnv, type SampleRepo } from './helpers.js';
 
 let srv: RunningServer;
 let repo: SampleRepo;
@@ -20,6 +21,19 @@ const envFor = (agent: string | undefined, extra: Record<string, string | undefi
 
 const preEdit = (agent: string | undefined, worktree: string, file: string, opts: { tool?: string; extra?: Record<string, string | undefined> } = {}) =>
   hubCli(['hook', 'pre-edit'], { cwd: worktree, env: envFor(agent, opts.extra), input: preToolUseInput(worktree, file, opts.tool) });
+
+const denyReasonOf = (stdout: string): string => {
+  const out = JSON.parse(stdout).hookSpecificOutput;
+  expect(out.permissionDecision).toBe('deny');
+  return out.permissionDecisionReason;
+};
+
+/** Fail-open output: a warning for the user (systemMessage) and for Claude (additionalContext), and no decision. */
+const expectVisibleWarning = (stdout: string, pattern: RegExp) => {
+  const out = JSON.parse(stdout);
+  expect(out.systemMessage).toMatch(pattern);
+  expect(out.hookSpecificOutput).toEqual({ hookEventName: 'PreToolUse', additionalContext: out.systemMessage });
+};
 
 describe('hub hook pre-edit', () => {
   it('prints nothing and exits 0 when the claim is granted', async () => {
@@ -82,8 +96,8 @@ describe('hub hook pre-edit', () => {
     const down = { HUB_URL: 'http://127.0.0.1:9', HUB_TIMEOUT_MS: '1000' };
     const open = await preEdit(B, repo.wtB, path.join(repo.wtB, 'README.md'), { extra: down });
     expect(open.code).toBe(0);
-    expect(open.stdout).toBe('');
     expect(open.stderr).toMatch(/unreachable.*edit allowed without a claim/);
+    expectVisibleWarning(open.stdout, /unreachable.*edit allowed without a claim/);
 
     const closed = await preEdit(B, repo.wtB, path.join(repo.wtB, 'README.md'), { extra: { ...down, HUB_FAIL_CLOSED: '1' } });
     const out = JSON.parse(closed.stdout).hookSpecificOutput;
@@ -91,12 +105,81 @@ describe('hub hook pre-edit', () => {
     expect(out.permissionDecisionReason).toMatch(/unreachable/);
   });
 
-  it('does not coordinate (and says so on stderr) when no agent identity is configured', async () => {
+  it('does not coordinate when no agent identity is configured, and says so where the user and Claude see it', async () => {
     const res = await preEdit(undefined, repo.wtB, path.join(repo.wtB, 'src', 'auth.ts'));
     expect(res.code).toBe(0);
-    expect(res.stdout).toBe('');
     expect(res.stderr).toMatch(/no agent identity/);
+    expectVisibleWarning(res.stdout, /no agent identity/);
   });
+
+  it('denies the edit when the hub answers with a 4xx refusal, and fails open (visibly) only on a 5xx', async () => {
+    const refusing = await failingHub(400, 'invalid_path', 'path "src/a\\u0007.ts" has control characters');
+    const broken = await failingHub(500, 'internal', 'database is locked');
+    try {
+      const refused = await preEdit(B, repo.wtB, path.join(repo.wtB, 'README.md'), { extra: { HUB_URL: refusing.url } });
+      expect(refused.code).toBe(0);
+      expect(denyReasonOf(refused.stdout)).toMatch(/^Edit blocked: hub at http:\/\/127\.0\.0\.1:\d+ refused the request \(HTTP 400 invalid_path: path 'src\/a\\u0007\.ts' has control characters\)/);
+
+      const failing = await preEdit(B, repo.wtB, path.join(repo.wtB, 'README.md'), { extra: { HUB_URL: broken.url } });
+      expect(failing.code).toBe(0);
+      expectVisibleWarning(failing.stdout, /HTTP 500 internal: database is locked.*edit allowed without a claim/);
+      const closed = await preEdit(B, repo.wtB, path.join(repo.wtB, 'README.md'), { extra: { HUB_URL: broken.url, HUB_FAIL_CLOSED: '1' } });
+      expect(denyReasonOf(closed.stdout)).toMatch(/HTTP 500.*HUB_FAIL_CLOSED/);
+    } finally {
+      await refusing.close();
+      await broken.close();
+    }
+  });
+
+  it('denies the edit, naming the token, when the hub rejects the credentials (401)', async () => {
+    const secured = await startHub({ token: 's3cret' });
+    try {
+      await client(secured.url, A, 's3cret').claim({ files: ['src/auth.ts'], intent: 'Migrate login to OAuth2' });
+      const edit = (token: string | undefined) =>
+        preEdit(B, repo.wtB, path.join(repo.wtB, 'src', 'auth.ts'), { extra: { HUB_URL: secured.url, HUB_TOKEN: token } });
+      expect(denyReasonOf((await edit('s3cret')).stdout)).toMatch(/is claimed by maya\/claude-1/);
+      for (const token of [undefined, 'wrong']) {
+        const res = await edit(token);
+        expect(res.code).toBe(0);
+        expect(denyReasonOf(res.stdout)).toMatch(/^Edit blocked: hub at .* rejected this agent's credentials \(HTTP 401 unauthorized: missing or wrong bearer token\); set HUB_TOKEN/);
+      }
+    } finally {
+      await secured.close();
+    }
+  });
+
+  it('denies edits inside the repo while the config is broken (even without HUB_FAIL_CLOSED), but not files outside it', async () => {
+    const teamFile = path.join(repo.wtB, 'agenthub.json');
+    writeFileSync(teamFile, '<<<<<<< HEAD\n{"project":"demo"}\n=======\n{"project":"other"}\n>>>>>>> main\n');
+    try {
+      const res = await preEdit(B, repo.wtB, path.join(repo.wtB, 'src', 'users.ts'));
+      expect(res.code).toBe(0);
+      expect(denyReasonOf(res.stdout)).toMatch(/^Edit blocked: agenthub configuration error \(.*agenthub\.json is not valid JSON\)/);
+      expect(await preEdit(B, repo.wtB, path.join(repo.dir, 'scratch.txt'))).toEqual({ code: 0, stdout: '', stderr: '' });
+    } finally {
+      rmSync(teamFile);
+    }
+  });
+
+  it('treats an out-of-range HUB_TIMEOUT_MS as a config error, not as an unreachable hub', async () => {
+    // maya holds src/auth.ts (first test); the hub is up and would deny sam.
+    for (const bad of ['-1', '2500.5', '1e10']) {
+      const res = await preEdit(B, repo.wtB, path.join(repo.wtB, 'src', 'auth.ts'), { extra: { HUB_TIMEOUT_MS: bad } });
+      expect(denyReasonOf(res.stdout), bad).toMatch(/configuration error.*HUB_TIMEOUT_MS/);
+    }
+  });
+
+  it('answers well inside the 30 s Claude Code hook timeout even when HUB_TIMEOUT_MS is longer', async () => {
+    const silent = await fakeHub(() => {}); // accepts the request, never answers
+    try {
+      const started = Date.now();
+      const res = await preEdit(B, repo.wtB, path.join(repo.wtB, 'README.md'), { extra: { HUB_URL: silent.url, HUB_TIMEOUT_MS: '60000' } });
+      expect(Date.now() - started).toBeLessThan(15_000);
+      expectVisibleWarning(res.stdout, /no answer within 10000 ms.*edit allowed without a claim/);
+    } finally {
+      await silent.close();
+    }
+  }, 30_000);
 });
 
 describe('hub hook digest', () => {
@@ -131,5 +214,18 @@ describe('hub hook digest', () => {
     const res = await hubCli(['hook', 'digest'], { cwd: repo.wtB, env: envFor(B, { HUB_URL: 'http://127.0.0.1:9', HUB_TIMEOUT_MS: '1000' }), input: '{}' });
     expect(res.code).toBe(0);
     expect(JSON.parse(res.stdout).hookSpecificOutput.additionalContext).toMatch(/hub is unavailable.*not being coordinated/);
+  });
+
+  it('says the hub rejected the agent, not that it is unavailable, on a 401, and warns the user too', async () => {
+    const secured = await startHub({ token: 's3cret' });
+    try {
+      const res = await hubCli(['hook', 'digest'], { cwd: repo.wtB, env: envFor(B, { HUB_URL: secured.url }), input: '{}' });
+      expect(res.code).toBe(0);
+      const out = JSON.parse(res.stdout);
+      expect(out.hookSpecificOutput.additionalContext).toMatch(/rejected this agent's credentials.*HTTP 401.*Edits in this checkout are blocked until this is fixed/);
+      expect(out.systemMessage).toBe(out.hookSpecificOutput.additionalContext);
+    } finally {
+      await secured.close();
+    }
   });
 });

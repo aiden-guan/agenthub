@@ -1,13 +1,20 @@
-import { HubClient } from './client.js';
+import type { CheckResult } from '@agenthub/hub/protocol';
+import { HubClient, classifyFailure } from './client.js';
 import { loadConfig, type HubConfig } from './config.js';
 import { inline, minutesLeft } from './format.js';
 import { stagedPaths } from './git.js';
 import type { HookOutcome } from './hooks.js';
 
+const BYPASS = 'Emergency bypass: git commit --no-verify, or HUB_GUARD=off.';
+const blocked = (msg: string): HookOutcome => ({ stdout: '', stderr: `hub guard: ${msg}\n`, exitCode: 1 });
+
 /**
  * `hub guard` — git pre-commit hook. Rejects the commit when a staged file
  * (added, modified, deleted or renamed) is exclusively claimed by another
  * agent. Shared claims don't block. Works for agents without edit hooks.
+ * Only an unreachable (or broken, 5xx) hub lets the commit through unchecked,
+ * with a warning, unless fail-closed is configured. A refusal, an auth error,
+ * a config error or a git failure blocks it.
  */
 export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv }): Promise<HookOutcome> {
   if (io.env.HUB_GUARD === 'off') return { stdout: '', stderr: '', exitCode: 0 };
@@ -15,19 +22,25 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv }): Promis
   try {
     cfg = loadConfig({ cwd: io.cwd, env: io.env });
   } catch (err) {
-    return { stdout: '', stderr: `hub guard: ${(err as Error).message}\n`, exitCode: 1 };
+    return blocked((err as Error).message);
   }
   if (!cfg.root) return { stdout: '', stderr: '', exitCode: 0 };
-  const files = stagedPaths(cfg.root);
+  let files: string[];
+  try {
+    files = stagedPaths(cfg.root);
+  } catch (err) {
+    return blocked(`could not list the staged files (${(err as Error).message}); commit blocked. ${BYPASS}`);
+  }
   if (files.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
 
-  let res;
+  let res: CheckResult;
   try {
     res = await new HubClient(cfg).check(files);
   } catch (err) {
-    const msg = (err as Error).message;
-    if (cfg.failClosed) return { stdout: '', stderr: `hub guard: ${msg}; commit blocked (HUB_FAIL_CLOSED)\n`, exitCode: 1 };
-    return { stdout: '', stderr: `hub guard: ${msg}; claims not checked\n`, exitCode: 0 };
+    const failure = classifyFailure(err, cfg.url);
+    if (failure.kind !== 'unreachable') return blocked(`${failure.message}; commit blocked. ${BYPASS}`);
+    if (cfg.failClosed) return blocked(`${failure.message}; commit blocked (HUB_FAIL_CLOSED)`);
+    return { stdout: '', stderr: `hub guard: ${failure.message}; claims not checked\n`, exitCode: 0 };
   }
   if (res.conflicts.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
 
@@ -39,7 +52,7 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv }): Promis
   }
   lines.push(
     'Unstage them (git restore --staged <file>), coordinate with the holder (hub_post), or wait for the claim to be released (hub_wait).',
-    'Emergency bypass: git commit --no-verify, or HUB_GUARD=off.',
+    BYPASS,
   );
   return { stdout: '', stderr: `${lines.join('\n')}\n`, exitCode: 1 };
 }

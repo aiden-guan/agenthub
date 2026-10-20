@@ -9,6 +9,8 @@ export const CONFIG_FILE_NAME = '.hub.json';
 /** Committed with the repo so every clone and worktree agrees: project id and hub URL. */
 export const TEAM_CONFIG_FILE_NAME = 'agenthub.json';
 export const AGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+export const DEFAULT_TIMEOUT_MS = 4000;
+const TIMEOUT_RANGE_MS = [100, 600_000] as const;
 
 /** Contents of `.hub.json`, `agenthub.json` or the global config file. */
 export interface ConfigFile {
@@ -18,6 +20,7 @@ export interface ConfigFile {
   token?: string;
   failClosed?: boolean;
 }
+const STRING_KEYS = ['url', 'agent', 'project', 'token'] as const;
 
 export interface HubConfig {
   url: string;
@@ -39,7 +42,10 @@ export interface HubConfig {
  * $HUB_CONFIG), then the committed `<worktree>/agenthub.json`, then the local
  * `<worktree>/.hub.json`, then environment variables HUB_URL, HUB_AGENT,
  * HUB_PROJECT, HUB_TOKEN, HUB_FAIL_CLOSED, HUB_TIMEOUT_MS. A token in the
- * committed file is ignored.
+ * committed file is ignored. Throws on a value it can't read exactly (a
+ * malformed file, a wrong type, an unrecognised HUB_FAIL_CLOSED, an
+ * out-of-range HUB_TIMEOUT_MS): the hooks and guard block on that instead of
+ * running with a setting nobody asked for.
  */
 export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): HubConfig {
   const env = opts.env ?? process.env;
@@ -60,13 +66,15 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
   if (agent && !AGENT_ID_RE.test(agent)) {
     throw new Error(`agent id "${agent}" is invalid; use human/agent, e.g. maya/claude-2`);
   }
+  const url = (env.HUB_URL || file.url || DEFAULT_URL).replace(/\/+$/, '');
+  if (!/^https?:\/\/[^/]/.test(url) || !URL.canParse(url)) throw new Error(`hub URL ${JSON.stringify(url)} is invalid; use http://host:port`);
   return {
-    url: (env.HUB_URL || file.url || DEFAULT_URL).replace(/\/+$/, ''),
+    url,
     agent,
     project: env.HUB_PROJECT || file.project || (root ? deriveProject(root) : null) || 'default',
     token: env.HUB_TOKEN || file.token || null,
-    failClosed: parseBool(env.HUB_FAIL_CLOSED) ?? file.failClosed ?? false,
-    timeoutMs: Number(env.HUB_TIMEOUT_MS) || 4000,
+    failClosed: parseBool('HUB_FAIL_CLOSED', env.HUB_FAIL_CLOSED) ?? file.failClosed ?? false,
+    timeoutMs: parseTimeout(env.HUB_TIMEOUT_MS),
     root,
     configFiles: sources.filter(([, f]) => f !== null).map(([p]) => p),
   };
@@ -85,15 +93,37 @@ export function readConfigFile(file: string): ConfigFile | null {
   } catch {
     return null;
   }
+  let value: Record<string, unknown>;
   try {
-    const value = JSON.parse(text);
-    return value && typeof value === 'object' ? (value as ConfigFile) : null;
+    value = JSON.parse(text);
   } catch {
     throw new Error(`${file} is not valid JSON`);
   }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${file} must contain a JSON object`);
+  for (const key of STRING_KEYS) {
+    if (value[key] !== undefined && typeof value[key] !== 'string') throw new Error(`${file}: "${key}" must be a string`);
+  }
+  if (value.failClosed !== undefined && typeof value.failClosed !== 'boolean') throw new Error(`${file}: "failClosed" must be true or false`);
+  return value as ConfigFile;
 }
 
-function parseBool(v: string | undefined): boolean | undefined {
-  if (v === undefined || v === '') return undefined;
-  return ['1', 'true', 'yes', 'on'].includes(v.toLowerCase());
+/** Unset or empty: undefined (fall through to the files). Anything unrecognised is an error, never a silent "off". */
+function parseBool(name: string, v: string | undefined): boolean | undefined {
+  const s = v?.trim().toLowerCase();
+  if (!s) return undefined;
+  if (['1', 'true', 'yes', 'on'].includes(s)) return true;
+  if (['0', 'false', 'no', 'off'].includes(s)) return false;
+  throw new Error(`${name}=${JSON.stringify(v)} is not understood; use 1 or 0`);
+}
+
+/** A whole number of milliseconds in range; anything else would make every request fail before it reaches the hub. */
+function parseTimeout(v: string | undefined): number {
+  const s = v?.trim();
+  if (!s) return DEFAULT_TIMEOUT_MS;
+  const [min, max] = TIMEOUT_RANGE_MS;
+  const n = Number(s);
+  if (!/^\d+$/.test(s) || n < min || n > max) {
+    throw new Error(`HUB_TIMEOUT_MS=${JSON.stringify(v)} must be a whole number of milliseconds from ${min} to ${max}`);
+  }
+  return n;
 }
