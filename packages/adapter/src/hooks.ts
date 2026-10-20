@@ -1,9 +1,9 @@
 import path from 'node:path';
 import type { ClaimResult } from '@agenthub/hub/protocol';
 import { HubClient, classifyFailure } from './client.js';
-import { loadConfig, type HubConfig } from './config.js';
+import { hasOwnSettings, loadConfig, type HubConfig } from './config.js';
 import { denyReason, digestText, inline } from './format.js';
-import { currentBranch, findRepoRoot, headCommit, isIgnored, toRepoPath } from './git.js';
+import { currentBranch, findRepoRoot, gitCommonDir, headCommit, isIgnored, realish, toRepoPath } from './git.js';
 import { PendingClaims, type StoredClaim } from './pending.js';
 
 export interface HookIO {
@@ -72,6 +72,26 @@ function cwdFor(input: Record<string, any>, io: HookIO): string {
 }
 
 /**
+ * The checkout whose claims cover the files in `dir`: the nearest repository
+ * around it that has agenthub settings. A submodule, or another repository
+ * nested in a worktree, has none of its own, so its files are claimed as files
+ * of the worktree around it (`vendor/lib/x.ts`), on the team's hub. A worktree
+ * inside another worktree of the same repository (as Claude Code makes under
+ * .claude/worktrees) is a checkout of its own. With no settings anywhere
+ * around: the nearest repository.
+ */
+function claimRoot(dir: string): string | null {
+  const nearest = findRepoRoot(dir);
+  const common = (root: string) => realish(gitCommonDir(root) ?? root);
+  let checkout = nearest; // innermost root of the repository `root` belongs to
+  for (let root = nearest; root; root = findRepoRoot(path.dirname(root))) {
+    if (root !== checkout && common(root) !== common(checkout!)) checkout = root;
+    if (hasOwnSettings(root)) return checkout;
+  }
+  return nearest;
+}
+
+/**
  * The repository and claim keys for the files a tool call edits, taken from the
  * files themselves: Claude's cwd follows `cd` (into a nested repository,
  * another worktree, an added directory), so it can't say which checkout a file
@@ -85,7 +105,7 @@ function editTarget(input: Record<string, any>, io: HookIO): { root: string; fil
   if (rawPaths.length === 0) return null;
   const cwd = cwdFor(input, io);
   const abs = rawPaths.map((p) => path.resolve(cwd, p));
-  const root = findRepoRoot(path.dirname(abs[0]));
+  const root = claimRoot(path.dirname(abs[0]));
   if (!root) return null;
   const inRepo = [...new Set(abs.map((p) => toRepoPath(p, root, root)).filter((p): p is string => p !== null))];
   const files = inRepo.filter((f) => !isIgnored(root, f));
@@ -247,7 +267,7 @@ export async function postEditHook(io: HookIO): Promise<HookOutcome> {
   if (!input || !ids?.tool) return ALLOW;
   const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
   const file = [toolInput.file_path, toolInput.notebook_path].find((p): p is string => typeof p === 'string' && p.length > 0);
-  const root = file ? findRepoRoot(path.dirname(path.resolve(cwdFor(input, io), file))) : null;
+  const root = file ? claimRoot(path.dirname(path.resolve(cwdFor(input, io), file))) : null;
   const store = root ? PendingClaims.open(root) : null;
   if (!store) return ALLOW;
   const thread = store.list(ids.session).filter((e) => e.thread === ids.thread);
@@ -270,7 +290,7 @@ export async function settleHook(io: HookIO): Promise<HookOutcome> {
   const wholeSession = input.hook_event_name === 'SessionEnd';
   const seen = new Set<string>();
   for (const dir of [io.env.CLAUDE_PROJECT_DIR, cwdFor(input, io)]) {
-    const root = dir ? findRepoRoot(dir) : null;
+    const root = dir ? claimRoot(dir) : null;
     const store = root ? PendingClaims.open(root) : null;
     if (!store || seen.has(store.dir)) continue;
     seen.add(store.dir);

@@ -6,7 +6,7 @@ import { stagedPaths } from './git.js';
 import type { HookOutcome } from './hooks.js';
 
 const BYPASS = 'Emergency bypass: git commit --no-verify, or HUB_GUARD=off.';
-const SEQUENCER_BYPASS = 'Emergency bypass: run the git command again with HUB_GUARD=off (revert, cherry-pick and rebase skip pre-commit, so --no-verify does not apply).';
+const SEQUENCER_BYPASS = 'Emergency bypass: run the git command again with HUB_GUARD=off (git commit --no-verify does not skip this check in a revert, cherry-pick or rebase).';
 const blocked = (msg: string): HookOutcome => ({ stdout: '', stderr: `hub guard: ${msg}\n`, exitCode: 1 });
 
 /**
@@ -16,8 +16,8 @@ const blocked = (msg: string): HookOutcome => ({ stdout: '', stderr: `hub guard:
  * Only an unreachable (or broken, 5xx) hub lets the commit through unchecked,
  * with a warning, unless fail-closed is configured. A refusal, an auth error,
  * a config error or a git failure blocks it. `sequencer`: called from
- * prepare-commit-msg for a commit git revert, cherry-pick or rebase makes,
- * which never runs pre-commit.
+ * prepare-commit-msg for a commit git revert, cherry-pick or rebase makes, or
+ * from pre-applypatch for one git am makes, neither of which runs pre-commit.
  */
 export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer?: boolean }): Promise<HookOutcome> {
   if (io.env.HUB_GUARD === 'off') return { stdout: '', stderr: '', exitCode: 0 };
@@ -65,7 +65,7 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
   }
   lines.push(
     io.sequencer
-      ? 'Undo the operation (git reset --merge, or git rebase --abort in a rebase), coordinate with the holder (hub_post), or wait for the claim to be released (hub_wait).'
+      ? 'Undo the operation (git reset --merge, or git rebase --abort / git am --abort if one is in progress), coordinate with the holder (hub_post), or wait for the claim to be released (hub_wait).'
       : 'Unstage them (git restore --staged <file>), coordinate with the holder (hub_post), or wait for the claim to be released (hub_wait).',
     bypass,
   );

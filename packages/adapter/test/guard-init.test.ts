@@ -57,9 +57,10 @@ describe('hub init', () => {
     expect(hook).toContain('# agenthub-guard');
     expect(hook).toContain('hub guard');
     expect(readFileSync(path.join(hooksDir, 'pre-commit.pre-agenthub'), 'utf8')).toContain('lint ok');
-    // git revert, cherry-pick and rebase commit without running pre-commit: the guard runs there too
+    // git revert, cherry-pick, rebase and am commit without running pre-commit: the guard runs there too
     expect(readFileSync(path.join(hooksDir, 'prepare-commit-msg'), 'utf8')).toContain('hub guard --sequencer');
     expect(readFileSync(path.join(hooksDir, 'prepare-commit-msg.pre-agenthub'), 'utf8')).toContain('msg ok');
+    expect(readFileSync(path.join(hooksDir, 'pre-applypatch'), 'utf8')).toContain('hub guard --sequencer');
 
     expect(JSON.parse(readFileSync(path.join(repo.main, 'agenthub.json'), 'utf8'))).toEqual({ project: PROJECT });
     expect(existsSync(path.join(repo.main, '.hub.json'))).toBe(false); // no identity given
@@ -342,17 +343,22 @@ describe('hub guard: commits git makes without running pre-commit', () => {
     expect(reverted.stderr).toContain('HUB_GUARD=off');
     expect(subject()).toBe('Revert "sam: users"');
     git(r.wtB, 'reset', '-q', '--hard');
-    const edited = await gitB(['revert', 'HEAD~2'], { GIT_EDITOR: 'true' }); // the path git takes when it opens an editor
+    // On a terminal git opens an editor for the message by default; --edit takes that path without one. git then
+    // commits through `git commit -n -e`, whose prepare-commit-msg sees MERGE_MSG ("merge") and no pre-commit.
+    const edited = await gitB(['revert', '--edit', 'HEAD~2'], { GIT_EDITOR: 'true' });
     expect(edited.code).not.toBe(0);
     expect(edited.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/);
+    expect(subject()).toBe('Revert "sam: users"');
     git(r.wtB, 'reset', '-q', '--hard');
 
     expect((await gitB(['revert', '--no-edit', 'HEAD~2'], { HUB_GUARD: 'off' })).code).toBe(0);
-    const picked = await gitB(['cherry-pick', 'HEAD~3']); // re-applies "sam: auth"
-    expect(picked.code).not.toBe(0);
-    expect(picked.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/);
-    expect(subject()).toBe('Revert "sam: auth"');
-    git(r.wtB, 'reset', '-q', '--hard');
+    for (const args of [['cherry-pick', 'HEAD~3'], ['cherry-pick', '--edit', 'HEAD~3']]) {
+      const picked = await gitB(args, { GIT_EDITOR: 'true' }); // re-applies "sam: auth"
+      expect(picked.code, args.join(' ')).not.toBe(0);
+      expect(picked.stderr, args.join(' ')).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/);
+      expect(subject()).toBe('Revert "sam: auth"');
+      git(r.wtB, 'reset', '-q', '--hard');
+    }
   });
 
   it('blocks a rebase that replays a commit touching the claimed file', async () => {
@@ -364,6 +370,27 @@ describe('hub guard: commits git makes without running pre-commit', () => {
     git(r.wtB, 'rebase', '--abort');
   });
 
+  it('blocks git am and git rebase --apply, which commit patches without pre-commit or prepare-commit-msg', async () => {
+    const rebased = await gitB(['rebase', '--apply', 'main']);
+    expect(rebased.code).not.toBe(0);
+    expect(rebased.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/);
+    git(r.wtB, 'rebase', '--abort');
+
+    const patch = (rev: string) => {
+      const file = path.join(r.dir, `${rev.replace(/\W/g, '')}.patch`);
+      writeFileSync(file, git(r.wtB, 'format-patch', '-1', '--stdout', rev));
+      return file;
+    };
+    const auth = await gitB(['am', patch('HEAD~3')]); // "sam: auth", reverted since
+    expect(auth.code).not.toBe(0);
+    expect(auth.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/);
+    expect(subject()).toBe('Revert "sam: auth"');
+    git(r.wtB, 'am', '--abort');
+    expect((await gitB(['am', patch('HEAD~2')])).code).toBe(0); // "sam: users": free
+    expect(subject()).toBe('sam: users');
+    git(r.wtB, 'reset', '-q', '--hard', 'HEAD~1');
+  });
+
   it('leaves plain commits to pre-commit, so git commit --no-verify still bypasses the guard', async () => {
     writeFileSync(path.join(r.wtB, 'src', 'auth.ts'), 'export const login = () => "forced";\n');
     git(r.wtB, 'add', 'src/auth.ts');
@@ -372,18 +399,32 @@ describe('hub guard: commits git makes without running pre-commit', () => {
     expect(subject()).toBe('forced');
   });
 
-  it('leaves a git commit that finishes a conflicted cherry-pick to pre-commit too', async () => {
-    const pick = git(r.wtB, 'rev-parse', 'HEAD').trim(); // "forced", on src/auth.ts
-    git(r.wtB, 'reset', '-q', '--hard', 'HEAD~1');
-    writeFileSync(path.join(r.wtB, 'src', 'auth.ts'), 'export const login = () => "conflict";\n');
-    expect((await gitB(['commit', '-qam', 'conflicting'], { HUB_GUARD: 'off' })).code).toBe(0);
-    expect((await gitB(['cherry-pick', pick])).code).not.toBe(0); // conflicts, so git stops before committing
-    writeFileSync(path.join(r.wtB, 'src', 'auth.ts'), 'export const login = () => "resolved";\n');
-    git(r.wtB, 'add', 'src/auth.ts');
+  it('checks a git commit that finishes a conflicted cherry-pick once, and even with --no-verify', async () => {
+    const conflictedPick = async (file: string) => {
+      const pick = git(r.wtB, 'rev-parse', 'HEAD').trim();
+      git(r.wtB, 'reset', '-q', '--hard', 'HEAD~1');
+      writeFileSync(path.join(r.wtB, file), 'export const conflict = 1;\n');
+      expect((await gitB(['commit', '-qam', `conflicting ${file}`], { HUB_GUARD: 'off' })).code).toBe(0);
+      expect((await gitB(['cherry-pick', pick])).code).not.toBe(0); // conflicts, so git stops before committing
+      writeFileSync(path.join(r.wtB, file), 'export const resolved = 1;\n');
+      git(r.wtB, 'add', file);
+    };
+    await conflictedPick('src/auth.ts'); // re-applies "forced"
     const blocked = await gitB(['commit', '--no-edit']); // pre-commit checks it
     expect(blocked.code).not.toBe(0);
     expect(blocked.stderr).toMatch(/hub guard: commit blocked/);
-    expect((await gitB(['commit', '-q', '--no-edit', '--no-verify'])).code).toBe(0); // and --no-verify skips the check, as for any commit
+    // To the hooks this is the commit git revert --edit makes (prepare-commit-msg with MERGE_MSG, no pre-commit): checked too
+    const forced = await gitB(['commit', '--no-edit', '--no-verify']);
+    expect(forced.code).not.toBe(0);
+    expect(forced.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/);
+    expect((await gitB(['commit', '-q', '--no-edit'], { HUB_GUARD: 'off' })).code).toBe(0);
+
+    writeFileSync(path.join(r.wtB, 'src', 'users.ts'), 'export const users = ["picked"];\n');
+    expect((await gitB(['commit', '-qam', 'sam: users again'])).code).toBe(0);
+    await conflictedPick('src/users.ts');
+    const unchecked = await gitB(['commit', '-q', '--no-edit'], { HUB_URL: 'http://127.0.0.1:9', HUB_TIMEOUT_MS: '1000' });
+    expect(unchecked.code).toBe(0);
+    expect(unchecked.stderr.match(/claims not checked/g)).toHaveLength(1); // pre-commit ran, so prepare-commit-msg did not ask again
   });
 });
 

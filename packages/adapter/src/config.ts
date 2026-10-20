@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { deriveProject, findRepoRoot, recordedSettings } from './git.js';
@@ -110,6 +110,12 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
     projectSource,
     warnings,
   };
+}
+
+/** Whether `hub init` set this checkout up: agenthub.json or .hub.json in it, or settings recorded in its repository's git config. */
+export function hasOwnSettings(root: string): boolean {
+  if (existsSync(path.join(root, TEAM_CONFIG_FILE_NAME)) || existsSync(path.join(root, CONFIG_FILE_NAME))) return true;
+  return Object.keys(recordedSettings(root)).length > 0;
 }
 
 export function globalConfigPath(env: NodeJS.ProcessEnv = process.env): string {

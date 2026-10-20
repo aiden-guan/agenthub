@@ -12,7 +12,7 @@ Agent integration
   hub hook post-edit         Claude Code PostToolUse hook: confirm the claim of an edit that ran
   hub hook settle            Claude Code Stop/SubagentStop/UserPromptSubmit/SessionEnd hook: release claims of edits that never ran
   hub hook digest            Claude Code SessionStart hook: team state as additionalContext
-  hub guard                  git pre-commit (and, for revert/cherry-pick/rebase, prepare-commit-msg) hook:
+  hub guard                  git pre-commit hook (also prepare-commit-msg for revert/cherry-pick/rebase, pre-applypatch for am):
                              reject commits touching files others hold exclusively
   hub init [--agent human/agent] [--project ID] [--url URL] [--command CMD] [--no-hooks] [--no-mcp] [--no-guard]
                              Write .hub.json, .claude/settings.json hooks, .mcp.json and the pre-commit guard

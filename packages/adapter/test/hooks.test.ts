@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { init } from '../src/init.js';
 import {
   A,
   B,
@@ -320,6 +321,51 @@ describe('hub hook pre-edit: repo, identity and claim key come from the edited f
     const file = path.join(oak(), 'README.md'); // bold-oak has no .hub.json and no session dir says who this is
     expect(denyReasonOf((await edit(oak(), file, { HUB_FAIL_CLOSED: '1' })).stdout)).toMatch(/no agent identity.*HUB_FAIL_CLOSED/);
     expectVisibleWarning((await edit(oak(), file)).stdout, /no agent identity/);
+  });
+});
+
+describe('hub hook pre-edit: a file in a submodule of the worktree', () => {
+  const ctx = sandbox();
+  // As in the README setup: hub URL and project come from agenthub.json, identities from .hub.json; no HUB_* variables.
+  const env = (wt: string) => testEnv({ CLAUDE_PROJECT_DIR: wt });
+  const lib = (wt: string, name = 'x.ts') => path.join(wt, 'vendor', 'lib', name);
+  const quiet = { code: 0, stdout: '', stderr: '' };
+  const maya = (n: number): CallIds => ({ session: 'sess-maya', toolUseId: `toolu_maya_${n}` });
+  const hook = (name: string, wt: string, input: string) => hubCli(['hook', name], { cwd: wt, env: env(wt), input });
+
+  beforeAll(() => {
+    const { r } = ctx;
+    const libRepo = path.join(r.dir, 'lib');
+    git(r.dir, 'init', '-q', '-b', 'main', libRepo);
+    writeFileSync(path.join(libRepo, 'x.ts'), 'export const x = 1;\n');
+    git(libRepo, 'add', '-A');
+    git(libRepo, 'commit', '-q', '-m', 'lib');
+    git(r.main, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', libRepo, 'vendor/lib');
+    init({ cwd: r.main, project: PROJECT, url: ctx.hub.url, hooks: false, mcp: false, guard: false, env: {} });
+    git(r.main, 'add', '-A');
+    git(r.main, 'commit', '-q', '-m', 'vendor lib, agenthub setup');
+    for (const [wt, agent] of [[r.wtA, A], [r.wtB, B]]) {
+      git(wt, 'merge', '-q', '--ff-only', 'main');
+      git(wt, '-c', 'protocol.file.allow=always', 'submodule', 'update', '-q', '--init');
+      init({ cwd: wt, agent, hooks: false, mcp: false, guard: false, env: {} });
+    }
+  });
+
+  it("claims it as a file of the worktree, on the team's hub and project, so a second agent is denied", async () => {
+    const { r } = ctx;
+    expect(await hook('pre-edit', r.wtA, preToolUseInput(r.wtA, lib(r.wtA), 'Edit', maya(1)))).toEqual(quiet);
+    expect(denyReasonOf((await hook('pre-edit', r.wtB, preToolUseInput(r.wtB, lib(r.wtB)))).stdout)).toMatch(/^vendor\/lib\/x\.ts is claimed by maya\/claude-1/);
+    const claims = (await client(ctx.hub.url, A).status()).claims.map((c) => `${c.holder} ${c.scope[0].file}`);
+    expect(claims).toEqual(['maya/claude-1 vendor/lib/x.ts']);
+  });
+
+  it('confirms the edits that ran and releases the ones that never did, as for any other file', async () => {
+    const { r } = ctx;
+    expect(await hook('post-edit', r.wtA, postToolUseInput(r.wtA, lib(r.wtA), 'Edit', maya(1)))).toEqual(quiet);
+    expect(await hook('pre-edit', r.wtA, preToolUseInput(r.wtA, lib(r.wtA, 'y.ts'), 'Write', maya(2)))).toEqual(quiet); // then rejected
+    expect(await hook('settle', r.wtA, sessionEventInput(r.wtA, 'Stop', 'sess-maya'))).toEqual(quiet);
+    const held = (await client(ctx.hub.url, A).status()).claims.map((c) => c.scope[0].file);
+    expect(held).toEqual(['vendor/lib/x.ts']);
   });
 });
 

@@ -28,6 +28,8 @@ const EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit'];
 const SETTLE_EVENTS = ['Stop', 'SubagentStop', 'UserPromptSubmit', 'SessionEnd'];
 const GUARD_MARKER = '# agenthub-guard';
 const CHAINED_SUFFIX = '.pre-agenthub';
+/** In the worktree's git dir: the pid of the `git commit` whose pre-commit ran the guard, so its prepare-commit-msg doesn't ask again. */
+const CHECKED_FILE = 'agenthub-pre-commit';
 
 /**
  * `hub init` — set up the current worktree:
@@ -38,8 +40,9 @@ const CHAINED_SUFFIX = '.pre-agenthub';
  *    (`hub hook post-edit`), SessionStart (`hub hook digest`), and Stop,
  *    SubagentStop, UserPromptSubmit and SessionEnd (`hub hook settle`)
  *  - `.mcp.json` entry for the `hub mcp` server
- *  - the git guard, as pre-commit and as prepare-commit-msg (for the commits git
- *    revert, cherry-pick and rebase make without pre-commit); existing hooks are kept and chained
+ *  - the git guard, as pre-commit, as prepare-commit-msg (for the commits git
+ *    revert, cherry-pick and rebase make without pre-commit) and as
+ *    pre-applypatch (git am, git rebase --apply); existing hooks are kept and chained
  *  - the project id and hub URL in the repository's git config, which every
  *    worktree shares, for checkouts whose branch has no agenthub.json yet
  * Safe to run again; it only adds what's missing.
@@ -150,6 +153,7 @@ export function init(opts: InitOptions): string[] {
     mkdirSync(hooksDir, { recursive: true });
     installGitHook(hooksDir, 'pre-commit', guardScript(command), report);
     installGitHook(hooksDir, 'prepare-commit-msg', sequencerGuardScript(command), report);
+    installGitHook(hooksDir, 'pre-applypatch', applyPatchGuardScript(command), report);
   }
 
   return [...(report.length ? report : ['already set up; nothing to change']), ...notes];
@@ -241,15 +245,21 @@ ${GUARD_MARKER} (installed by \`hub init\`)
 ${FAIL_CLOSED_SH}
 
 ${runGuardSh(command, '')}
+# Checked: prepare-commit-msg, run next by the same git process ($PPID), skips it.
+gitdir="$(git rev-parse --git-dir 2>/dev/null)" && { echo "$PPID" > "$gitdir/${CHECKED_FILE}"; } 2>/dev/null
 ${chainSh('pre-commit')}`;
 }
 
 /**
  * prepare-commit-msg: git revert, cherry-pick and rebase commit without running
- * pre-commit, but with MERGE_MSG in the git dir and no MERGE_HEAD. Other commits
- * went through pre-commit (or skipped it on purpose with --no-verify): so did a
- * `git commit` that picks up MERGE_MSG to finish a conflicted pick ($2 is
- * "merge"). Merge commits, which carry other branches' work, are left alone.
+ * pre-commit (in process, or through `git commit -n -e` when the message is
+ * edited, as it is by default on a terminal), with MERGE_MSG in the git dir and
+ * no MERGE_HEAD. A commit whose pre-commit ran was checked there: pre-commit
+ * leaves the pid of its git process. Any other commit in the middle of one of
+ * those operations is checked here, including a `git commit --no-verify` that
+ * finishes a conflicted pick, which looks the same to the hooks as git's own
+ * `git commit -n -e`. Plain commits are left to pre-commit (and --no-verify),
+ * and merge commits, which carry other branches' work, are left alone.
  */
 export function sequencerGuardScript(command: string): string {
   return `#!/bin/sh
@@ -261,10 +271,29 @@ ${GUARD_MARKER} (installed by \`hub init\`)
 ${FAIL_CLOSED_SH}
 
 gitdir="$(git rev-parse --git-dir 2>/dev/null)"
-if [ "$2" != merge ] && [ -n "$gitdir" ] && [ -f "$gitdir/MERGE_MSG" ] && [ ! -f "$gitdir/MERGE_HEAD" ]; then
+checked=""
+if [ -n "$gitdir" ] && [ -f "$gitdir/${CHECKED_FILE}" ]; then
+  checked="$(cat "$gitdir/${CHECKED_FILE}" 2>/dev/null)"
+  rm -f "$gitdir/${CHECKED_FILE}"
+fi
+if [ -n "$gitdir" ] && [ "$checked" != "$PPID" ] && [ -f "$gitdir/MERGE_MSG" ] && [ ! -f "$gitdir/MERGE_HEAD" ]; then
 ${runGuardSh(command, ' --sequencer').replace(/^/gm, '  ')}
 fi
 ${chainSh('prepare-commit-msg')}`;
+}
+
+/** pre-applypatch: git am, and git rebase --apply through it, commit each patch without pre-commit or prepare-commit-msg. */
+export function applyPatchGuardScript(command: string): string {
+  return `#!/bin/sh
+${GUARD_MARKER} (installed by \`hub init\`)
+# git am (and git rebase --apply) commits patches without running pre-commit;
+# this checks each against other agents' exclusive claims.
+# Bypass in an emergency: git am --no-verify   or   HUB_GUARD=off git <command>
+
+${FAIL_CLOSED_SH}
+
+${runGuardSh(command, ' --sequencer')}
+${chainSh('pre-applypatch')}`;
 }
 
 type HookEntry = { type: string; command: string; timeout?: number; onFailure?: 'block' | 'continue' };
