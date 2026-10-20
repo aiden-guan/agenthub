@@ -340,6 +340,7 @@ describe('hub hook pre-edit: a file in a submodule of the worktree', () => {
     const libRepo = path.join(r.dir, 'lib');
     git(r.dir, 'init', '-q', '-b', 'main', libRepo);
     writeFileSync(path.join(libRepo, 'x.ts'), 'export const x = 1;\n');
+    writeFileSync(path.join(libRepo, '.gitignore'), '.env\nbuild/\n');
     git(libRepo, 'add', '-A');
     git(libRepo, 'commit', '-q', '-m', 'lib');
     git(r.main, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', libRepo, 'vendor/lib');
@@ -366,6 +367,16 @@ describe('hub hook pre-edit: a file in a submodule of the worktree', () => {
     expect(await hook('post-edit', r.wtA, postToolUseInput(r.wtA, lib(r.wtA), 'Edit', maya(1)))).toEqual(quiet);
     expect(await hook('pre-edit', r.wtA, preToolUseInput(r.wtA, lib(r.wtA, 'y.ts'), 'Write', maya(2)))).toEqual(quiet); // then rejected
     expect(await hook('settle', r.wtA, sessionEventInput(r.wtA, 'Stop', 'sess-maya'))).toEqual(quiet);
+    const held = (await client(ctx.hub.url, A).status()).claims.map((c) => c.scope[0].file);
+    expect(held).toEqual(['vendor/lib/x.ts']);
+  });
+
+  it("does not claim files the submodule's own .gitignore ignores (the worktree's git won't look inside it)", async () => {
+    const { r } = ctx;
+    for (const name of ['.env', path.join('build', 'out.js')]) {
+      expect(await hook('pre-edit', r.wtA, preToolUseInput(r.wtA, lib(r.wtA, name), 'Write', maya(3))), name).toEqual(quiet);
+      expect(await hook('pre-edit', r.wtB, preToolUseInput(r.wtB, lib(r.wtB, name), 'Write')), name).toEqual(quiet);
+    }
     const held = (await client(ctx.hub.url, A).status()).claims.map((c) => c.scope[0].file);
     expect(held).toEqual(['vendor/lib/x.ts']);
   });
@@ -483,6 +494,14 @@ describe('hub hook pre-edit: claim keys', () => {
     }
     expect((await claimed()).filter((c) => c.includes('.env') && !c.includes('..env'))).toEqual([]);
     expect((await claimed()).filter((c) => c.includes('node_modules'))).toEqual([]);
+    // A repository cloned into an ignored directory is just as local to each worktree.
+    appendFileSync(exclude, '.cache/\n');
+    for (const [agent, wt] of [[A, r.wtA], [B, r.wtB]]) {
+      mkdirSync(path.join(wt, '.cache', 'dep'), { recursive: true });
+      git(path.join(wt, '.cache', 'dep'), 'init', '-q');
+      expect(await edit(agent, wt, path.join('.cache', 'dep', 'x.ts'), 'Write'), agent).toEqual({ code: 0, stdout: '', stderr: '' });
+    }
+    expect((await claimed()).filter((c) => c.includes('.cache'))).toEqual([]);
     // A tracked file stays coordinated even when an ignore rule matches it.
     appendFileSync(exclude, 'README.md\n');
     expect((await edit(A, r.wtA, 'README.md')).stdout).toBe('');

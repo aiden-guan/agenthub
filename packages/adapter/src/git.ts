@@ -75,8 +75,25 @@ export function toRepoPath(file: string, root: string, cwd: string): string | nu
   return posix;
 }
 
-/** Whether git ignores this untracked repo path (`.env`, `node_modules/…`). A tracked file never counts as ignored. */
-export function isIgnored(root: string, repoPath: string): boolean {
+/**
+ * Whether git ignores this untracked file (`.env`, `node_modules/…`), asked of
+ * the repository that holds it and of each one around it up to `root`: a
+ * submodule's .gitignore is its own (git in the worktree refuses to look
+ * inside a submodule), and a directory the worktree ignores is local to each
+ * worktree, a clone in it included. A tracked file never counts as ignored.
+ */
+export function isIgnored(file: string, root: string): boolean {
+  const top = realish(root);
+  let repo = findRepoRoot(path.dirname(file));
+  while (repo && (repo === top || repo.startsWith(top + path.sep))) {
+    const rel = toRepoPath(file, repo, repo);
+    if (rel !== null && checkIgnore(repo, rel)) return true;
+    repo = repo === top ? null : findRepoRoot(path.dirname(repo));
+  }
+  return false;
+}
+
+function checkIgnore(root: string, repoPath: string): boolean {
   try {
     execFileSync('git', ['check-ignore', '-q', '--', repoPath], { cwd: root, stdio: 'ignore', timeout: 3000 });
     return true;

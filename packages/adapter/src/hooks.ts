@@ -123,8 +123,11 @@ function editTarget(input: Record<string, any>, io: HookIO): { root: string; fil
   const abs = rawPaths.map((p) => path.resolve(cwd, p));
   const root = claimRoot(path.dirname(abs[0]), sessionDir(input, io));
   if (!root) return null;
-  const inRepo = [...new Set(abs.map((p) => toRepoPath(p, root, root)).filter((p): p is string => p !== null))];
-  const files = inRepo.filter((f) => !isIgnored(root, f));
+  const keys = abs.flatMap((p) => {
+    const key = toRepoPath(p, root, root);
+    return key !== null && !isIgnored(p, root) ? [key] : [];
+  });
+  const files = [...new Set(keys)];
   return files.length ? { root, files } : null;
 }
 
