@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -15,6 +15,13 @@ export interface ServerOptions {
   sweepIntervalMs?: number;
   /** Upper bound for long-poll waits on GET /events. Default 10 min. */
   maxWaitMs?: number;
+  /**
+   * Browser origins (`scheme://host[:port]`) allowed to call the hub. HTTP
+   * requests and feed upgrades that carry any other `Origin` header are refused
+   * with 403, so a web page can't reach a hub on localhost through the
+   * developer's browser. Node clients send no Origin. Default: none.
+   */
+  allowOrigins?: string[];
 }
 
 export interface RunningServer {
@@ -69,6 +76,17 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const { hub } = opts;
   const maxWaitMs = opts.maxWaitMs ?? 600_000;
   const routes = buildRoutes(hub, maxWaitMs);
+  const allowedOrigins = new Set((opts.allowOrigins ?? []).map(toOrigin));
+
+  /** Throws unless the request has no Origin or an allowed one; returns the allowed origin. */
+  function checkOrigin(req: IncomingMessage): string | null {
+    const origin = req.headers.origin;
+    if (origin === undefined) return null;
+    if (!allowedOrigins.has(origin)) {
+      throw new HubError('forbidden_origin', `requests from origin ${JSON.stringify(origin)} are not allowed (see hub-server --allow-origin)`, 403);
+    }
+    return origin;
+  }
 
   const server = createServer((req, res) => {
     handle(req, res).catch((err) => sendError(res, err));
@@ -76,6 +94,15 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://hub.local');
+    const origin = checkOrigin(req);
+    if (origin !== null) {
+      res.setHeader('access-control-allow-origin', origin);
+      res.setHeader('vary', 'Origin');
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, { 'access-control-allow-methods': 'GET, POST', 'access-control-allow-headers': 'authorization, content-type, x-hub-agent', 'access-control-max-age': '600' });
+        return void res.end();
+      }
+    }
     if (req.method === 'GET' && url.pathname === '/healthz') {
       return sendJson(res, 200, { ok: true, now: hub.now() });
     }
@@ -104,9 +131,11 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
   // ---- WebSocket push feed
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+  wss.on('error', (err) => console.error('[hub] feed server error:', err));
   const sockets = new Set<WebSocket>();
   server.on('upgrade', (req, socket, head) => {
     try {
+      checkOrigin(req);
       const url = new URL(req.url ?? '/', 'http://hub.local');
       const m = /^\/v1\/p\/([^/]+)\/feed$/.exec(url.pathname);
       if (!m) throw new HubError('not_found', 'no such feed', 404);
@@ -119,12 +148,16 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       wss.handleUpgrade(req, socket, head, (ws) => onFeed(ws, project, agentParam, Number.isFinite(since) ? since : null));
     } catch (err) {
       const status = err instanceof HubError ? err.status : 400;
-      socket.write(`HTTP/1.1 ${status} ${status === 401 ? 'Unauthorized' : 'Bad Request'}\r\nConnection: close\r\n\r\n`);
+      socket.write(`HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Bad Request'}\r\nConnection: close\r\n\r\n`);
       socket.destroy();
     }
   });
 
   function onFeed(ws: WebSocket, project: string, agent: string | null, since: number | null): void {
+    // ws reports a frame it rejects (over maxPayload, unmasked, bad UTF-8, bad
+    // opcode...) as 'error' and then closes the connection itself with the
+    // matching status code. Without a listener the error would crash the hub.
+    ws.on('error', (err) => console.error(`[hub] feed connection dropped: ${err.message}`));
     sockets.add(ws);
     let alive = true;
     const send = (frame: FeedServerFrame) => {
@@ -316,6 +349,20 @@ async function readJson(req: IncomingMessage): Promise<Record<string, any>> {
   } catch {
     throw new HubError('bad_json', 'request body must be a JSON object');
   }
+}
+
+/** Normalizes an allowlist entry to the form browsers send in `Origin`. */
+function toOrigin(s: string): string {
+  let url: URL | null = null;
+  try {
+    url = new URL(s);
+  } catch {
+    // reported below
+  }
+  if (!url || url.origin === 'null' || url.href !== `${url.origin}/`) {
+    throw new Error(`allowed origin ${JSON.stringify(s)} is not an origin; expected scheme://host[:port], e.g. https://dash.example.com`);
+  }
+  return url.origin;
 }
 
 function safeDecode(s: string): string {

@@ -1,5 +1,7 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,15 +14,80 @@ const B = 'sam/claude-1';
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 const servers: RunningServer[] = [];
+const cleanups: (() => void)[] = [];
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => s.close()));
+  for (const c of cleanups.splice(0)) c();
 });
 
-async function start(opts: { leaseTtlMs?: number; heartbeatIntervalMs?: number; sweepIntervalMs?: number; token?: string } = {}) {
+async function start(opts: { leaseTtlMs?: number; heartbeatIntervalMs?: number; sweepIntervalMs?: number; token?: string; allowOrigins?: string[] } = {}) {
   const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: opts.leaseTtlMs, heartbeatIntervalMs: opts.heartbeatIntervalMs });
-  const server = await startServer({ hub, port: 0, sweepIntervalMs: opts.sweepIntervalMs, token: opts.token });
+  const server = await startServer({ hub, port: 0, sweepIntervalMs: opts.sweepIntervalMs, token: opts.token, allowOrigins: opts.allowOrigins });
   servers.push(server);
   return server;
+}
+
+/** Runs the real `hub-server` CLI (built dist) on a random port with a temporary database. */
+async function startCli(args: string[] = []): Promise<{ url: string; port: number; child: ChildProcess; output: () => string }> {
+  const dir = mkdtempSync(path.join(tmpdir(), 'agenthub-cli-'));
+  const child = spawn(process.execPath, [path.join(here, '..', 'bin', 'hub-server.js'), '--port', '0', '--db', path.join(dir, 'hub.db'), ...args]);
+  cleanups.push(() => {
+    child.kill('SIGKILL');
+    rmSync(dir, { recursive: true, force: true });
+  });
+  let out = '';
+  child.stdout!.on('data', (d) => (out += d));
+  child.stderr!.on('data', (d) => (out += d));
+  const url = await new Promise<string>((resolve, reject) => {
+    const check = () => {
+      const m = /listening on (http:\/\/\S+)/.exec(out);
+      if (m) resolve(m[1]);
+    };
+    child.stdout!.on('data', check);
+    child.on('exit', (code) => reject(new Error(`hub-server exited with ${code}: ${out}`)));
+  });
+  return { url, port: Number(new URL(url).port), child, output: () => out };
+}
+
+/** Does a raw WebSocket handshake on the demo feed, sends `bytes` and waits for the hub to close the connection. */
+async function sendRawFrame(port: number, bytes: Buffer): Promise<string> {
+  const sock = connect(port, '127.0.0.1');
+  sock.on('error', () => {}); // a reset is fine; only the outcome matters
+  let got = '';
+  sock.on('data', (d) => (got += d.toString('latin1')));
+  await once(sock, 'connect');
+  sock.write(
+    `GET /v1/p/demo/feed HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+      'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+  );
+  while (!got.includes('\r\n\r\n')) await once(sock, 'data');
+  expect(got).toMatch(/^HTTP\/1\.1 101 /);
+  sock.write(bytes);
+  if (!sock.closed) await once(sock, 'close');
+  return got;
+}
+
+/** A client-to-server frame (FIN set, masked) with a payload under 126 bytes. */
+function maskedFrame(opcode: number, payload: Buffer): Buffer {
+  const mask = Buffer.from([0x11, 0x22, 0x33, 0x44]);
+  const masked = Buffer.from(payload.map((b, i) => b ^ mask[i % 4]));
+  return Buffer.concat([Buffer.from([0x80 | opcode, 0x80 | payload.length]), mask, masked]);
+}
+
+/** Opens a feed socket and resolves with the HTTP status of the handshake (101 when it opened). */
+function upgradeStatus(base: string, headers: Record<string, string> = {}): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${base.replace('http', 'ws')}/v1/p/demo/feed?agent=${A}`, { headers });
+    ws.on('open', () => {
+      ws.close();
+      resolve(101);
+    });
+    ws.on('error', (err) => {
+      const m = /Unexpected server response: (\d+)/.exec(err.message);
+      if (m) resolve(Number(m[1]));
+      else reject(err);
+    });
+  });
 }
 
 async function api(base: string, method: string, route: string, body?: unknown, agent?: string, token?: string) {
@@ -181,6 +248,109 @@ describe('push feed', () => {
     clearInterval(timer);
     await holder.waitFor(holder.isEvent('claim.expired'), 3000);
     holder.ws.close();
+  });
+
+  it('drops a feed connection that sends an oversized or malformed frame and keeps the hub-server process running', async () => {
+    const s = await startCli();
+    await fetch(`${s.url}/v1/p/demo/claims`, {
+      method: 'POST',
+      headers: { 'x-hub-agent': A, 'content-type': 'application/json' },
+      body: JSON.stringify({ files: ['src/x.ts'] }),
+    });
+    const healthy = async () => (await fetch(`${s.url}/healthz`)).status;
+
+    // A spec-compliant client sending one message over the 64 KiB limit.
+    const big = new WebSocket(`${s.url.replace('http', 'ws')}/v1/p/demo/feed?agent=${B}`);
+    big.on('error', () => {});
+    await once(big, 'open');
+    big.send('x'.repeat(70 * 1024));
+    const [code] = await once(big, 'close');
+    expect(code).toBe(1009);
+    expect(await healthy()).toBe(200);
+
+    // Frames that break the protocol: no client mask, invalid UTF-8 text, a reserved opcode.
+    for (const bytes of [Buffer.from([0x81, 0x03, 0x61, 0x62, 0x63]), maskedFrame(0x1, Buffer.from([0xff, 0xfe, 0xfd])), maskedFrame(0x3, Buffer.from('x'))]) {
+      await sendRawFrame(s.port, bytes);
+      expect(await healthy()).toBe(200);
+    }
+
+    expect(s.child.exitCode).toBe(null);
+    expect(s.output()).toContain('[hub] feed connection dropped: Max payload size exceeded');
+    const check = await fetch(`${s.url}/v1/p/demo/claims/check`, {
+      method: 'POST',
+      headers: { 'x-hub-agent': B, 'content-type': 'application/json' },
+      body: JSON.stringify({ files: ['src/x.ts'] }),
+    });
+    expect(((await check.json()) as any).conflicts).toHaveLength(1); // the claim is still enforced
+    const f = feed(s.url, B);
+    await f.waitFor((fr) => fr.type === 'hello');
+    f.ws.close();
+  });
+});
+
+describe('browser origins', () => {
+  it('refuses feed upgrades and HTTP requests that carry an Origin header that is not allowed', async () => {
+    const s = await start();
+    expect(await upgradeStatus(s.url, { origin: 'https://evil.example' })).toBe(403);
+    expect(await upgradeStatus(s.url, { origin: 'null' })).toBe(403);
+    expect(await upgradeStatus(s.url)).toBe(101); // Node clients send no Origin
+
+    for (const route of ['/healthz', '/v1/p/demo/status', '/v1/p/demo/events?since=0']) {
+      const res = await fetch(`${s.url}${route}`, { headers: { origin: 'https://evil.example', 'x-hub-agent': A } });
+      expect(res.status).toBe(403);
+      expect(res.headers.get('access-control-allow-origin')).toBe(null);
+      expect(await res.json()).toMatchObject({ error: { code: 'forbidden_origin', message: expect.stringContaining('"https://evil.example"') } });
+    }
+    const post = await fetch(`${s.url}/v1/p/demo/claims`, {
+      method: 'POST',
+      headers: { origin: 'https://evil.example', 'x-hub-agent': A, 'content-type': 'text/plain' },
+      body: JSON.stringify({ files: ['a.ts'] }),
+    });
+    expect(post.status).toBe(403);
+    expect((await api(s.url, 'GET', '/claims')).json.claims).toHaveLength(0);
+  });
+
+  it('serves allowlisted origins, including CORS preflights', async () => {
+    const s = await start({ allowOrigins: ['http://localhost:5173', 'https://Dash.Example.com/'] });
+    expect(await upgradeStatus(s.url, { origin: 'http://localhost:5173' })).toBe(101);
+    expect(await upgradeStatus(s.url, { origin: 'https://dash.example.com' })).toBe(101);
+    expect(await upgradeStatus(s.url, { origin: 'http://localhost:5174' })).toBe(403);
+
+    const pre = await fetch(`${s.url}/v1/p/demo/claims`, {
+      method: 'OPTIONS',
+      headers: { origin: 'http://localhost:5173', 'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type,x-hub-agent' },
+    });
+    expect(pre.status).toBe(204);
+    expect(pre.headers.get('access-control-allow-origin')).toBe('http://localhost:5173');
+    expect(pre.headers.get('access-control-allow-headers')).toContain('x-hub-agent');
+
+    const res = await fetch(`${s.url}/v1/p/demo/claims`, {
+      method: 'POST',
+      headers: { origin: 'http://localhost:5173', 'x-hub-agent': A, 'content-type': 'application/json' },
+      body: JSON.stringify({ files: ['a.ts'] }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('access-control-allow-origin')).toBe('http://localhost:5173');
+    expect(((await res.json()) as any).status).toBe('granted');
+
+    const noOrigin = await fetch(`${s.url}/v1/p/demo/claims`, { method: 'OPTIONS' });
+    expect(noOrigin.status).toBe(404);
+  });
+
+  it('rejects an allowlist entry that is not an origin', async () => {
+    const hub = new Hub({ store: new SqliteStore(':memory:') });
+    for (const bad of ['localhost:5173', 'null', 'http://localhost:5173/app', 'file:///tmp/x.html', '*']) {
+      await expect(startServer({ hub, port: 0, allowOrigins: [bad] })).rejects.toThrow(/not an origin/);
+    }
+  });
+
+  it('hub-server takes repeatable --allow-origin flags', async () => {
+    const s = await startCli(['--allow-origin', 'http://localhost:5173', '--allow-origin', 'https://dash.example.com']);
+    expect(await upgradeStatus(s.url, { origin: 'http://localhost:5173' })).toBe(101);
+    expect(await upgradeStatus(s.url, { origin: 'https://dash.example.com' })).toBe(101);
+    expect(await upgradeStatus(s.url, { origin: 'https://evil.example' })).toBe(403);
+    expect((await fetch(`${s.url}/healthz`, { headers: { origin: 'https://evil.example' } })).status).toBe(403);
+    expect((await fetch(`${s.url}/healthz`)).status).toBe(200);
   });
 });
 

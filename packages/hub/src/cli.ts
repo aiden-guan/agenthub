@@ -10,6 +10,10 @@ const HELP = `hub-server — agenthub coordination hub
 
 Usage: hub-server [--port 7077] [--host 127.0.0.1] [--db ./hub.db]
                   [--lease-ttl-ms 120000] [--heartbeat-ms 30000] [--token SECRET]
+                  [--allow-origin https://dash.example.com]...
+
+Requests from browsers (anything sending an Origin header) are refused unless
+their origin is given with --allow-origin, which may be repeated.
 
 Environment: HUB_PORT, HUB_HOST, HUB_DB, HUB_LEASE_TTL_MS, HUB_HEARTBEAT_MS, HUB_TOKEN
 `;
@@ -22,6 +26,7 @@ const { values } = parseArgs({
     'lease-ttl-ms': { type: 'string' },
     'heartbeat-ms': { type: 'string' },
     token: { type: 'string' },
+    'allow-origin': { type: 'string', multiple: true },
     help: { type: 'boolean', short: 'h' },
   },
 });
@@ -47,6 +52,7 @@ const server = await startServer({
   port: num(values.port ?? env.HUB_PORT) ?? 7077,
   host: values.host ?? env.HUB_HOST ?? '127.0.0.1',
   token: values.token ?? env.HUB_TOKEN ?? undefined,
+  allowOrigins: values['allow-origin'],
 });
 
 console.log(`agenthub hub listening on ${server.url}`);
