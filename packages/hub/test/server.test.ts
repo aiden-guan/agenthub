@@ -520,6 +520,17 @@ describe('HTTP API', () => {
     expect((await api(s.url, 'GET', '/status', undefined, B)).json).toMatchObject({ claims: [], decisions: [] });
   });
 
+  it('refuses a path with an unpaired surrogate escape, so two agents cannot both hold it', async () => {
+    const s = await start();
+    // JSON.stringify sends the lone surrogate as the escape \ud800, which JSON.parse on the hub turns back into one.
+    for (const agent of [A, B]) {
+      const r = await api(s.url, 'POST', '/claims', { files: ['x\ud800.ts'] }, agent);
+      expect(r).toMatchObject({ status: 400, json: { error: { code: 'invalid_path' } } });
+      expect(r.json.error.message).toContain(String.raw`"x\ud800.ts"`);
+    }
+    expect((await api(s.url, 'GET', '/status', undefined, B)).json).toMatchObject({ claims: [] });
+  });
+
   it('checks a commit batch that includes a drive-letter-like name such as a:b.md', async () => {
     const s = await start();
     expect((await api(s.url, 'POST', '/claims', { files: ['src/auth.ts'] }, A)).json.status).toBe('granted');

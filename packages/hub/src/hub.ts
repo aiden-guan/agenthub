@@ -1,6 +1,7 @@
 import {
   AGENT_ID_RE,
   CHANNEL_RE,
+  PATH_FORBIDDEN_RE,
   PROJECT_RE,
   type AgentInfo,
   type CheckResult,
@@ -702,21 +703,20 @@ export function assertProject(project: unknown): asserts project is string {
   }
 }
 
-/** C0/C1 controls, line and paragraph separators, bidi controls: none may appear in a path other agents will read. */
-const PATH_FORBIDDEN = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
 const MAX_PATH = 4096;
 
 /**
  * The claim key for a repo-relative POSIX path: the NFC form of the path as
  * sent, nothing else changed, so every client names a file the same way.
- * Refuses forbidden characters, absolute paths (`/x`, or a Windows drive root
- * like `C:/x`) and `.`, `..` or empty segments. `a:b.md` and `..env` are legal.
+ * Refuses PATH_FORBIDDEN_RE characters, absolute paths (`/x`, or a Windows
+ * drive root like `C:/x`) and `.`, `..` or empty segments. `a:b.md` and
+ * `..env` are legal.
  */
 export function normalizeRepoPath(input: unknown): string {
   if (typeof input !== 'string') throw new HubError('invalid_path', 'file paths must be strings');
   const p = input.normalize('NFC');
-  const bad = PATH_FORBIDDEN.exec(p);
-  if (bad) throw invalidPath(p, `contains ${codePoint(bad[0])}; control, line-separator and bidi characters are not allowed`);
+  const bad = PATH_FORBIDDEN_RE.exec(p);
+  if (bad) throw invalidPath(p, `contains ${codePoint(bad[0])}; control, line-separator and bidi characters and unpaired surrogates are not allowed`);
   if (p.length > MAX_PATH) throw invalidPath(p, `is longer than ${MAX_PATH} characters`);
   if (p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)) throw invalidPath(p, 'is absolute; use a path relative to the repository root');
   if (p.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) {

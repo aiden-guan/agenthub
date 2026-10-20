@@ -12,7 +12,7 @@ export interface ScopeEntry {
   /**
    * Repo-relative POSIX path, stored and compared in NFC form. The hub answers
    * 400 `invalid_path` for control, line-separator or bidi characters, an
-   * absolute path, or a `.`, `..` or empty segment.
+   * unpaired surrogate, an absolute path, or a `.`, `..` or empty segment.
    */
   file: string;
   symbol?: string;
@@ -279,3 +279,9 @@ export interface ApiError {
 export const AGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const CHANNEL_RE = /^#[a-z0-9][a-z0-9._-]{0,63}$/;
 export const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,127}$/;
+/**
+ * A character no repo path may contain: C0 and C1 controls, line and paragraph
+ * separators, bidi controls, and unpaired surrogates (which aren't text, and
+ * which SQLite would store as U+FFFD, so the path would never match itself).
+ */
+export const PATH_FORBIDDEN_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\p{Cs}]/u;

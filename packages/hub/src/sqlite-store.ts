@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import type { Claim, ClaimStatus, Decision, HubEvent, Landing, Message, Task } from './protocol.js';
+import { PATH_FORBIDDEN_RE, type Claim, type ClaimStatus, type Decision, type HubEvent, type Landing, type Message, type Task } from './protocol.js';
 import type { AgentRow, AgentTouch, ClaimFilter, ClaimPatch, Store } from './store.js';
 
 const SCHEMA = `
@@ -136,6 +136,18 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_by_project ON events (project, seq);
 `;
 
+const FORBIDDEN_IN_PATH = new RegExp(PATH_FORBIDDEN_RE.source, 'gu');
+
+/**
+ * A hub from before path validation stored any path its normalizer let
+ * through, newlines and bidi controls included. Read such old paths back with
+ * those characters escaped (`\u000a`), so an old row can't forge a line or
+ * reorder text in a teammate's view. Paths stored since then are unchanged.
+ */
+function storedPath(file: string): string {
+  return file.replace(FORBIDDEN_IN_PATH, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 interface ClaimRowDb {
   project: string;
   id: string;
@@ -161,7 +173,7 @@ function toClaim(r: ClaimRowDb): Claim {
     project: r.project,
     holder: r.holder,
     task_id: r.task_id,
-    scope: JSON.parse(r.scope),
+    scope: (JSON.parse(r.scope) as Claim['scope']).map((entry) => ({ ...entry, file: storedPath(entry.file) })),
     mode: r.mode,
     intent: r.intent,
     base_commit: r.base_commit,
@@ -216,6 +228,13 @@ interface MessageRowDb {
 
 function toMessage(r: MessageRowDb): Message {
   return { id: r.id, project: r.project, from: r.from_agent, to: r.to_agent, channel: r.channel, body: r.body, created_at: r.created_at };
+}
+
+/** Claim and decision events list their paths in `files`. */
+function eventData(json: string): Record<string, unknown> {
+  const data = JSON.parse(json) as Record<string, unknown>;
+  if (Array.isArray(data.files)) data.files = data.files.map((f: unknown) => (typeof f === 'string' ? storedPath(f) : f));
+  return data;
 }
 
 const CLAIM_PATCH_COLUMNS = ['status', 'granted_at', 'expires_at', 'ended_at', 'end_reason', 'task_id', 'intent'] as const;
@@ -469,7 +488,7 @@ export class SqliteStore implements Store {
       agent: r.agent,
       summary: r.summary,
       rationale: r.rationale,
-      files: JSON.parse(r.files),
+      files: (JSON.parse(r.files) as string[]).map(storedPath),
       symbols: JSON.parse(r.symbols),
       task_id: r.task_id,
       created_at: r.created_at,
@@ -518,7 +537,7 @@ export class SqliteStore implements Store {
       type: r.type,
       actor: r.actor,
       at: r.at,
-      data: JSON.parse(r.data),
+      data: eventData(r.data),
       targets: r.targets ? JSON.parse(r.targets) : null,
     }));
   }
