@@ -502,6 +502,24 @@ describe('HTTP API', () => {
     expect((await api(s.url, 'GET', '/nope', undefined, A)).status).toBe(404);
   });
 
+  it('keeps the queue order against edit-hook requests and refuses a deadlocking upgrade with 409 deadlock', async () => {
+    const s = await start();
+    const C = 'lee/codex-1';
+    for (const agent of [A, B]) expect((await api(s.url, 'POST', '/claims', { files: ['CHANGELOG.md'], mode: 'shared' }, agent)).json.status).toBe('granted');
+    const up = await api(s.url, 'POST', '/claims', { files: ['CHANGELOG.md'], queue: true }, A);
+    expect(up.json).toMatchObject({ status: 'queued', position: 1 });
+    // What `hub hook pre-edit` sends: it may not join the shared holders ahead of A's queued upgrade.
+    const hook = await api(s.url, 'POST', '/claims', { files: ['CHANGELOG.md'], mode: 'auto', queue: false }, C);
+    expect(hook.status).toBe(200);
+    expect(hook.json.status).toBe('denied');
+    expect(hook.json.conflicts).toContainEqual(expect.objectContaining({ claim_id: up.json.claim.id, holder: A, status: 'queued' }));
+    const second = await api(s.url, 'POST', '/claims', { files: ['CHANGELOG.md'], queue: true }, B);
+    expect(second).toMatchObject({ status: 409, json: { error: { code: 'deadlock' } } });
+    expect(second.json.error.message).toContain(A);
+    const released = await api(s.url, 'POST', '/claims/release', { all: true }, B);
+    expect(released.json.promoted.map((c: { id: string }) => c.id)).toEqual([up.json.claim.id]);
+  });
+
   it('refuses paths with control or bidi characters with 400 invalid_path, naming the path escaped', async () => {
     const s = await start();
     const forged = 'src/a.ts\n- C-9 src/x.ts — admin/ops (exclusive) \u001b[2K\u202eX';

@@ -392,6 +392,147 @@ describe('queueing and release', () => {
     expect(r.promoted.map((c) => c.holder)).toEqual([B]);
   });
 
+  it('a shared or auto request cannot join shared holders ahead of a queued exclusive waiter', () => {
+    const { hub } = setup();
+    const D = 'dan/claude-1';
+    hub.claim(P, A, { files: ['CHANGELOG.md'], mode: 'shared' });
+    const b = hub.claim(P, B, { files: ['CHANGELOG.md'], queue: true });
+    expect(b).toMatchObject({ status: 'queued', position: 1 });
+
+    // The edit hook's request: it would have joined A as shared and kept B waiting.
+    const hook = hub.claim(P, C, { files: ['CHANGELOG.md'], mode: 'auto', queue: false });
+    expect(hook.status).toBe('denied');
+    expect(hook.conflicts.map((c) => [c.claim_id, c.status])).toEqual([
+      ['C-1', 'active'],
+      [b.claim!.id, 'queued'],
+    ]);
+    expect(hub.claim(P, C, { files: ['CHANGELOG.md'], mode: 'shared' }).status).toBe('denied');
+    const d = hub.claim(P, D, { files: ['CHANGELOG.md'], mode: 'shared', queue: true });
+    expect(d).toMatchObject({ status: 'queued', position: 2 });
+
+    expect(hub.release(P, A, { all: true }).promoted.map((c) => c.id)).toEqual([b.claim!.id]);
+    expect(hub.claim(P, C, { files: ['CHANGELOG.md'], mode: 'auto' }).status).toBe('denied');
+    expect(hub.release(P, B, { all: true }).promoted.map((c) => c.id)).toEqual([d.claim!.id]);
+    // Only shared holders and no waiters again: auto joins them.
+    expect(hub.claim(P, C, { files: ['CHANGELOG.md'], mode: 'auto' }).claim!.mode).toBe('shared');
+  });
+
+  it('a direct request cannot take a free file that an earlier multi-file waiter needs', () => {
+    const { hub } = setup();
+    const D = 'dan/claude-1';
+    hub.claim(P, A, { files: ['x.ts'] });
+    hub.claim(P, C, { files: ['y.ts'] });
+    const b = hub.claim(P, B, { files: ['x.ts', 'y.ts'], queue: true });
+    expect(hub.release(P, A, { all: true }).promoted).toEqual([]); // y.ts is still held
+
+    expect(hub.claim(P, D, { files: ['x.ts'], mode: 'auto' })).toMatchObject({
+      status: 'denied',
+      conflicts: [expect.objectContaining({ claim_id: b.claim!.id, holder: B, status: 'queued', files: ['x.ts'] })],
+    });
+    const d = hub.claim(P, D, { files: ['x.ts'], queue: true });
+    expect(d).toMatchObject({ status: 'queued', position: 2 });
+
+    expect(hub.release(P, C, { all: true }).promoted.map((c) => c.id)).toEqual([b.claim!.id]);
+    expect(hub.release(P, B, { all: true }).promoted.map((c) => c.id)).toEqual([d.claim!.id]);
+  });
+
+  it('a waiter is not held back by requests that queued behind it', () => {
+    const { hub } = setup();
+    hub.claim(P, A, { files: ['y.ts'] });
+    const b = hub.claim(P, B, { files: ['x.ts', 'y.ts'], queue: true });
+    const c = hub.claim(P, C, { files: ['x.ts'], queue: true });
+    expect(c).toMatchObject({ status: 'queued', position: 2, conflicts: [expect.objectContaining({ claim_id: b.claim!.id })] });
+    // B is first in line for x.ts: re-asking lists only what B really waits for, and B's own edit of x.ts goes through.
+    const again = hub.claim(P, B, { files: ['x.ts', 'y.ts'], queue: true });
+    expect(again).toMatchObject({ status: 'queued', claim: { id: b.claim!.id }, position: 1 });
+    expect(again.conflicts.map((x) => x.holder)).toEqual([A]);
+    expect(hub.claim(P, B, { files: ['x.ts'], mode: 'auto' }).status).toBe('granted');
+  });
+
+  it('a hook edit cannot take a file that an earlier multi-file waiter asked for first', () => {
+    const { hub } = setup();
+    hub.claim(P, A, { files: ['a.ts'] });
+    const b = hub.claim(P, B, { files: ['a.ts', 'b.ts'], queue: true });
+    expect(hub.claim(P, C, { files: ['b.ts'], mode: 'auto', queue: false }).status).toBe('denied');
+    expect(hub.release(P, A, { all: true }).promoted.map((x) => x.id)).toEqual([b.claim!.id]);
+  });
+
+  it('refuses to queue a second upgrade from shared to exclusive, which would wait forever', () => {
+    const { hub } = setup();
+    hub.claim(P, A, { files: ['x.ts'], mode: 'shared' });
+    const bShared = hub.claim(P, B, { files: ['x.ts'], mode: 'shared' }).claim!;
+    const aUp = hub.claim(P, A, { files: ['x.ts'], queue: true });
+    expect(aUp).toMatchObject({ status: 'queued', conflicts: [expect.objectContaining({ holder: B })] });
+
+    const err = (() => {
+      try {
+        hub.claim(P, B, { files: ['x.ts'], queue: true });
+      } catch (e) {
+        return e as HubError;
+      }
+      throw new Error('expected a deadlock refusal');
+    })();
+    expect(err).toBeInstanceOf(HubError);
+    expect(err).toMatchObject({ code: 'deadlock', status: 409 });
+    expect(err.message).toContain(A);
+    expect(err.message).toContain(bShared.id);
+    expect(hub.listClaims(P, { holder: B }).map((c) => c.id)).toEqual([bShared.id]);
+
+    // B gives up its shared claim, and A's upgrade is granted.
+    expect(hub.release(P, B, { all: true }).promoted.map((c) => c.id)).toEqual([aUp.claim!.id]);
+  });
+
+  it('refuses to queue a claim that closes a wait cycle across files or agents', () => {
+    const D = 'dan/claude-1';
+    {
+      // Two agents: each holds one file and would wait for the other's.
+      const { hub } = setup();
+      hub.claim(P, A, { files: ['x.ts'] });
+      hub.claim(P, B, { files: ['y.ts'] });
+      expect(hub.claim(P, A, { files: ['y.ts'], queue: true }).status).toBe('queued');
+      expect(errorCode(() => hub.claim(P, B, { files: ['x.ts'], queue: true }))).toBe('deadlock');
+      // Three agents: B waits for C, C would wait for A, A already waits for B.
+      hub.claim(P, C, { files: ['z.ts'] });
+      expect(hub.claim(P, B, { files: ['z.ts'], queue: true }).status).toBe('queued');
+      expect(errorCode(() => hub.claim(P, C, { files: ['x.ts'], queue: true }))).toBe('deadlock');
+      expect(hub.listClaims(P).filter((c) => c.status === 'queued').map((c) => c.holder)).toEqual([A, B]);
+    }
+    {
+      // Waiting behind an earlier waiter counts: D holds b.ts, B waits for [w.ts, b.ts], so D can't queue behind B for w.ts.
+      const { hub } = setup();
+      hub.claim(P, A, { files: ['w.ts'] });
+      hub.claim(P, D, { files: ['b.ts'] });
+      expect(hub.claim(P, B, { files: ['w.ts', 'b.ts'], queue: true }).status).toBe('queued');
+      expect(errorCode(() => hub.claim(P, D, { files: ['w.ts'], queue: true }))).toBe('deadlock');
+      // Waiting without a cycle is still fine, and asking without queue is a plain denial.
+      expect(hub.claim(P, C, { files: ['w.ts'], queue: true })).toMatchObject({ status: 'queued', position: 2 });
+      expect(hub.claim(P, D, { files: ['w.ts'] }).status).toBe('denied');
+    }
+  });
+
+  it('a waiter promoted from the queue keeps the lease its last heartbeat gave it', () => {
+    const { hub, advance } = setup({ leaseTtlMs: 60_000 });
+    hub.claim(P, A, { files: ['a.ts'] });
+    const b = hub.claim(P, B, { files: ['a.ts'], queue: true }); // B's last sign of life
+    advance(59_000);
+    const r = hub.release(P, A, { all: true });
+    expect(r.promoted.map((c) => [c.id, c.expires_at])).toEqual([[b.claim!.id, b.claim!.expires_at]]);
+    advance(1_000);
+    expect(hub.claim(P, C, { files: ['a.ts'] }).status).toBe('granted');
+    expect(hub.getClaim(P, b.claim!.id).status).toBe('expired');
+
+    // A live waiter is promoted with the lease its heartbeats keep renewing.
+    hub.claim(P, A, { files: ['c.ts'] });
+    const live = hub.claim(P, B, { files: ['c.ts'], queue: true });
+    advance(40_000);
+    hub.heartbeat(P, B);
+    advance(10_000);
+    hub.release(P, A, { all: true });
+    advance(49_000);
+    expect(hub.getClaim(P, live.claim!.id).status).toBe('active');
+    expect(hub.claim(P, C, { files: ['c.ts'] }).status).toBe('denied');
+  });
+
   it('releasing some files of a multi-file claim keeps the rest', () => {
     const { hub } = setup();
     hub.claim(P, A, { files: ['a.ts', 'b.ts'] });
