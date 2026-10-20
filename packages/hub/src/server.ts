@@ -27,6 +27,9 @@ export interface ServerOptions {
    * that requests may be addressed to (the `Host` header). Anything else is
    * refused with 403, which stops a web page that rebinds its own domain to
    * the hub's address: it counts as same-origin, so it sends no Origin header.
+   * A hub listening on loopback always checks Host. One listening on a network
+   * address is reached by whatever names that network gives it, so it checks
+   * Host only when this list is non-empty.
    */
   allowHosts?: string[];
 }
@@ -87,6 +90,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const allowedHosts = new Set((opts.allowHosts ?? []).map(toHostname));
   const bindName = opts.host && isIP(opts.host) === 0 ? hostnameOf(opts.host) : null;
   if (bindName !== null) allowedHosts.add(bindName);
+  // Settled once listening: on for a loopback address or an explicit allowlist.
+  let hostCheck = true;
 
   /** Throws unless the request has no Origin or an allowed one; returns the allowed origin. */
   function checkOrigin(req: IncomingMessage): string | null {
@@ -102,7 +107,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   /** Throws unless the Host header is an IP address, a localhost name or an allowed name: none of these can be rebound. */
   function checkHost(req: IncomingMessage): void {
     const header = req.headers.host;
-    if (header === undefined) return;
+    if (!hostCheck || header === undefined) return;
     const name = hostnameOf(header);
     if (name !== null && (isIP(name.replace(/^\[(.*)\]$/, '$1')) !== 0 || name === 'localhost' || name.endsWith('.localhost') || allowedHosts.has(name))) return;
     throw new HubError('forbidden_host', `requests for host ${JSON.stringify(name ?? header)} are not allowed (see hub-server --allow-host)`, 403);
@@ -255,7 +260,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     server.once('error', reject);
     server.listen(opts.port ?? 7077, opts.host ?? '127.0.0.1', () => resolve());
   });
-  const port = (server.address() as AddressInfo).port;
+  const { port, address } = server.address() as AddressInfo;
+  hostCheck = isLoopback(address) || (opts.allowHosts ?? []).length > 0;
   const host = opts.host && opts.host !== '0.0.0.0' && opts.host !== '::' ? opts.host : '127.0.0.1';
 
   return {
@@ -385,6 +391,12 @@ function toOrigin(s: string): string {
     throw new Error(`allowed origin ${JSON.stringify(s)} is not an origin; expected scheme://host[:port], e.g. https://dash.example.com`);
   }
   return url.origin;
+}
+
+/** Whether a listening address only accepts connections from this machine (`0.0.0.0` and `::` don't). */
+function isLoopback(address: string): boolean {
+  const v4 = address.replace(/^::ffff:/i, '');
+  return isIP(v4) === 4 ? v4.startsWith('127.') : address === '::1';
 }
 
 /** The lowercased host name in a `Host` header (`name[:port]`), or null if it is something else. */

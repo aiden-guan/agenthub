@@ -21,9 +21,9 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) c();
 });
 
-async function start(opts: { leaseTtlMs?: number; heartbeatIntervalMs?: number; sweepIntervalMs?: number; token?: string; allowOrigins?: string[]; allowHosts?: string[] } = {}) {
+async function start(opts: { leaseTtlMs?: number; heartbeatIntervalMs?: number; sweepIntervalMs?: number; token?: string; allowOrigins?: string[]; allowHosts?: string[]; host?: string } = {}) {
   const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: opts.leaseTtlMs, heartbeatIntervalMs: opts.heartbeatIntervalMs });
-  const server = await startServer({ hub, port: 0, sweepIntervalMs: opts.sweepIntervalMs, token: opts.token, allowOrigins: opts.allowOrigins, allowHosts: opts.allowHosts });
+  const server = await startServer({ hub, port: 0, host: opts.host, sweepIntervalMs: opts.sweepIntervalMs, token: opts.token, allowOrigins: opts.allowOrigins, allowHosts: opts.allowHosts });
   servers.push(server);
   return server;
 }
@@ -92,7 +92,7 @@ function upgradeStatus(base: string, headers: Record<string, string> = {}): Prom
 }
 
 /** Sends a request to 127.0.0.1 with any Host header, the way a page on a rebound domain reaches the hub. */
-function requestAs(port: number, host: string, route: string, headers: Record<string, string> = {}, method = 'GET'): Promise<{ status: number; body: string }> {
+function requestAs(port: number, host: string, route: string, headers: Record<string, string> = {}, method = 'GET', body?: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = httpRequest({ host: '127.0.0.1', port, path: route, method, headers: { ...headers, host } }, (res) => {
       let body = '';
@@ -101,7 +101,7 @@ function requestAs(port: number, host: string, route: string, headers: Record<st
       res.on('end', () => resolve({ status: res.statusCode!, body }));
     });
     req.on('error', reject);
-    req.end();
+    req.end(body);
   });
 }
 
@@ -396,6 +396,29 @@ describe('browser origins', () => {
     }
   });
 
+  it('serves any host name when listening on a network address, as on a private network', async () => {
+    // Teammates reach such a hub by whatever name the network gives it (devbox.lan, a
+    // compose service, a proxy), so without --allow-host it doesn't check Host.
+    const s = await start({ host: '0.0.0.0' });
+    const lan = `devbox.lan:${s.port}`;
+    expect((await requestAs(s.port, lan, '/healthz')).status).toBe(200);
+    expect((await requestAs(s.port, lan, '/v1/p/demo/status', { 'x-hub-agent': A })).status).toBe(200);
+    const claim = await requestAs(s.port, lan, '/v1/p/demo/claims', { 'x-hub-agent': A, 'content-type': 'application/json' }, 'POST', JSON.stringify({ files: ['src/x.ts'] }));
+    expect(JSON.parse(claim.body)).toMatchObject({ status: 'granted' });
+    expect(await upgradeStatus(s.url, { host: lan })).toBe(101);
+    // Browser origins are still refused.
+    expect((await requestAs(s.port, lan, '/healthz', { origin: 'https://evil.example' })).status).toBe(403);
+    expect(await upgradeStatus(s.url, { host: lan, origin: 'https://evil.example' })).toBe(403);
+  });
+
+  it('checks Host on a network address once names are given with allowHosts', async () => {
+    const s = await start({ host: '0.0.0.0', allowHosts: ['devbox.lan'] });
+    expect((await requestAs(s.port, `devbox.lan:${s.port}`, '/v1/p/demo/status')).status).toBe(200);
+    expect((await requestAs(s.port, `127.0.0.1:${s.port}`, '/v1/p/demo/status')).status).toBe(200);
+    expect((await requestAs(s.port, `rebind.evil.example:${s.port}`, '/v1/p/demo/status')).status).toBe(403);
+    expect(await upgradeStatus(s.url, { host: `rebind.evil.example:${s.port}` })).toBe(403);
+  });
+
   it('rejects an allowlist entry that is not an origin', async () => {
     const hub = new Hub({ store: new SqliteStore(':memory:') });
     for (const bad of ['localhost:5173', 'null', 'http://localhost:5173/app', 'file:///tmp/x.html', '*']) {
@@ -417,6 +440,17 @@ describe('browser origins', () => {
     expect((await requestAs(s.port, `hub.example.com:${s.port}`, '/v1/p/demo/status')).status).toBe(200);
     expect((await requestAs(s.port, `devbox.lan:${s.port}`, '/v1/p/demo/status')).status).toBe(200);
     expect((await requestAs(s.port, `rebind.evil.example:${s.port}`, '/v1/p/demo/status')).status).toBe(403);
+  });
+
+  it('hub-server --host 0.0.0.0 serves clients that use a DNS name in their hub URL', async () => {
+    const s = await startCli(['--host', '0.0.0.0']);
+    const lan = `devbox.lan:${s.port}`;
+    expect((await requestAs(s.port, lan, '/healthz')).status).toBe(200);
+    const claim = await requestAs(s.port, lan, '/v1/p/demo/claims', { 'x-hub-agent': A, 'content-type': 'application/json' }, 'POST', JSON.stringify({ files: ['src/x.ts'] }));
+    expect(JSON.parse(claim.body)).toMatchObject({ status: 'granted' });
+    // The default loopback hub still refuses the same name.
+    const local = await startCli();
+    expect((await requestAs(local.port, `devbox.lan:${local.port}`, '/healthz')).status).toBe(403);
   });
 
   it('hub-server reports a bad --allow-origin or --allow-host in one line, without a stack trace', () => {
