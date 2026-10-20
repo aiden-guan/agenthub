@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { AGENT_ID_RE, CONFIG_FILE_NAME, TEAM_CONFIG_FILE_NAME, readConfigFile, type ConfigFile } from './config.js';
-import { deriveProject, git } from './git.js';
+import { deriveProject, git, recordedSettings } from './git.js';
 
 export interface InitOptions {
   cwd: string;
@@ -13,20 +13,35 @@ export interface InitOptions {
   hooks?: boolean;
   mcp?: boolean;
   guard?: boolean;
+  /** For the HUB_AGENT check; default process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
-export const PRE_EDIT_MATCHER = 'Edit|Write|MultiEdit';
+/**
+ * Claude Code reads a matcher of plain names as an exact list of tool names, so
+ * every tool that writes files must be on it. MultiEdit is gone from current
+ * Claude Code; it stays for older versions.
+ */
+export const PRE_EDIT_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit';
+const EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit'];
+/** Events after which no tool call of the turn (or session) is still waiting: `hub hook settle` runs there. */
+const SETTLE_EVENTS = ['Stop', 'SubagentStop', 'UserPromptSubmit', 'SessionEnd'];
 const GUARD_MARKER = '# agenthub-guard';
-const CHAINED_HOOK = 'pre-commit.pre-agenthub';
+const CHAINED_SUFFIX = '.pre-agenthub';
 
 /**
  * `hub init` — set up the current worktree:
  *  - `agenthub.json` (commit it) with the project id and hub URL, so every clone and worktree agrees
  *  - `.hub.json` with this worktree's agent identity (kept out of git via info/exclude)
- *  - `.claude/settings.json` PreToolUse (Edit|Write|MultiEdit → `hub hook pre-edit`)
- *    and SessionStart (`hub hook digest`) hook entries, merged into what's there
+ *  - `.claude/settings.json` hook entries, merged into what's there: PreToolUse
+ *    (Edit|Write|MultiEdit|NotebookEdit → `hub hook pre-edit`), PostToolUse
+ *    (`hub hook post-edit`), SessionStart (`hub hook digest`), and Stop,
+ *    SubagentStop, UserPromptSubmit and SessionEnd (`hub hook settle`)
  *  - `.mcp.json` entry for the `hub mcp` server
- *  - the git pre-commit guard (an existing pre-commit hook is kept and chained)
+ *  - the git guard, as pre-commit and as prepare-commit-msg (for the commits git
+ *    revert, cherry-pick and rebase make without pre-commit); existing hooks are kept and chained
+ *  - the project id and hub URL in the repository's git config, which every
+ *    worktree shares, for checkouts whose branch has no agenthub.json yet
  * Safe to run again; it only adds what's missing.
  */
 export function init(opts: InitOptions): string[] {
@@ -37,17 +52,37 @@ export function init(opts: InitOptions): string[] {
 
   if (opts.agent && !AGENT_ID_RE.test(opts.agent)) throw new Error(`agent id "${opts.agent}" is invalid; use human/agent, e.g. maya/claude-2`);
 
-  // 1. team config, committed: project id and hub URL
+  // 1. team config, committed: project id and hub URL. A checkout whose branch
+  // predates that commit gets what the repository recorded, not a new project.
   const teamPath = path.join(root, TEAM_CONFIG_FILE_NAME);
   const teamExisting = readConfigFile(teamPath);
+  const recorded = recordedSettings(root);
+  const team: ConfigFile = { ...teamExisting };
   if (!teamExisting || opts.project || opts.url) {
-    const team: ConfigFile = { ...teamExisting };
-    team.project = opts.project ?? team.project ?? deriveProject(root) ?? 'default';
+    // Set up by an older `hub init` that recorded nothing: another worktree's file says what the team uses.
+    const sibling = !teamExisting && !opts.project && !recorded.project ? siblingTeamConfig(root) : null;
+    team.project = opts.project ?? team.project ?? recorded.project ?? sibling?.project ?? deriveProject(root) ?? 'default';
     if (opts.url) team.url = opts.url.replace(/\/+$/, '');
+    else if (!teamExisting && (recorded.url ?? sibling?.url)) team.url = recorded.url ?? sibling?.url;
     if (JSON.stringify(team) !== JSON.stringify(teamExisting)) {
       writeJson(teamPath, team);
       report.push(`wrote ${TEAM_CONFIG_FILE_NAME} (project ${team.project}${team.url ? `, hub ${team.url}` : ''}); commit it so every clone and worktree agrees`);
     }
+  }
+  const notes: string[] = [];
+
+  // 1b. the same, recorded in the git config every worktree shares. What another
+  // checkout recorded is only replaced on purpose (--project, --url).
+  const record: Array<[key: 'project' | 'url', value: string]> = [];
+  if (team.project && (!recorded.project || (opts.project && recorded.project !== team.project))) record.push(['project', team.project]);
+  if (team.url && (!recorded.url || (opts.url && recorded.url !== team.url))) record.push(['url', team.url]);
+  const written = record.filter(([key, value]) => git(root, ['config', '--local', `agenthub.${key}`, value]) !== null);
+  if (written.length) report.push(`recorded ${written.map(([k, v]) => `${k} ${v}`).join(', ')} in the repository's git config, for worktrees whose branch has no ${TEAM_CONFIG_FILE_NAME} yet`);
+  if (recorded.project && team.project && recorded.project !== team.project && !opts.project) {
+    notes.push(
+      `note: this checkout's ${TEAM_CONFIG_FILE_NAME} says project ${team.project}, but the repository was set up for project ${recorded.project}, so edits and commits here are checked against other claims than the rest of the team's. ` +
+        `Run \`hub init --project ${recorded.project}\` here to match, or \`hub init --project ${team.project}\` to switch the repository.`,
+    );
   }
 
   // 2. this worktree's identity, never committed
@@ -58,7 +93,15 @@ export function init(opts: InitOptions): string[] {
     report.push(`wrote ${CONFIG_FILE_NAME} (agent ${opts.agent})`);
   }
   if (excludeFromGit(root, `/${CONFIG_FILE_NAME}`)) report.push(`added /${CONFIG_FILE_NAME} to .git/info/exclude`);
-  const notes = opts.agent || local.agent ? [] : ['note: no agent identity yet; run `hub init --agent <human>/<agent>` in each worktree (or set HUB_AGENT)'];
+  const agent = opts.agent ?? local.agent;
+  const envAgent = (opts.env ?? process.env).HUB_AGENT;
+  if (!agent) notes.push('note: no agent identity yet; run `hub init --agent <human>/<agent>` in each worktree');
+  else if (envAgent && envAgent !== agent) {
+    notes.push(
+      `note: HUB_AGENT=${envAgent} is set in this shell and overrides ${agent} from ${CONFIG_FILE_NAME} for every hub command and Claude session started from it; ` +
+        `unset it so this worktree acts as ${agent}`,
+    );
+  }
 
   // 3. Claude Code hooks
   if (opts.hooks !== false) {
@@ -69,7 +112,10 @@ export function init(opts: InitOptions): string[] {
     // run at all (`hub` or node missing, a crash, its timeout), Claude Code must
     // block the edit rather than let it through uncoordinated.
     let changed = addHook(hooks, 'PreToolUse', PRE_EDIT_MATCHER, `${command} hook pre-edit`, 'block');
+    // Confirms the claims of edits that ran; settle releases the ones of edits that never did.
+    changed = addHook(hooks, 'PostToolUse', PRE_EDIT_MATCHER, `${command} hook post-edit`) || changed;
     changed = addHook(hooks, 'SessionStart', undefined, `${command} hook digest`) || changed;
+    for (const event of SETTLE_EVENTS) changed = addHook(hooks, event, undefined, `${command} hook settle`) || changed;
     if (opts.mcp !== false) {
       const enabled: string[] = (settings.enabledMcpjsonServers ??= []);
       if (!enabled.includes('hub')) {
@@ -79,7 +125,7 @@ export function init(opts: InitOptions): string[] {
     }
     if (changed) {
       writeJson(settingsPath, settings);
-      report.push('updated .claude/settings.json (PreToolUse pre-edit hook, SessionStart digest hook)');
+      report.push('updated .claude/settings.json (pre-edit, post-edit, settle and digest hooks)');
     }
   }
 
@@ -97,38 +143,71 @@ export function init(opts: InitOptions): string[] {
     }
   }
 
-  // 5. git pre-commit guard
+  // 5. git guard
   if (opts.guard !== false) {
     const hooksDir = git(root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']);
     if (!hooksDir) throw new Error('could not locate the git hooks directory');
     mkdirSync(hooksDir, { recursive: true });
-    const hookPath = path.join(hooksDir, 'pre-commit');
-    const script = guardScript(command);
-    const current = existsSync(hookPath) ? readFileSync(hookPath, 'utf8') : null;
-    if (current !== script) {
-      if (current !== null && !current.includes(GUARD_MARKER)) {
-        const chained = path.join(hooksDir, CHAINED_HOOK);
-        if (existsSync(chained)) throw new Error(`${hookPath} exists and ${chained} too; merge them by hand`);
-        renameSync(hookPath, chained);
-        report.push(`kept your existing pre-commit hook as ${CHAINED_HOOK} (runs after the guard)`);
-      }
-      writeFileSync(hookPath, script);
-      chmodSync(hookPath, 0o755);
-      report.push(`installed pre-commit guard at ${hookPath}`);
-    }
+    installGitHook(hooksDir, 'pre-commit', guardScript(command), report);
+    installGitHook(hooksDir, 'prepare-commit-msg', sequencerGuardScript(command), report);
   }
 
   return [...(report.length ? report : ['already set up; nothing to change']), ...notes];
 }
 
-export function guardScript(command: string): string {
-  const shown = command.replace(/["'`$\\]/g, '');
-  return `#!/bin/sh
-${GUARD_MARKER} (installed by \`hub init\`)
-# Rejects commits that touch files another agent holds an exclusive claim on.
-# Bypass in an emergency: git commit --no-verify   or   HUB_GUARD=off git commit
+/** The project (and hub URL) the other worktrees' agenthub.json files agree on; throws if they don't. */
+function siblingTeamConfig(root: string): ConfigFile | null {
+  const out = git(root, ['worktree', 'list', '--porcelain']) ?? '';
+  const found: ConfigFile[] = [];
+  for (const line of out.split('\n')) {
+    if (!line.startsWith('worktree ')) continue;
+    const dir = line.slice('worktree '.length);
+    if (path.resolve(dir) === path.resolve(root)) continue;
+    try {
+      const f = readConfigFile(path.join(dir, TEAM_CONFIG_FILE_NAME));
+      if (f?.project) found.push(f);
+    } catch {
+      // unreadable there: that checkout will report it itself
+    }
+  }
+  const projects = [...new Set(found.map((f) => f.project))];
+  if (projects.length > 1) throw new Error(`the worktrees' ${TEAM_CONFIG_FILE_NAME} files name different projects (${projects.join(', ')}); run hub init --project ID`);
+  return found.find((f) => f.url) ?? found[0] ?? null;
+}
 
-# Exit 127: the CLI (or the node it runs on) could not start, so nothing has read
+/** Write a guard hook; a hook of the user's already there is kept and chained after it. */
+function installGitHook(hooksDir: string, name: string, script: string, report: string[]): void {
+  const hookPath = path.join(hooksDir, name);
+  const current = existsSync(hookPath) ? readFileSync(hookPath, 'utf8') : null;
+  if (current === script) return;
+  if (current !== null && !current.includes(GUARD_MARKER)) {
+    const chained = path.join(hooksDir, `${name}${CHAINED_SUFFIX}`);
+    if (existsSync(chained)) throw new Error(`${hookPath} exists and ${chained} too; merge them by hand`);
+    renameSync(hookPath, chained);
+    report.push(`kept your existing ${name} hook as ${name}${CHAINED_SUFFIX} (runs after the guard)`);
+  }
+  writeFileSync(hookPath, script);
+  chmodSync(hookPath, 0o755);
+  report.push(`installed ${name} guard at ${hookPath}`);
+}
+
+/** POSIX sh that runs the guard and handles a CLI that can't start (exit 127) as fail-closed says. */
+function runGuardSh(command: string, args: string): string {
+  const shown = command.replace(/["'`$\\]/g, '');
+  return `${command} guard${args}
+status=$?
+if [ "$status" -eq 127 ] && [ "$HUB_GUARD" != off ]; then
+  if fail_closed; then
+    echo "agenthub: could not run '${shown}' (not on PATH, or node is missing); commit blocked (fail-closed)" >&2
+    exit 1
+  fi
+  echo "agenthub: could not run '${shown}' (not on PATH, or node is missing); claim guard skipped" >&2
+fi
+[ "$status" -eq 127 ] && status=0
+[ "$status" -ne 0 ] && exit "$status"`;
+}
+
+const FAIL_CLOSED_SH = `# Exit 127: the CLI (or the node it runs on) could not start, so nothing has read
 # the fail-closed setting. Same precedence as the CLI: HUB_FAIL_CLOSED, then
 # failClosed in the global, team and local config files (later files win).
 fail_closed() {
@@ -144,38 +223,85 @@ fail_closed() {
     grep -Eq '"failClosed"[[:space:]]*:[[:space:]]*false' "$f" && fc=1
   done
   return "$fc"
-}
+}`;
 
-${command} guard
-status=$?
-if [ "$status" -eq 127 ] && [ "$HUB_GUARD" != off ]; then
-  if fail_closed; then
-    echo "agenthub: could not run '${shown}' (not on PATH, or node is missing); commit blocked (fail-closed)" >&2
-    exit 1
-  fi
-  echo "agenthub: could not run '${shown}' (not on PATH, or node is missing); claim guard skipped" >&2
-fi
-[ "$status" -eq 127 ] && status=0
-[ "$status" -ne 0 ] && exit "$status"
-chained="$(dirname "$0")/${CHAINED_HOOK}"
+const chainSh = (name: string): string => `chained="$(dirname "$0")/${name}${CHAINED_SUFFIX}"
 if [ -x "$chained" ]; then
   exec "$chained" "$@"
 fi
 exit 0
 `;
+
+export function guardScript(command: string): string {
+  return `#!/bin/sh
+${GUARD_MARKER} (installed by \`hub init\`)
+# Rejects commits that touch files another agent holds an exclusive claim on.
+# Bypass in an emergency: git commit --no-verify   or   HUB_GUARD=off git commit
+
+${FAIL_CLOSED_SH}
+
+${runGuardSh(command, '')}
+${chainSh('pre-commit')}`;
+}
+
+/**
+ * prepare-commit-msg: git revert, cherry-pick and rebase commit without running
+ * pre-commit, but with MERGE_MSG in the git dir and no MERGE_HEAD. Other commits
+ * went through pre-commit (or skipped it on purpose with --no-verify): so did a
+ * `git commit` that picks up MERGE_MSG to finish a conflicted pick ($2 is
+ * "merge"). Merge commits, which carry other branches' work, are left alone.
+ */
+export function sequencerGuardScript(command: string): string {
+  return `#!/bin/sh
+${GUARD_MARKER} (installed by \`hub init\`)
+# git revert, cherry-pick and rebase make commits without running pre-commit;
+# this checks those against other agents' exclusive claims.
+# Bypass in an emergency: HUB_GUARD=off git <command>
+
+${FAIL_CLOSED_SH}
+
+gitdir="$(git rev-parse --git-dir 2>/dev/null)"
+if [ "$2" != merge ] && [ -n "$gitdir" ] && [ -f "$gitdir/MERGE_MSG" ] && [ ! -f "$gitdir/MERGE_HEAD" ]; then
+${runGuardSh(command, ' --sequencer').replace(/^/gm, '  ')}
+fi
+${chainSh('prepare-commit-msg')}`;
 }
 
 type HookEntry = { type: string; command: string; timeout?: number; onFailure?: 'block' | 'continue' };
 type HookGroup = { matcher?: string; hooks: HookEntry[] };
 
-/** Add the hook unless it's there; an entry from an older `hub init` gets the `onFailure` it lacks (an explicit choice is kept). */
+/** Tools a matcher made of plain names (which Claude Code reads as an exact list) leaves out. A pattern, or none, matches them all. */
+function missingTools(matcher: string | undefined, tools: string[]): string[] {
+  if (!matcher || matcher === '*' || !/^[A-Za-z0-9_|, -]+$/.test(matcher)) return [];
+  const names = matcher.split(/[|,]/).map((n) => n.trim());
+  return tools.filter((t) => !names.includes(t));
+}
+
+/**
+ * Add the hook unless it's there. An entry from an older `hub init` gets the
+ * `onFailure` it lacks (an explicit choice is kept), and one whose group's
+ * matcher misses a file-writing tool (NotebookEdit) moves to `matcher`: the
+ * whole group if the entry is alone in it, else into a group of its own.
+ */
 function addHook(hooks: Record<string, HookGroup[]>, event: string, matcher: string | undefined, command: string, onFailure?: 'block'): boolean {
   const groups = (hooks[event] ??= []);
-  const existing = groups.flatMap((g) => g.hooks ?? []).find((h) => h.command === command);
-  if (existing) {
-    if (!onFailure || existing.onFailure !== undefined) return false;
-    existing.onFailure = onFailure;
-    return true;
+  const holder = groups.find((g) => (g.hooks ?? []).some((h) => h.command === command));
+  if (holder) {
+    const existing = holder.hooks.find((h) => h.command === command)!;
+    let changed = false;
+    if (onFailure && existing.onFailure === undefined) {
+      existing.onFailure = onFailure;
+      changed = true;
+    }
+    if (matcher && missingTools(holder.matcher, EDIT_TOOLS).length > 0) {
+      if (holder.hooks.length === 1) holder.matcher = matcher;
+      else {
+        holder.hooks = holder.hooks.filter((h) => h !== existing);
+        groups.push({ matcher, hooks: [existing] });
+      }
+      changed = true;
+    }
+    return changed;
   }
   const entry: HookEntry = { type: 'command', command, timeout: 30 };
   if (onFailure) entry.onFailure = onFailure;

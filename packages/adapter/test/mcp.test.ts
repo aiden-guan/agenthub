@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { RunningServer } from '@agenthub/hub';
@@ -6,7 +7,7 @@ import { HubClient } from '../src/client.js';
 import type { HubConfig } from '../src/config.js';
 import { Feed } from '../src/feed.js';
 import { createMcpServer } from '../src/mcp.js';
-import { A, B, PROJECT, makeRepo, sleep, startHub, type SampleRepo } from './helpers.js';
+import { A, B, PROJECT, hubCli, makeRepo, preToolUseInput, sessionEventInput, sleep, startHub, testEnv, type SampleRepo } from './helpers.js';
 
 const TOOLS = ['claim', 'decide', 'hub_post', 'hub_status', 'hub_wait', 'inbox', 'land', 'release', 'task_create', 'task_list', 'task_take'];
 
@@ -28,7 +29,7 @@ afterAll(async () => {
 
 /** An MCP client connected to a fresh `hub mcp` server for `agent`, with a live feed. */
 async function connect(agent: string, root: string) {
-  const cfg: HubConfig = { url: srv.url, agent, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root, configFiles: [] };
+  const cfg: HubConfig = { url: srv.url, agent, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root, configFiles: [], projectSource: 'env', warnings: [] };
   const hubClient = new HubClient(cfg);
   const feed = new Feed(hubClient, { heartbeatMs: 1000 });
   feed.start();
@@ -133,7 +134,7 @@ describe('hub mcp', () => {
   });
 
   it('refuses to act without an agent identity', async () => {
-    const cfg: HubConfig = { url: srv.url, agent: null, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root: repo.wtA, configFiles: [] };
+    const cfg: HubConfig = { url: srv.url, agent: null, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root: repo.wtA, configFiles: [], projectSource: 'env', warnings: [] };
     const server = createMcpServer({ cfg, client: new HubClient(cfg), feed: null, cwd: repo.wtA });
     const [c, s] = InMemoryTransport.createLinkedPair();
     await server.connect(s);
@@ -143,6 +144,19 @@ describe('hub mcp', () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/no agent identity/);
     await mcp.close();
+  });
+
+  it('keeps a claim the edit hook took for an edit that never ran once the agent claims the file with claim', async () => {
+    const env = testEnv({ HUB_URL: srv.url, HUB_PROJECT: PROJECT, HUB_AGENT: A });
+    const file = path.join(repo.wtA, 'docs', 'adopted.md');
+    const ids = { session: 'sess-mcp', toolUseId: 'toolu_mcp_1' };
+    expect((await hubCli(['hook', 'pre-edit'], { cwd: repo.wtA, env, input: preToolUseInput(repo.wtA, file, 'Write', ids) })).stdout).toBe('');
+    const a = await connect(A, repo.wtA);
+    expect((await a.call('claim', { files: ['docs/adopted.md'], intent: 'write the docs' })).text).toMatch(/^You already hold C-\d+ \(docs\/adopted\.md\)/);
+    await hubCli(['hook', 'settle'], { cwd: repo.wtA, env, input: sessionEventInput(repo.wtA, 'Stop', 'sess-mcp') });
+    const held = (await new HubClient({ url: srv.url, project: PROJECT, agent: A, token: null, timeoutMs: 3000 }).status()).claims;
+    expect(held.filter((c) => c.scope.some((s) => s.file === 'docs/adopted.md')).map((c) => c.holder)).toEqual([A]);
+    await a.call('release', { files: ['docs/adopted.md'] });
   });
 });
 

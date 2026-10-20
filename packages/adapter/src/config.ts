@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { deriveProject, findRepoRoot } from './git.js';
+import { deriveProject, findRepoRoot, recordedSettings } from './git.js';
 
 export const DEFAULT_URL = 'http://127.0.0.1:7077';
 /** Per-worktree, never committed: agent identity, token, local overrides. */
@@ -35,11 +35,21 @@ export interface HubConfig {
   root: string | null;
   /** Config files that were read, lowest precedence first. */
   configFiles: string[];
+  /**
+   * Where `project` came from. `recorded`: the repository's git config, which
+   * `hub init` writes for checkouts whose branch has no agenthub.json yet.
+   * `derived`: guessed from the repository, so it may not be the team's.
+   */
+  projectSource: 'env' | 'file' | 'recorded' | 'derived' | 'default';
+  /** Settings that work but are probably not what the user meant, for the digest, the guard and `hub whoami`. */
+  warnings: string[];
 }
 
 /**
  * Resolution order, later wins: global file (~/.config/agenthub/config.json or
- * $HUB_CONFIG), then the committed `<worktree>/agenthub.json`, then the local
+ * $HUB_CONFIG), then the committed `<worktree>/agenthub.json` (or, in a
+ * checkout whose branch doesn't have that file yet, the project and URL
+ * `hub init` recorded in the repository's git config), then the local
  * `<worktree>/.hub.json`, then environment variables HUB_URL, HUB_AGENT,
  * HUB_PROJECT, HUB_TOKEN, HUB_FAIL_CLOSED, HUB_TIMEOUT_MS. A token in the
  * committed file is ignored. Throws on a value it can't read exactly (a
@@ -60,7 +70,11 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
     delete team.agent;
     delete team.token;
   }
-  const file: ConfigFile = Object.assign({}, ...sources.map(([, f]) => f ?? {}));
+  // A branch made before agenthub.json was committed has no copy of it, but the
+  // pre-commit guard runs there too: use what `hub init` recorded for every worktree.
+  const recorded: ConfigFile = root && !team && !(env.HUB_PROJECT && env.HUB_URL) ? recordedSettings(root) : {};
+  const files = sources.map(([, f]) => f ?? {});
+  const file: ConfigFile = Object.assign({}, files[0], recorded, ...files.slice(1));
 
   const agent = env.HUB_AGENT || file.agent || null;
   if (agent && !AGENT_ID_RE.test(agent)) {
@@ -68,15 +82,33 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
   }
   const url = (env.HUB_URL || file.url || DEFAULT_URL).replace(/\/+$/, '');
   if (!/^https?:\/\/[^/]/.test(url) || !URL.canParse(url)) throw new Error(`hub URL ${JSON.stringify(url)} is invalid; use http://host:port`);
+  const warnings: string[] = [];
+  const localFile = root ? sources[2] : null;
+  const localAgent = localFile?.[1]?.agent;
+  if (env.HUB_AGENT && localAgent && env.HUB_AGENT !== localAgent) {
+    warnings.push(
+      `HUB_AGENT=${env.HUB_AGENT} overrides ${localAgent} from ${localFile![0]}, so this session acts as ${env.HUB_AGENT}: ` +
+        `its claims merge with every other session using that name. Unset HUB_AGENT to act as ${localAgent}.`,
+    );
+  }
+  const chosen = env.HUB_PROJECT || file.project;
+  const derived = !chosen && root ? deriveProject(root) : null;
+  const projectSource: HubConfig['projectSource'] = env.HUB_PROJECT
+    ? 'env'
+    : chosen
+      ? chosen === recorded.project && !files.slice(1).some((f) => f.project) ? 'recorded' : 'file'
+      : derived ? 'derived' : 'default';
   return {
     url,
     agent,
-    project: env.HUB_PROJECT || file.project || (root ? deriveProject(root) : null) || 'default',
+    project: chosen || derived || 'default',
     token: env.HUB_TOKEN || file.token || null,
     failClosed: parseBool('HUB_FAIL_CLOSED', env.HUB_FAIL_CLOSED) ?? file.failClosed ?? false,
     timeoutMs: parseTimeout(env.HUB_TIMEOUT_MS),
     root,
     configFiles: sources.filter(([, f]) => f !== null).map(([p]) => p),
+    projectSource,
+    warnings,
   };
 }
 

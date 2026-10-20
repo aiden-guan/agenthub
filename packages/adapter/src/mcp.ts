@@ -18,6 +18,7 @@ import {
   statusText,
 } from './format.js';
 import { currentBranch, headCommit, toRepoPath } from './git.js';
+import { adoptClaims } from './pending.js';
 
 export const VERSION = '0.1.0';
 
@@ -162,6 +163,7 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         queue: args.queue ?? true,
         base_commit: cfg.root ? (headCommit(cfg.root) ?? undefined) : undefined,
       });
+      adoptClaims(cfg.root, res.claims);
       return describeClaimResult(res);
     }),
   );

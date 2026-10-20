@@ -4,6 +4,7 @@ import { HubClient } from './client.js';
 import { loadConfig } from './config.js';
 import { claimFiles, formatDecision, formatMessage, formatTask, statusText, UNTRUSTED_NOTE } from './format.js';
 import { currentBranch, headCommit, toRepoPath } from './git.js';
+import { adoptClaims } from './pending.js';
 import type { HookOutcome } from './hooks.js';
 
 const ok = (stdout: string): HookOutcome => ({ stdout, stderr: '', exitCode: 0 });
@@ -18,7 +19,7 @@ export async function human(cmd: string, argv: string[]): Promise<HookOutcome> {
   };
   const files = (paths: string[]) =>
     paths.map((f) => {
-      const p = cfg.root ? toRepoPath(f, cfg.root, process.cwd()) : f;
+      const p = cfg.root ? toRepoPath(f, cfg.root, process.cwd()) : f.normalize('NFC');
       if (!p) throw new Error(`${f} is outside the repository`);
       return p;
     });
@@ -73,6 +74,7 @@ export async function human(cmd: string, argv: string[]): Promise<HookOutcome> {
         queue: values.queue ?? false,
         base_commit: cfg.root ? (headCommit(cfg.root) ?? undefined) : undefined,
       });
+      adoptClaims(cfg.root, res.claims);
       if (res.status === 'denied') {
         return fail(`denied: ${res.conflicts.map((c) => `${c.files.join(', ')} held by ${c.holder} (${c.claim_id})`).join('; ')}`);
       }

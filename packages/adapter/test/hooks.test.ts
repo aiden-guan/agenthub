@@ -1,8 +1,26 @@
-import { rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { A, B, PROJECT, client, fakeHub, failingHub, hubCli, makeRepo, preToolUseInput, startHub, testEnv, type SampleRepo } from './helpers.js';
+import {
+  A,
+  B,
+  PROJECT,
+  client,
+  fakeHub,
+  failingHub,
+  git,
+  hubCli,
+  makeRepo,
+  postToolUseInput,
+  preToolUseInput,
+  sessionEventInput,
+  startHub,
+  testEnv,
+  type CallIds,
+  type SampleRepo,
+  type SessionEvent,
+} from './helpers.js';
 
 let srv: RunningServer;
 let repo: SampleRepo;
@@ -210,6 +228,22 @@ describe('hub hook digest', () => {
     expect(status.agents.find((x) => x.agent === B)).toMatchObject({ online: true, client: 'claude-code', branch: 'agent-b' });
   });
 
+  it('warns the user and Claude when HUB_AGENT overrides the identity in this checkout\'s .hub.json', async () => {
+    const local = path.join(repo.wtB, '.hub.json');
+    writeFileSync(local, JSON.stringify({ agent: 'lee/claude-1' }));
+    try {
+      const res = await hubCli(['hook', 'digest'], { cwd: repo.wtB, env: envFor(B), input: '{}' });
+      const out = JSON.parse(res.stdout);
+      expect(out.systemMessage).toMatch(/^agenthub: HUB_AGENT=sam\/claude-1 overrides lee\/claude-1 from .*\.hub\.json/);
+      expect(out.hookSpecificOutput.additionalContext).toContain(out.systemMessage);
+      expect(out.hookSpecificOutput.additionalContext).toContain('you are sam/claude-1');
+      const whoami = JSON.parse((await hubCli(['whoami'], { cwd: repo.wtB, env: envFor(B) })).stdout);
+      expect(whoami.warnings).toEqual([expect.stringMatching(/^HUB_AGENT=sam\/claude-1 overrides lee\/claude-1/)]);
+    } finally {
+      rmSync(local);
+    }
+  });
+
   it('tells the agent when the hub is unavailable instead of failing the session', async () => {
     const res = await hubCli(['hook', 'digest'], { cwd: repo.wtB, env: envFor(B, { HUB_URL: 'http://127.0.0.1:9', HUB_TIMEOUT_MS: '1000' }), input: '{}' });
     expect(res.code).toBe(0);
@@ -227,5 +261,194 @@ describe('hub hook digest', () => {
     } finally {
       await secured.close();
     }
+  });
+});
+
+/** Each block below gets its own hub and repo, so claims from one never leak into another. */
+function sandbox() {
+  const ctx = {} as { hub: RunningServer; r: SampleRepo };
+  beforeAll(async () => {
+    ctx.hub = await startHub();
+    ctx.r = makeRepo();
+  });
+  afterAll(async () => {
+    await ctx.hub.close();
+    ctx.r.cleanup();
+  });
+  return ctx;
+}
+
+describe('hub hook pre-edit: repo, identity and claim key come from the edited file, not from where Claude has cd-ed', () => {
+  const ctx = sandbox();
+  // Identities come from each worktree's .hub.json here, as `hub init --agent` writes them, not from HUB_AGENT.
+  const env = (extra: Record<string, string | undefined> = {}) => testEnv({ HUB_URL: ctx.hub.url, HUB_PROJECT: PROJECT, ...extra });
+  const edit = (cwd: string, file: string, extra: Record<string, string | undefined> = {}) =>
+    hubCli(['hook', 'pre-edit'], { cwd, env: env(extra), input: preToolUseInput(cwd, file) });
+  const oak = () => path.join(ctx.r.wtB, '.claude', 'worktrees', 'bold-oak');
+
+  beforeAll(async () => {
+    const { r } = ctx;
+    writeFileSync(path.join(r.wtA, '.hub.json'), JSON.stringify({ agent: A }));
+    writeFileSync(path.join(r.wtB, '.hub.json'), JSON.stringify({ agent: B }));
+    mkdirSync(path.join(r.wtB, 'vendor', 'lib'), { recursive: true });
+    git(path.join(r.wtB, 'vendor', 'lib'), 'init', '-q'); // a nested repository, as with a submodule
+    git(r.main, 'worktree', 'add', '-q', oak(), '-b', 'bold-oak'); // where `claude --worktree` / EnterWorktree put one
+    expect((await edit(r.wtA, path.join(r.wtA, 'src', 'auth.ts'))).stdout).toBe(''); // maya claims src/auth.ts
+  });
+
+  it("denies sam's edit of his copy of a file maya holds from any directory Claude may be in", async () => {
+    const { r } = ctx;
+    const target = path.join(r.wtB, 'src', 'auth.ts');
+    for (const cwd of [r.wtB, path.join(r.wtB, 'src'), path.join(r.wtB, 'vendor', 'lib'), oak(), r.wtA, r.dir]) {
+      const res = await edit(cwd, target);
+      expect(res.code, cwd).toBe(0);
+      expect(denyReasonOf(res.stdout), cwd).toMatch(/^src\/auth\.ts is claimed by maya\/claude-1/);
+    }
+    expect(denyReasonOf((await edit(path.join(r.wtB, 'vendor', 'lib'), target, { HUB_AGENT: B })).stdout)).toMatch(/^src\/auth\.ts is claimed by maya/);
+  });
+
+  it('keys a file in a worktree under .claude/worktrees by its repo path, with the identity of the session that created it', async () => {
+    const { r } = ctx;
+    const session = { CLAUDE_PROJECT_DIR: r.wtB };
+    expect(denyReasonOf((await edit(r.wtB, path.join(oak(), 'src', 'auth.ts'), session)).stdout)).toMatch(/^src\/auth\.ts is claimed by maya\/claude-1/);
+    expect(await edit(oak(), path.join(oak(), 'src', 'users.ts'), session)).toEqual({ code: 0, stdout: '', stderr: '' });
+    const claims = (await client(ctx.hub.url, A).status()).claims.map((c) => `${c.holder} ${c.scope[0].file}`).sort();
+    expect(claims).toEqual(['maya/claude-1 src/auth.ts', 'sam/claude-1 src/users.ts']);
+  });
+
+  it('denies an edit no identity can be found for when HUB_FAIL_CLOSED is set, and warns visibly otherwise', async () => {
+    const file = path.join(oak(), 'README.md'); // bold-oak has no .hub.json and no session dir says who this is
+    expect(denyReasonOf((await edit(oak(), file, { HUB_FAIL_CLOSED: '1' })).stdout)).toMatch(/no agent identity.*HUB_FAIL_CLOSED/);
+    expectVisibleWarning((await edit(oak(), file)).stdout, /no agent identity/);
+  });
+});
+
+describe('hub hook pre-edit: claim keys', () => {
+  const ctx = sandbox();
+  const env = (agent: string) => testEnv({ HUB_URL: ctx.hub.url, HUB_PROJECT: PROJECT, HUB_AGENT: agent });
+  const edit = (agent: string, wt: string, rel: string, tool = 'Edit') =>
+    hubCli(['hook', 'pre-edit'], { cwd: wt, env: env(agent), input: preToolUseInput(wt, path.join(wt, rel), tool) });
+  const claimed = async () => (await client(ctx.hub.url, A).status()).claims.map((c) => `${c.holder} ${c.scope[0].file}`).sort();
+
+  it("treats names that merely start with two dots ('..env', '..data/x') as files in the repository", async () => {
+    const { r } = ctx;
+    for (const rel of ['..env', path.join('..data', 'x.ts'), '...']) {
+      expect((await edit(A, r.wtA, rel)).stdout, rel).toBe('');
+      expect(denyReasonOf((await edit(B, r.wtB, rel)).stdout), rel).toMatch(/is claimed by maya\/claude-1/);
+    }
+    expect(await claimed()).toEqual(['maya/claude-1 ...', 'maya/claude-1 ..data/x.ts', 'maya/claude-1 ..env']);
+  });
+
+  it('gives the same NFC key to a file whose name is decomposed (NFD) on disk in one worktree and composed in another', async () => {
+    const { r } = ctx;
+    const nfd = 'café.ts';
+    const nfc = 'café.ts';
+    writeFileSync(path.join(r.wtA, 'src', nfd), 'export {};\n'); // as Finder or a Cocoa app would name it
+    writeFileSync(path.join(r.wtB, 'src', nfc), 'export {};\n');
+    expect((await edit(A, r.wtA, path.join('src', nfc))).stdout).toBe('');
+    expect(denyReasonOf((await edit(B, r.wtB, path.join('src', nfc))).stdout)).toMatch(/^src\/café\.ts is claimed by maya\/claude-1/);
+    expect(denyReasonOf((await edit(B, r.wtB, path.join('src', nfd))).stdout)).toMatch(/is claimed by maya\/claude-1/);
+    const keys = (await client(ctx.hub.url, A).status()).claims.map((c) => c.scope[0].file).filter((f) => f.startsWith('src/caf'));
+    expect(keys).toEqual([`src/${nfc}`]);
+  });
+
+  it('does not claim files git ignores: each worktree has its own copy, which can never conflict', async () => {
+    const { r } = ctx;
+    const exclude = git(r.main, 'rev-parse', '--path-format=absolute', '--git-path', 'info/exclude').trim();
+    appendFileSync(exclude, '.env\nnode_modules/\n');
+    for (const rel of ['.env', path.join('node_modules', 'foo', 'index.js')]) {
+      expect(await edit(A, r.wtA, rel, 'Write'), rel).toEqual({ code: 0, stdout: '', stderr: '' });
+      expect(await edit(B, r.wtB, rel, 'Write'), rel).toEqual({ code: 0, stdout: '', stderr: '' });
+    }
+    expect((await claimed()).filter((c) => c.includes('.env') && !c.includes('..env'))).toEqual([]);
+    expect((await claimed()).filter((c) => c.includes('node_modules'))).toEqual([]);
+    // A tracked file stays coordinated even when an ignore rule matches it.
+    appendFileSync(exclude, 'README.md\n');
+    expect((await edit(A, r.wtA, 'README.md')).stdout).toBe('');
+    expect(denyReasonOf((await edit(B, r.wtB, 'README.md')).stdout)).toMatch(/^README\.md is claimed by maya\/claude-1/);
+  });
+
+  it('claims notebooks edited with NotebookEdit (notebook_path)', async () => {
+    const { r } = ctx;
+    expect((await edit(A, r.wtA, 'analysis.ipynb', 'NotebookEdit')).stdout).toBe('');
+    expect(denyReasonOf((await edit(B, r.wtB, 'analysis.ipynb', 'NotebookEdit')).stdout)).toMatch(/^analysis\.ipynb is claimed by maya\/claude-1/);
+  });
+});
+
+describe('claims the edit hook took for tool calls that never ran', () => {
+  const ctx = sandbox();
+  const env = (agent: string) => testEnv({ HUB_URL: ctx.hub.url, HUB_PROJECT: PROJECT, HUB_AGENT: agent });
+  const maya = (n: number, extra: CallIds = {}): CallIds => ({ session: 'sess-maya', toolUseId: `toolu_maya_${n}`, ...extra });
+  const pre = (ids: CallIds, rel: string, agent = A, wt = ctx.r.wtA) =>
+    hubCli(['hook', 'pre-edit'], { cwd: wt, env: env(agent), input: preToolUseInput(wt, path.join(wt, rel), 'Edit', ids) });
+  const post = (ids: CallIds, rel: string, agent = A, wt = ctx.r.wtA) =>
+    hubCli(['hook', 'post-edit'], { cwd: wt, env: env(agent), input: postToolUseInput(wt, path.join(wt, rel), 'Edit', ids) });
+  const settle = (event: SessionEvent, session = 'sess-maya', agentId?: string) =>
+    hubCli(['hook', 'settle'], { cwd: ctx.r.wtA, env: env(A), input: sessionEventInput(ctx.r.wtA, event, session, agentId) });
+  const held = async () => (await client(ctx.hub.url, A).status()).claims.filter((c) => c.holder === A).map((c) => c.scope[0].file).sort();
+  const quiet = { code: 0, stdout: '', stderr: '' };
+
+  it('releases the claim of an edit the user rejected once a later edit of the same agent runs', async () => {
+    expect(await pre(maya(1), 'src/users.ts')).toEqual(quiet); // claimed, then maya clicks "No": no PostToolUse
+    expect(await held()).toEqual(['src/users.ts']);
+    expect(await pre(maya(2), 'README.md')).toEqual(quiet);
+    expect(await post(maya(2), 'README.md')).toEqual(quiet);
+    expect(await held()).toEqual(['README.md']);
+    const sam = { session: 'sess-sam', toolUseId: 'toolu_sam_1' };
+    expect(await pre(sam, 'src/users.ts', B, ctx.r.wtB)).toEqual(quiet);
+  });
+
+  it('keeps the claims of edits that ran, including one that failed once and was retried', async () => {
+    await pre(maya(3), 'src/auth.ts');
+    await post(maya(3), 'src/auth.ts');
+    await pre(maya(4), 'src/new.ts'); // fails (old_string not found): no PostToolUse
+    await pre(maya(5), 'src/new.ts'); // the retry renews the same claim
+    await post(maya(5), 'src/new.ts');
+    expect(await settle('Stop')).toEqual(quiet);
+    expect(await held()).toEqual(['README.md', 'src/auth.ts', 'src/new.ts']);
+  });
+
+  it('releases unconfirmed claims at the end of the turn, on the next prompt, and when the session ends', async () => {
+    let n = 10;
+    for (const event of ['Stop', 'UserPromptSubmit', 'SessionEnd'] as const) {
+      await pre(maya(n++), `docs/${event}.md`);
+      expect(await held(), event).toContain(`docs/${event}.md`);
+      expect(await settle(event), event).toEqual(quiet);
+      expect(await held(), event).not.toContain(`docs/${event}.md`);
+    }
+  });
+
+  it('keeps a claim the agent then makes on purpose', async () => {
+    await pre(maya(20), 'src/plan.ts');
+    const res = await hubCli(['claim', 'src/plan.ts', '--intent', 'plan the refactor'], { cwd: ctx.r.wtA, env: env(A) });
+    expect(res.stdout).toMatch(/^granted \(renewed\)/);
+    await settle('Stop');
+    expect(await held()).toContain('src/plan.ts');
+  });
+
+  it("keeps a subagent's rejected claim once the main thread makes that edit itself", async () => {
+    await pre(maya(40, { agentId: 'sub-2' }), 'lib/e.ts'); // rejected
+    await pre(maya(41), 'lib/e.ts'); // renews the same claim
+    await post(maya(41), 'lib/e.ts');
+    await settle('SubagentStop', 'sess-maya', 'sub-2');
+    expect(await held()).toContain('lib/e.ts');
+  });
+
+  it("leaves other subagents' and other sessions' pending claims alone until their own turn ends", async () => {
+    await pre(maya(30, { agentId: 'sub-1' }), 'lib/a.ts'); // a subagent's edit, waiting for permission
+    await pre(maya(31), 'lib/b.ts');
+    await post(maya(31), 'lib/b.ts'); // the main thread moves on
+    await pre({ session: 'sess-maya-2', toolUseId: 'toolu_other' }, 'lib/c.ts'); // another session of the same agent
+    await pre({ session: 'sess-maya-2', toolUseId: 'toolu_other_2' }, 'lib/d.ts');
+    expect(await held()).toEqual(expect.arrayContaining(['lib/a.ts', 'lib/b.ts', 'lib/c.ts', 'lib/d.ts']));
+    await settle('Stop'); // the main thread's turn: the subagent may still be waiting
+    expect(await held()).toEqual(expect.arrayContaining(['lib/a.ts', 'lib/b.ts', 'lib/c.ts', 'lib/d.ts']));
+    expect(await settle('SubagentStop', 'sess-maya', 'sub-1')).toEqual(quiet);
+    expect(await held()).not.toContain('lib/a.ts');
+    expect(await settle('SessionEnd', 'sess-maya-2')).toEqual(quiet); // every thread of that session
+    const after = await held();
+    expect(after).not.toContain('lib/c.ts');
+    expect(after).not.toContain('lib/d.ts');
+    expect(after).toContain('lib/b.ts');
   });
 });

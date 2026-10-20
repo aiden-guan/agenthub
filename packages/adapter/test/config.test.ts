@@ -2,8 +2,9 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { loadConfig } from '../src/config.js';
-import { toRepoPath } from '../src/git.js';
+import { DEFAULT_URL, loadConfig } from '../src/config.js';
+import { stagedPaths, toRepoPath } from '../src/git.js';
+import { git } from './helpers.js';
 
 // realpath: on macOS the temp dir lives behind the /var -> /private/var symlink
 const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'agenthub-config-')));
@@ -83,5 +84,56 @@ describe('config', () => {
     expect(toRepoPath('src/a.ts', root, root)).toBe('src/a.ts');
     expect(toRepoPath('../outside.ts', root, root)).toBeNull();
     expect(toRepoPath(path.join(root, '.git', 'config'), root, root)).toBeNull();
+  });
+
+  it("keeps names that only start with two dots ('..env', '...', '..data/x') inside the repository", () => {
+    const root = repo('dots', {});
+    expect(toRepoPath(path.join(root, '..env'), root, root)).toBe('..env');
+    expect(toRepoPath(path.join(root, '...'), root, root)).toBe('...');
+    expect(toRepoPath(path.join(root, '..data', 'x.ts'), root, root)).toBe('..data/x.ts');
+    expect(toRepoPath('..', root, root)).toBeNull();
+    expect(toRepoPath(path.join('..', 'x.ts'), root, root)).toBeNull();
+    expect(toRepoPath(path.join(root, 'src', '..', '..', 'x.ts'), root, root)).toBeNull();
+  });
+
+  it('turns claim keys and staged paths into NFC, whatever form the name has on disk or in the request', () => {
+    const root = path.join(dir, 'unicode');
+    mkdirSync(path.join(root, 'src'), { recursive: true });
+    git(root, 'init', '-q');
+    const nfd = 'cafe\u0301.ts';
+    const nfc = 'caf\u00e9.ts';
+    writeFileSync(path.join(root, 'src', nfd), 'export {};\n');
+    expect(toRepoPath(path.join(root, 'src', nfc), root, root)).toBe(`src/${nfc}`);
+    expect(toRepoPath(path.join(root, 'src', nfd), root, root)).toBe(`src/${nfc}`);
+    expect(toRepoPath(path.join(root, 'new', nfd), root, root)).toBe(`new/${nfc}`); // not on disk yet
+    git(root, '-c', 'core.precomposeunicode=false', 'add', '-A');
+    expect(stagedPaths(root)).toEqual([`src/${nfc}`]);
+  });
+
+  it('falls back to the project and hub URL hub init recorded for the repository when this checkout has no agenthub.json', () => {
+    const root = path.join(dir, 'recorded');
+    mkdirSync(root);
+    git(root, 'init', '-q');
+    git(root, 'config', 'agenthub.project', 'team/app');
+    git(root, 'config', 'agenthub.url', 'http://team:9');
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ project: 'team/app', url: 'http://team:9', projectSource: 'recorded' });
+    writeFileSync(path.join(root, 'agenthub.json'), JSON.stringify({ project: 'other' })); // the checkout's own file wins
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ project: 'other', url: DEFAULT_URL, projectSource: 'file' });
+    rmSync(path.join(root, 'agenthub.json'));
+    git(root, 'config', '--unset', 'agenthub.project');
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ project: 'recorded', projectSource: 'derived' });
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_PROJECT: 'p' } })).toMatchObject({ project: 'p', projectSource: 'env' });
+  });
+
+  it("warns when HUB_AGENT overrides the identity in this checkout's .hub.json (env still wins)", () => {
+    const root = repo('override', { '.hub.json': { agent: 'sam/claude-1' } });
+    const cfg = loadConfig({ cwd: root, env: { ...noGlobal, HUB_AGENT: 'maya/claude-1' } });
+    expect(cfg.agent).toBe('maya/claude-1');
+    expect(cfg.warnings).toEqual([expect.stringMatching(/^HUB_AGENT=maya\/claude-1 overrides sam\/claude-1 from .*\.hub\.json/)]);
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_AGENT: 'sam/claude-1' } }).warnings).toEqual([]);
+    expect(loadConfig({ cwd: root, env: noGlobal }).warnings).toEqual([]);
+    const global = path.join(dir, 'global-agent.json');
+    writeFileSync(global, JSON.stringify({ agent: 'lee/claude-1' })); // a default for every checkout: overriding it is normal
+    expect(loadConfig({ cwd: repo('override-global', {}), env: { HUB_CONFIG: global, HUB_AGENT: 'maya/claude-1' } }).warnings).toEqual([]);
   });
 });

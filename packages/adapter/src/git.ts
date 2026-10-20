@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 /** Nearest ancestor of `start` (inclusive) containing `.git` (a directory, or a file in a worktree). */
@@ -61,15 +61,50 @@ export function realish(p: string): string {
 /**
  * Map a file path to the repo-relative POSIX path the hub uses as a claim key,
  * so the same file matches across worktrees. Returns null for files outside
- * the repository or inside `.git`.
+ * the repository or inside `.git`. Keys are NFC: realpath returns a name the
+ * way it is stored on disk (decomposed, on macOS, for files Finder or a Cocoa
+ * app created), while git and other worktrees use the composed form.
  */
 export function toRepoPath(file: string, root: string, cwd: string): string | null {
   const abs = realish(path.resolve(cwd, file));
   const rel = path.relative(realish(root), abs);
-  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
-  const posix = rel.split(path.sep).join('/');
+  // Only a whole '..' segment leaves the root: '..env' and '..data/x' are files in it.
+  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
+  const posix = rel.split(path.sep).join('/').normalize('NFC');
   if (posix === '.git' || posix.startsWith('.git/')) return null;
   return posix;
+}
+
+/** Whether git ignores this untracked repo path (`.env`, `node_modules/…`). A tracked file never counts as ignored. */
+export function isIgnored(root: string, repoPath: string): boolean {
+  try {
+    execFileSync('git', ['check-ignore', '-q', '--', repoPath], { cwd: root, stdio: 'ignore', timeout: 3000 });
+    return true;
+  } catch {
+    return false; // exit 1 (not ignored) or a git failure: coordinate the file
+  }
+}
+
+/**
+ * The git directory every worktree of this repository shares, read the way git
+ * finds it (`.git` itself, or the `gitdir:` a worktree's `.git` file points to
+ * and its `commondir`) without starting git: the edit hook runs before every edit.
+ */
+export function gitCommonDir(root: string): string | null {
+  const dotGit = path.join(root, '.git');
+  try {
+    if (statSync(dotGit).isDirectory()) return dotGit;
+    const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, 'utf8'));
+    if (!m) return null;
+    const gitDir = path.resolve(root, m[1].trim());
+    try {
+      return path.resolve(gitDir, readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim());
+    } catch {
+      return gitDir; // a submodule: its git dir is its own
+    }
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -93,7 +128,18 @@ export function stagedPaths(root: string): string[] {
     const reason = e.code === 'ETIMEDOUT' ? 'no answer within 120 s' : String(e.stderr ?? '').trim().split('\n')[0] || e.message;
     throw new Error(`git diff --cached failed: ${reason}`);
   }
-  return [...new Set(out.split('\0').filter((s) => s.length > 0))];
+  return [...new Set(out.split('\0').filter((s) => s.length > 0).map((s) => s.normalize('NFC')))];
+}
+
+/** Settings `hub init` records in the repository's shared git config (`agenthub.project`, `agenthub.url`). */
+export function recordedSettings(root: string): { project?: string; url?: string } {
+  const out = git(root, ['config', '--local', '--get-regexp', '^agenthub\\.(project|url)$']);
+  const found: { project?: string; url?: string } = {};
+  for (const line of out?.split('\n') ?? []) {
+    const m = /^agenthub\.(project|url) (.+)$/.exec(line.trim());
+    if (m) found[m[1] as 'project' | 'url'] = m[2];
+  }
+  return found;
 }
 
 /** A stable project id shared by every worktree: `owner/repo` from origin, else the main checkout's folder name. */

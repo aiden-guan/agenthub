@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { stagedPaths } from '../src/git.js';
-import { guardScript, init, splitCommand } from '../src/init.js';
+import { PRE_EDIT_MATCHER as EDIT_MATCHER, guardScript, init, splitCommand } from '../src/init.js';
 import { A, B, CLI_COMMAND, PROJECT, client, failingHub, git, hubCli, makeRepo, run, startHub, testEnv, type SampleRepo } from './helpers.js';
 
 let srv: RunningServer;
@@ -30,6 +30,8 @@ describe('hub init', () => {
     mkdirSync(hooksDir, { recursive: true });
     writeFileSync(path.join(hooksDir, 'pre-commit'), '#!/bin/sh\necho "lint ok" >&2\n');
     chmodSync(path.join(hooksDir, 'pre-commit'), 0o755);
+    writeFileSync(path.join(hooksDir, 'prepare-commit-msg'), '#!/bin/sh\necho "msg ok" >&2\n');
+    chmodSync(path.join(hooksDir, 'prepare-commit-msg'), 0o755);
 
     const report = init({ cwd: repo.main, project: PROJECT });
     expect(report.join('\n')).toMatch(/updated \.claude\/settings\.json/);
@@ -38,9 +40,16 @@ describe('hub init', () => {
     expect(settings.permissions).toEqual({ allow: ['Bash(npm test)'] });
     expect(settings.hooks.PreToolUse).toEqual([
       { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo bash' }] },
-      { matcher: 'Edit|Write|MultiEdit', hooks: [{ type: 'command', command: 'hub hook pre-edit', timeout: 30, onFailure: 'block' }] },
+      { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: 'hub hook pre-edit', timeout: 30, onFailure: 'block' }] },
     ]);
+    expect(settings.hooks.PostToolUse).toEqual([{ matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: 'hub hook post-edit', timeout: 30 }] }]);
     expect(settings.hooks.SessionStart).toEqual([{ hooks: [{ type: 'command', command: 'hub hook digest', timeout: 30 }] }]);
+    for (const event of ['Stop', 'SubagentStop', 'UserPromptSubmit', 'SessionEnd']) {
+      expect(settings.hooks[event], event).toEqual([{ hooks: [{ type: 'command', command: 'hub hook settle', timeout: 30 }] }]);
+    }
+    // Claude Code reads a matcher of plain names as an exact list of tools: every file-writing tool must be on it.
+    expect(EDIT_MATCHER).toBe('Edit|Write|MultiEdit|NotebookEdit');
+    for (const tool of ['Edit', 'Write', 'NotebookEdit']) expect(EDIT_MATCHER.split('|')).toContain(tool);
     expect(settings.enabledMcpjsonServers).toEqual(['hub']);
     expect(JSON.parse(readFileSync(path.join(repo.main, '.mcp.json'), 'utf8'))).toEqual({ mcpServers: { hub: { command: 'hub', args: ['mcp'] } } });
 
@@ -48,6 +57,9 @@ describe('hub init', () => {
     expect(hook).toContain('# agenthub-guard');
     expect(hook).toContain('hub guard');
     expect(readFileSync(path.join(hooksDir, 'pre-commit.pre-agenthub'), 'utf8')).toContain('lint ok');
+    // git revert, cherry-pick and rebase commit without running pre-commit: the guard runs there too
+    expect(readFileSync(path.join(hooksDir, 'prepare-commit-msg'), 'utf8')).toContain('hub guard --sequencer');
+    expect(readFileSync(path.join(hooksDir, 'prepare-commit-msg.pre-agenthub'), 'utf8')).toContain('msg ok');
 
     expect(JSON.parse(readFileSync(path.join(repo.main, 'agenthub.json'), 'utf8'))).toEqual({ project: PROJECT });
     expect(existsSync(path.join(repo.main, '.hub.json'))).toBe(false); // no identity given
@@ -56,9 +68,9 @@ describe('hub init', () => {
   });
 
   it('is idempotent', () => {
-    expect(init({ cwd: repo.main, project: PROJECT })).toEqual([
+    expect(init({ cwd: repo.main, project: PROJECT, env: {} })).toEqual([
       'already set up; nothing to change',
-      'note: no agent identity yet; run `hub init --agent <human>/<agent>` in each worktree (or set HUB_AGENT)',
+      'note: no agent identity yet; run `hub init --agent <human>/<agent>` in each worktree',
     ]);
   });
 
@@ -89,6 +101,32 @@ describe('hub init', () => {
     writeFileSync(settingsPath, JSON.stringify(settings));
     init({ cwd: repo.main, project: PROJECT, guard: false });
     expect(JSON.parse(readFileSync(settingsPath, 'utf8')).hooks.PreToolUse[1].hooks[0].onFailure).toBe('continue');
+  });
+
+  it('moves a pre-edit hook written with the old matcher onto one that also covers NotebookEdit', () => {
+    const settingsPath = path.join(repo.main, '.claude', 'settings.json');
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    settings.hooks.PreToolUse[1].matcher = 'Edit|Write|MultiEdit'; // what hub init wrote before
+    settings.hooks.PostToolUse = [{ matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'echo mine' }, { type: 'command', command: 'hub hook post-edit', timeout: 30 }] }];
+    writeFileSync(settingsPath, JSON.stringify(settings));
+    expect(init({ cwd: repo.main, project: PROJECT, guard: false, env: {} }).join('\n')).toMatch(/updated \.claude\/settings\.json/);
+    const hooks = JSON.parse(readFileSync(settingsPath, 'utf8')).hooks;
+    expect(hooks.PreToolUse).toHaveLength(2);
+    expect(hooks.PreToolUse[1]).toMatchObject({ matcher: EDIT_MATCHER, hooks: [{ command: 'hub hook pre-edit' }] });
+    // a group shared with someone else's hook keeps its matcher; the hub entry moves to a group of its own
+    expect(hooks.PostToolUse).toEqual([
+      { matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'echo mine' }] },
+      { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: 'hub hook post-edit', timeout: 30 }] },
+    ]);
+    expect(init({ cwd: repo.main, project: PROJECT, guard: false, env: {} })[0]).toBe('already set up; nothing to change');
+  });
+
+  it('warns when HUB_AGENT in this shell overrides the identity it records', () => {
+    const report = init({ cwd: repo.wtB, agent: B, project: PROJECT, url: srv.url, command: CLI_COMMAND, hooks: false, mcp: false, env: { HUB_AGENT: A } });
+    expect(report.join('\n')).toMatch(/HUB_AGENT=maya\/claude-1 is set in this shell and overrides sam\/claude-1/);
+    expect(init({ cwd: repo.wtB, agent: B, project: PROJECT, url: srv.url, command: CLI_COMMAND, hooks: false, mcp: false, env: { HUB_AGENT: B } })).toEqual([
+      'already set up; nothing to change',
+    ]);
   });
 
   it('splits quoted commands for .mcp.json', () => {
@@ -268,5 +306,141 @@ describe('hub guard: only an unreachable hub may let a commit through unchecked'
     } finally {
       missing.cleanup();
     }
+  });
+});
+
+describe('hub guard: commits git makes without running pre-commit', () => {
+  let hub: RunningServer;
+  let r: SampleRepo;
+  const env = (extra: Record<string, string | undefined> = {}) => testEnv({ HUB_URL: hub.url, HUB_PROJECT: PROJECT, HUB_AGENT: B, ...extra });
+  const gitB = (args: string[], extra: Record<string, string | undefined> = {}) => run('git', args, { cwd: r.wtB, env: env(extra) });
+  const subject = () => git(r.wtB, 'log', '-1', '--format=%s').trim();
+
+  beforeAll(async () => {
+    hub = await startHub();
+    r = makeRepo();
+    init({ cwd: r.main, project: PROJECT, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+    // sam changes both files before anyone has claimed them
+    writeFileSync(path.join(r.wtB, 'src', 'auth.ts'), 'export const login = () => "sam";\n');
+    expect((await gitB(['commit', '-qam', 'sam: auth'])).code).toBe(0);
+    writeFileSync(path.join(r.wtB, 'src', 'users.ts'), 'export const users = ["sam"];\n');
+    expect((await gitB(['commit', '-qam', 'sam: users'])).code).toBe(0);
+    await client(hub.url, A).claim({ files: ['src/auth.ts'], intent: 'Migrate login to OAuth2' });
+  });
+  afterAll(async () => {
+    await hub.close();
+    r.cleanup();
+  });
+
+  it('blocks git revert and git cherry-pick of changes to a file another agent holds, and lets the rest through', async () => {
+    expect((await gitB(['revert', '--no-edit', 'HEAD'])).code).toBe(0); // src/users.ts only: free
+    expect(subject()).toBe('Revert "sam: users"');
+
+    const reverted = await gitB(['revert', '--no-edit', 'HEAD~2']);
+    expect(reverted.code).not.toBe(0);
+    expect(reverted.stderr).toMatch(/hub guard: commit blocked[\s\S]*src\/auth\.ts — claimed by maya\/claude-1 \(C-1\)/);
+    expect(reverted.stderr).toContain('HUB_GUARD=off');
+    expect(subject()).toBe('Revert "sam: users"');
+    git(r.wtB, 'reset', '-q', '--hard');
+    const edited = await gitB(['revert', 'HEAD~2'], { GIT_EDITOR: 'true' }); // the path git takes when it opens an editor
+    expect(edited.code).not.toBe(0);
+    expect(edited.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/);
+    git(r.wtB, 'reset', '-q', '--hard');
+
+    expect((await gitB(['revert', '--no-edit', 'HEAD~2'], { HUB_GUARD: 'off' })).code).toBe(0);
+    const picked = await gitB(['cherry-pick', 'HEAD~3']); // re-applies "sam: auth"
+    expect(picked.code).not.toBe(0);
+    expect(picked.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/);
+    expect(subject()).toBe('Revert "sam: auth"');
+    git(r.wtB, 'reset', '-q', '--hard');
+  });
+
+  it('blocks a rebase that replays a commit touching the claimed file', async () => {
+    writeFileSync(path.join(r.main, 'README.md'), '# sample\n\nmain moved on\n');
+    git(r.main, 'commit', '-qam', 'main: readme');
+    const res = await gitB(['rebase', 'main']);
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/);
+    git(r.wtB, 'rebase', '--abort');
+  });
+
+  it('leaves plain commits to pre-commit, so git commit --no-verify still bypasses the guard', async () => {
+    writeFileSync(path.join(r.wtB, 'src', 'auth.ts'), 'export const login = () => "forced";\n');
+    git(r.wtB, 'add', 'src/auth.ts');
+    expect((await gitB(['commit', '-q', '-m', 'blocked'])).code).not.toBe(0);
+    expect((await gitB(['commit', '-q', '--no-verify', '-m', 'forced'])).code).toBe(0);
+    expect(subject()).toBe('forced');
+  });
+
+  it('leaves a git commit that finishes a conflicted cherry-pick to pre-commit too', async () => {
+    const pick = git(r.wtB, 'rev-parse', 'HEAD').trim(); // "forced", on src/auth.ts
+    git(r.wtB, 'reset', '-q', '--hard', 'HEAD~1');
+    writeFileSync(path.join(r.wtB, 'src', 'auth.ts'), 'export const login = () => "conflict";\n');
+    expect((await gitB(['commit', '-qam', 'conflicting'], { HUB_GUARD: 'off' })).code).toBe(0);
+    expect((await gitB(['cherry-pick', pick])).code).not.toBe(0); // conflicts, so git stops before committing
+    writeFileSync(path.join(r.wtB, 'src', 'auth.ts'), 'export const login = () => "resolved";\n');
+    git(r.wtB, 'add', 'src/auth.ts');
+    const blocked = await gitB(['commit', '--no-edit']); // pre-commit checks it
+    expect(blocked.code).not.toBe(0);
+    expect(blocked.stderr).toMatch(/hub guard: commit blocked/);
+    expect((await gitB(['commit', '-q', '--no-edit', '--no-verify'])).code).toBe(0); // and --no-verify skips the check, as for any commit
+  });
+});
+
+describe('a worktree on a branch made before agenthub.json was committed', () => {
+  let hub: RunningServer;
+  let r: SampleRepo;
+
+  beforeAll(async () => {
+    hub = await startHub();
+    r = makeRepo(); // wt-a and wt-b branch off the initial commit, before the setup commit below
+    init({ cwd: r.main, project: PROJECT, url: hub.url, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+    git(r.main, 'add', 'agenthub.json');
+    git(r.main, 'commit', '-q', '-m', 'agenthub setup');
+    await client(hub.url, A).claim({ files: ['src/auth.ts'], intent: 'Migrate login to OAuth2' });
+  });
+  afterAll(async () => {
+    await hub.close();
+    r.cleanup();
+  });
+
+  it('checks commits against the project and hub hub init recorded for the repository', async () => {
+    expect(existsSync(path.join(r.wtB, 'agenthub.json'))).toBe(false);
+    writeFileSync(path.join(r.wtB, 'src', 'auth.ts'), 'export const login = () => "old branch";\n');
+    git(r.wtB, 'add', 'src/auth.ts');
+    const res = await run('git', ['commit', '-q', '-m', 'old branch fix'], { cwd: r.wtB, env: testEnv() }); // no HUB_URL or HUB_PROJECT
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1 \(C-1\)/);
+    git(r.wtB, 'reset', '-q', '--hard');
+  });
+
+  it('makes hub init there write the recorded project instead of deriving one from the folder name', () => {
+    const report = init({ cwd: r.wtB, agent: B, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+    expect(report[0]).toBe(`wrote agenthub.json (project ${PROJECT}, hub ${hub.url}); commit it so every clone and worktree agrees`);
+    expect(JSON.parse(readFileSync(path.join(r.wtB, 'agenthub.json'), 'utf8'))).toEqual({ project: PROJECT, url: hub.url });
+  });
+
+  it("leaves the recorded project alone when a checkout's own agenthub.json disagrees, and says so", () => {
+    writeFileSync(path.join(r.wtA, 'agenthub.json'), JSON.stringify({ project: 'sample' })); // written there by an older hub init
+    const report = init({ cwd: r.wtA, agent: A, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+    expect(report.join('\n')).toMatch(/agenthub\.json says project sample, but the repository was set up for project demo/);
+    expect(git(r.main, 'config', '--local', 'agenthub.project').trim()).toBe(PROJECT);
+    rmSync(path.join(r.wtA, 'agenthub.json'));
+  });
+
+  it('warns, without blocking, when it has to derive the project because nothing was recorded (a repo set up by an older hub init)', async () => {
+    git(r.main, 'config', '--unset', 'agenthub.project');
+    writeFileSync(path.join(r.wtA, 'src', 'users.ts'), 'export const users = [];\n');
+    git(r.wtA, 'add', 'src/users.ts');
+    const res = await hubCli(['guard'], { cwd: r.wtA, env: testEnv({ HUB_URL: hub.url }) });
+    expect(res.code).toBe(0);
+    expect(res.stderr).toMatch(/no agenthub\.json in this checkout.*project "sample".*hub init/);
+  });
+
+  it('makes hub init take the project from the other worktrees when the repository recorded none', () => {
+    // agenthub.project is still unset, as in a repository set up by an older hub init
+    const report = init({ cwd: r.wtA, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+    expect(report[0]).toBe(`wrote agenthub.json (project ${PROJECT}, hub ${hub.url}); commit it so every clone and worktree agrees`);
+    expect(git(r.main, 'config', '--local', 'agenthub.project').trim()).toBe(PROJECT);
   });
 });
