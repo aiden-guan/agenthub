@@ -140,12 +140,13 @@ const FORBIDDEN_IN_PATH = new RegExp(PATH_FORBIDDEN_RE.source, 'gu');
 
 /**
  * A hub from before path validation stored any path its normalizer let
- * through, newlines and bidi controls included. Read such old paths back with
- * those characters escaped (`\u000a`), so an old row can't forge a line or
- * reorder text in a teammate's view. Paths stored since then are unchanged.
+ * through, in any Unicode spelling, newlines and bidi controls included. Read
+ * such old paths back in NFC, the form requests use now, with those characters
+ * escaped (`\u000a`), so an old row can't forge a line or reorder text in a
+ * teammate's view. Paths stored since then are unchanged.
  */
 function storedPath(file: string): string {
-  return file.replace(FORBIDDEN_IN_PATH, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  return file.normalize('NFC').replace(FORBIDDEN_IN_PATH, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
 }
 
 interface ClaimRowDb {
@@ -250,6 +251,26 @@ export class SqliteStore implements Store {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.exec(SCHEMA);
+    this.indexLiveClaimsAsNfc();
+  }
+
+  /**
+   * A hub from before NFC keys indexed claims under paths as sent. Index live
+   * claims under the NFC form too, so a lease taken before an upgrade still
+   * conflicts with requests, which now always name files in NFC.
+   */
+  private indexLiveClaimsAsNfc(): void {
+    const rows = this.db
+      .prepare(
+        `SELECT f.project, f.claim_id, f.file, f.symbol FROM claim_files f
+         JOIN claims c ON c.project = f.project AND c.id = f.claim_id
+         WHERE c.status IN ('active', 'queued')`,
+      )
+      .all() as { project: string; claim_id: string; file: string; symbol: string }[];
+    const insert = this.db.prepare('INSERT OR IGNORE INTO claim_files (project, claim_id, file, symbol) VALUES (?, ?, ?, ?)');
+    for (const r of rows) {
+      if (r.file !== r.file.normalize('NFC')) insert.run(r.project, r.claim_id, r.file.normalize('NFC'), r.symbol);
+    }
   }
 
   transaction<T>(fn: () => T): T {

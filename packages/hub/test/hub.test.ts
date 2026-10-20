@@ -248,6 +248,40 @@ describe('paths', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('a live claim that a hub from before NFC keys stored in NFD still holds its file after the upgrade', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'agenthub-legacy-'));
+    try {
+      const db = path.join(dir, 'hub.db');
+      const t = Date.UTC(2026, 9, 20, 9, 0, 0);
+      const nfd = 'docs/café.md';
+      const nfc = 'docs/café.md';
+      // The old hub stored the path exactly as its client sent it.
+      const old = new SqliteStore(db);
+      old.ensureProject(P, t);
+      const id = `C-${old.nextCounter(P, 'claim')}`;
+      old.insertClaim({
+        id, project: P, holder: A, task_id: null, scope: [{ file: nfd }], mode: 'exclusive', intent: 'edit', base_commit: null, status: 'active',
+        created_at: t, granted_at: t, expires_at: t + 60_000, ttl_ms: 60_000, heartbeat_interval_ms: 15_000, ended_at: null, end_reason: null,
+      });
+      old.insertDecision({ id: `D-${old.nextCounter(P, 'decision')}`, project: P, agent: A, summary: 'ok', rationale: '', files: [nfd], symbols: [], task_id: null, created_at: t });
+      old.close();
+
+      const store = new SqliteStore(db);
+      const hub = new Hub({ store, now: () => t + 1_000, leaseTtlMs: 60_000, heartbeatIntervalMs: 15_000 });
+      expect(hub.claim(P, B, { files: [nfc] })).toMatchObject({ status: 'denied', conflicts: [expect.objectContaining({ claim_id: id, files: [nfc] })] });
+      expect(hub.check(P, B, [nfc]).conflicts.map((c) => c.claim_id)).toEqual([id]);
+      expect(hub.listClaims(P, { file: nfc }).map((c) => c.id)).toEqual([id]);
+      expect(hub.getClaim(P, id).scope).toEqual([{ file: nfc }]);
+      expect(hub.listDecisions(P)[0].files).toEqual([nfc]);
+      // The holder renews it under the NFC spelling, and releases it by that name.
+      expect(hub.claim(P, A, { files: [nfc] })).toMatchObject({ status: 'granted', renewed: true, claim: { id } });
+      expect(hub.release(P, A, { files: [nfc] }).released.map((c) => c.id)).toEqual([id]);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('leases', () => {
