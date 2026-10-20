@@ -91,6 +91,24 @@ function upgradeStatus(base: string, headers: Record<string, string> = {}): Prom
   });
 }
 
+/** Opens a feed socket that the hub is expected to refuse; resolves with the refusal's status and body. */
+function upgradeRefusal(base: string, headers: Record<string, string> = {}): Promise<{ status: number; type: string | undefined; body: string }> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${base.replace('http', 'ws')}/v1/p/demo/feed?agent=${A}`, { headers });
+    ws.on('open', () => {
+      ws.close();
+      reject(new Error('the feed opened'));
+    });
+    ws.on('unexpected-response', (_req, res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => (body += d));
+      res.on('end', () => resolve({ status: res.statusCode!, type: res.headers['content-type'], body }));
+    });
+    ws.on('error', reject);
+  });
+}
+
 /** Sends a request to 127.0.0.1 with any Host header, the way a page on a rebound domain reaches the hub. */
 function requestAs(port: number, host: string, route: string, headers: Record<string, string> = {}, method = 'GET', body?: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
@@ -382,6 +400,29 @@ describe('browser origins', () => {
     expect(await upgradeStatus(s.url, { host: `localhost:${s.port}` })).toBe(101);
   });
 
+  it('names the refused host and the exact --allow-host flag that serves it, on HTTP and on the feed upgrade', async () => {
+    const s = await start();
+    for (const name of ['host.docker.internal', 'my-laptop.local', 'hub.internal']) {
+      const res = await requestAs(s.port, `${name}:${s.port}`, '/v1/p/demo/claims', { 'x-hub-agent': A, 'content-type': 'application/json' }, 'POST', JSON.stringify({ files: ['src/x.ts'] }));
+      expect(res.status).toBe(403);
+      const { error } = JSON.parse(res.body);
+      expect(error.code).toBe('forbidden_host');
+      expect(error.message).toContain(`"${name}"`);
+      expect(error.message).toContain(`hub-server --allow-host ${name}`);
+      expect(error.message).toContain('host.docker.internal'); // the common case, Docker Desktop containers
+
+      const up = await upgradeRefusal(s.url, { host: `${name}:${s.port}` });
+      expect(up.status).toBe(403);
+      expect(up.type).toMatch(/^application\/json/);
+      expect(JSON.parse(up.body)).toEqual({ error });
+    }
+    // A Host that no flag could allow gets no suggestion to pass it.
+    const odd = await requestAs(s.port, `a..b:${s.port}`, '/healthz');
+    expect(odd.status).toBe(403);
+    expect(JSON.parse(odd.body).error.message).not.toContain('--allow-host a..b');
+    expect((await api(s.url, 'GET', '/claims')).json.claims).toHaveLength(0);
+  });
+
   it('serves host names given in the host allowlist', async () => {
     const s = await start({ allowHosts: ['Hub.Example.com'] });
     for (const host of ['hub.example.com', 'HUB.EXAMPLE.COM', 'hub.example.com:80']) {
@@ -440,6 +481,26 @@ describe('browser origins', () => {
     expect((await requestAs(s.port, `hub.example.com:${s.port}`, '/v1/p/demo/status')).status).toBe(200);
     expect((await requestAs(s.port, `devbox.lan:${s.port}`, '/v1/p/demo/status')).status).toBe(200);
     expect((await requestAs(s.port, `rebind.evil.example:${s.port}`, '/v1/p/demo/status')).status).toBe(403);
+  });
+
+  it('hub-server --allow-host host.docker.internal serves a Docker Desktop container on HTTP and on the feed', async () => {
+    const docker = 'host.docker.internal';
+    // Without the flag the refusal tells the user exactly what to run.
+    const plain = await startCli();
+    const refused = await requestAs(plain.port, `${docker}:${plain.port}`, '/v1/p/demo/claims', { 'x-hub-agent': A, 'content-type': 'application/json' }, 'POST', JSON.stringify({ files: ['src/x.ts'] }));
+    expect(refused.status).toBe(403);
+    expect(JSON.parse(refused.body).error.message).toContain(`hub-server --allow-host ${docker}`);
+    expect((await upgradeRefusal(plain.url, { host: `${docker}:${plain.port}` })).body).toContain(`hub-server --allow-host ${docker}`);
+
+    const s = await startCli(['--allow-host', docker]);
+    const claim = await requestAs(s.port, `${docker}:${s.port}`, '/v1/p/demo/claims', { 'x-hub-agent': A, 'content-type': 'application/json' }, 'POST', JSON.stringify({ files: ['src/x.ts'] }));
+    expect(JSON.parse(claim.body)).toMatchObject({ status: 'granted' });
+    const check = await requestAs(s.port, `${docker}:${s.port}`, '/v1/p/demo/claims/check', { 'x-hub-agent': B, 'content-type': 'application/json' }, 'POST', JSON.stringify({ files: ['src/x.ts'] }));
+    expect(JSON.parse(check.body).conflicts).toHaveLength(1);
+    expect(await upgradeStatus(s.url, { host: `${docker}:${s.port}` })).toBe(101);
+    // Other names are still refused, on both paths.
+    expect((await requestAs(s.port, `rebind.evil.example:${s.port}`, '/healthz')).status).toBe(403);
+    expect(await upgradeStatus(s.url, { host: `rebind.evil.example:${s.port}` })).toBe(403);
   });
 
   it('hub-server --host 0.0.0.0 serves clients that use a DNS name in their hub URL', async () => {

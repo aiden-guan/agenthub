@@ -16,8 +16,9 @@ Requests from browsers (anything sending an Origin header) are refused unless
 their origin is given with --allow-origin, which may be repeated.
 On a loopback address (the default), requests must address the hub by IP
 address, localhost or the --host name. Give any other name clients use in their
-hub URL with --allow-host, which may be repeated. This stops web pages that
-reach the hub through DNS rebinding. On a network address (--host 0.0.0.0) the
+hub URL with --allow-host, which may be repeated (agents in Docker Desktop
+containers, for example, need --allow-host host.docker.internal). This stops
+web pages that reach the hub through DNS rebinding. On a network address (--host 0.0.0.0) the
 hub serves any name unless --allow-host is given; set --token there too.
 
 Environment: HUB_PORT, HUB_HOST, HUB_DB, HUB_LEASE_TTL_MS, HUB_HEARTBEAT_MS, HUB_TOKEN

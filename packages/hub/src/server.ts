@@ -110,7 +110,13 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     if (!hostCheck || header === undefined) return;
     const name = hostnameOf(header);
     if (name !== null && (isIP(name.replace(/^\[(.*)\]$/, '$1')) !== 0 || name === 'localhost' || name.endsWith('.localhost') || allowedHosts.has(name))) return;
-    throw new HubError('forbidden_host', `requests for host ${JSON.stringify(name ?? header)} are not allowed (see hub-server --allow-host)`, 403);
+    const fix = name !== null && HOSTNAME.test(name) ? ` If clients use this name in their hub URL, restart the hub with: hub-server --allow-host ${name}` : ' Names clients use in their hub URL are allowed with hub-server --allow-host <name>';
+    throw new HubError(
+      'forbidden_host',
+      `requests for host ${JSON.stringify(name ?? header)} are not allowed: this hub answers only to IP addresses, localhost, its --host name and names given with --allow-host, ` +
+        `so web pages can't reach it through DNS rebinding.${fix} (Docker Desktop containers, for example, need --allow-host host.docker.internal).`,
+      403,
+    );
   }
 
   const server = createServer((req, res) => {
@@ -174,9 +180,14 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       const since = Number(url.searchParams.get('since') ?? NaN);
       wss.handleUpgrade(req, socket, head, (ws) => onFeed(ws, project, agentParam, Number.isFinite(since) ? since : null));
     } catch (err) {
-      const status = err instanceof HubError ? err.status : 400;
-      socket.write(`HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Bad Request'}\r\nConnection: close\r\n\r\n`);
-      socket.destroy();
+      // Same error envelope as HTTP, so a client can show why the feed was refused.
+      const e = err instanceof HubError ? err : new HubError('bad_request', 'bad feed request');
+      const body = JSON.stringify({ error: { code: e.code, message: e.message } });
+      socket.once('finish', () => socket.destroy());
+      socket.end(
+        `HTTP/1.1 ${e.status} ${STATUS_CODES[e.status] ?? 'Bad Request'}\r\nConnection: close\r\n` +
+          `Content-Type: application/json; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+      );
     }
   });
 
@@ -410,10 +421,13 @@ function hostnameOf(header: string): string | null {
   return url.username === '' && url.password === '' && url.pathname === '/' && url.search === '' && url.hash === '' ? url.hostname : null;
 }
 
+/** A lowercased host name that `--allow-host` accepts. */
+const HOSTNAME = /^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/;
+
 /** Normalizes a host allowlist entry, which must be a bare name: no scheme, port or wildcard. */
 function toHostname(s: string): string {
   const name = /^[^:/?#@\\[\]]+$/.test(s) ? hostnameOf(s) : null;
-  if (name === null || !/^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/.test(name)) {
+  if (name === null || !HOSTNAME.test(name)) {
     throw new Error(`allowed host ${JSON.stringify(s)} is not a host name; expected a bare name such as hub.example.com`);
   }
   return name;
