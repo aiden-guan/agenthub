@@ -74,6 +74,12 @@ export interface ClaimResult {
   conflicts: ClaimConflict[];
   /** Position in the queue (1 = next), only when queued. */
   position?: number;
+  /**
+   * Only when denied, and only when waiting would deadlock: a holder in the way is
+   * itself waiting, directly or not, for a claim of yours. Names the claims and
+   * agents in the cycle (no paths or intents) and which of your claims to release.
+   */
+  deadlock?: string;
   now: number;
   seq: number;
 }

@@ -510,6 +510,68 @@ describe('queueing and release', () => {
     }
   });
 
+  it('a waiter that waits for the requester does not hold back its edits, which would leave both waiting', () => {
+    const { hub } = setup();
+    const D = 'dan/claude-1';
+    hub.claim(P, C, { files: ['y.ts'], mode: 'auto', queue: false });
+    const b = hub.claim(P, B, { files: ['x.ts', 'y.ts'], queue: true });
+    expect(b).toMatchObject({ status: 'queued', conflicts: [expect.objectContaining({ holder: C, status: 'active' })] });
+    const d = hub.claim(P, D, { files: ['w.ts', 'x.ts'], queue: true }); // behind B for x.ts, so D waits for C too
+    expect(d).toMatchObject({ status: 'queued', conflicts: [expect.objectContaining({ claim_id: b.claim!.id })] });
+
+    // Someone B and D don't wait for is still held back by them.
+    expect(hub.claim(P, A, { files: ['w.ts'], mode: 'auto' })).toMatchObject({
+      status: 'denied',
+      conflicts: [expect.objectContaining({ claim_id: d.claim!.id, status: 'queued' })],
+    });
+    // B can't get y.ts before C lets go, so C's edits of x.ts and w.ts go first instead of each waiting for the other.
+    expect(hub.claim(P, C, { files: ['x.ts'], mode: 'auto', queue: false })).toMatchObject({ status: 'granted', claim: { mode: 'exclusive' } });
+    expect(hub.claim(P, C, { files: ['w.ts'], queue: true }).status).toBe('granted');
+
+    expect(hub.release(P, C, { all: true }).promoted.map((c) => c.id)).toEqual([b.claim!.id]);
+    expect(hub.release(P, B, { all: true }).promoted.map((c) => c.id)).toEqual([d.claim!.id]);
+  });
+
+  it('an agent a waiter waits for gets a file they both want once it is free, then the waiter does', () => {
+    const { hub } = setup();
+    const D = 'dan/claude-1';
+    hub.claim(P, A, { files: ['w.ts'] });
+    hub.claim(P, D, { files: ['b.ts'] });
+    const b = hub.claim(P, B, { files: ['w.ts', 'b.ts'], queue: true });
+    expect(hub.claim(P, D, { files: ['w.ts'], mode: 'auto' })).toMatchObject({ status: 'denied', conflicts: [expect.objectContaining({ holder: A })] });
+    expect(hub.release(P, A, { all: true }).promoted).toEqual([]); // B still needs D's b.ts
+    expect(hub.claim(P, D, { files: ['w.ts'], mode: 'auto' }).status).toBe('granted');
+    expect(hub.release(P, D, { all: true }).promoted.map((c) => c.id)).toEqual([b.claim!.id]);
+  });
+
+  it('a denial says so when waiting for the holder would deadlock', () => {
+    {
+      const { hub } = setup();
+      hub.claim(P, A, { files: ['x.ts'] });
+      const bHolds = hub.claim(P, B, { files: ['y.ts'] }).claim!;
+      const aWaits = hub.claim(P, A, { files: ['y.ts'], queue: true }).claim!;
+      // What B's edit hook sends: A holds x.ts and is waiting for B's y.ts.
+      const hook = hub.claim(P, B, { files: ['x.ts'], mode: 'auto', queue: false });
+      expect(hook).toMatchObject({ status: 'denied', conflicts: [expect.objectContaining({ holder: A, status: 'active' })] });
+      expect(hook.deadlock).toContain(`${aWaits.id} (${A}) waits for your ${bHolds.id}`);
+      expect(hook.deadlock).toContain(`Release ${bHolds.id}`);
+      // A plain denial has no such note.
+      const plain = hub.claim(P, C, { files: ['x.ts'], mode: 'auto' });
+      expect(plain.status).toBe('denied');
+      expect(plain).not.toHaveProperty('deadlock');
+    }
+    {
+      // A shared holder asking for exclusive without queueing, while the other holder's upgrade waits for it.
+      const { hub } = setup();
+      hub.claim(P, A, { files: ['x.ts'], mode: 'shared' });
+      const bShared = hub.claim(P, B, { files: ['x.ts'], mode: 'shared' }).claim!;
+      const aUp = hub.claim(P, A, { files: ['x.ts'], queue: true }).claim!;
+      const bUp = hub.claim(P, B, { files: ['x.ts'] });
+      expect(bUp.status).toBe('denied');
+      expect(bUp.deadlock).toContain(`${aUp.id} (${A}) waits for your ${bShared.id}`);
+    }
+  });
+
   it('a waiter promoted from the queue keeps the lease its last heartbeat gave it', () => {
     const { hub, advance } = setup({ leaseTtlMs: 60_000 });
     hub.claim(P, A, { files: ['a.ts'] });

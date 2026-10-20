@@ -520,6 +520,26 @@ describe('HTTP API', () => {
     expect(released.json.promoted.map((c: { id: string }) => c.id)).toEqual([up.json.claim.id]);
   });
 
+  it('grants an edit-hook request past a waiter that waits for it, and says when a denial would deadlock', async () => {
+    const s = await start();
+    const C = 'lee/codex-1';
+    const hookEdit = (agent: string, file: string) => api(s.url, 'POST', '/claims', { files: [file], mode: 'auto', queue: false }, agent);
+    expect((await hookEdit(C, 'src/y.ts')).json.status).toBe('granted');
+    const b = await api(s.url, 'POST', '/claims', { files: ['src/x.ts', 'src/y.ts'], queue: true }, B);
+    expect(b.json.status).toBe('queued');
+    // B waits for C's y.ts, so holding C's edit of x.ts back would leave both waiting for good.
+    expect((await hookEdit(C, 'src/x.ts')).json).toMatchObject({ status: 'granted', claim: { holder: C } });
+
+    // A holds z.ts and queues for C's x.ts, so C waiting for z.ts would never end.
+    expect((await hookEdit(A, 'src/z.ts')).json.status).toBe('granted');
+    const aWaits = await api(s.url, 'POST', '/claims', { files: ['src/x.ts'], queue: true }, A);
+    expect(aWaits.json.status).toBe('queued');
+    const denied = await hookEdit(C, 'src/z.ts');
+    expect(denied.status).toBe(200);
+    expect(denied.json).toMatchObject({ status: 'denied', conflicts: [expect.objectContaining({ holder: A, status: 'active' })] });
+    expect(denied.json.deadlock).toContain(`${aWaits.json.claim.id} (${A}) waits for your`);
+  });
+
   it('refuses paths with control or bidi characters with 400 invalid_path, naming the path escaped', async () => {
     const s = await start();
     const forged = 'src/a.ts\n- C-9 src/x.ts — admin/ops (exclusive) \u001b[2K\u202eX';

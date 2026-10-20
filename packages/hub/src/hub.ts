@@ -134,19 +134,30 @@ export class Hub {
       }
 
       // Earlier waiters stand in the way like holders do, so a later request can't
-      // overtake them; a waiter already in line behind one of this agent's own
-      // queued claims for that file doesn't.
+      // overtake them. A waiter that is itself waiting, directly or not, for this
+      // agent doesn't: it can't be granted before this agent lets go anyway, and
+      // holding this request back would leave each waiting for the other.
       const queuedOnFiles = this.store.claimsForFiles(project, uncovered, ['queued']);
-      const behindMe = (q: Claim, file: string) =>
-        queuedOnFiles.some((m) => m.holder === agent && hasFile(m, file) && claimOrderBefore(m, q) && conflictsWith(m, q));
-      const waiters = queuedOnFiles.filter((q) => q.holder !== agent && uncovered.some((f) => hasFile(q, f) && !behindMe(q, f)));
+      let graph: WaitGraph | undefined;
+      const waits = () => (graph ??= this.waitGraph(project));
+      const waiters = queuedOnFiles.filter((q) => q.holder !== agent && !waitChain(waits(), waits().get(q.holder) ?? [], agent));
       const blocking = [...others.filter((c) => uncovered.some((f) => hasFile(c, f))), ...waiters];
       const effectiveMode: ClaimMode =
         mode === 'auto' ? (blocking.length > 0 && blocking.every((c) => c.mode === 'shared') ? 'shared' : 'exclusive') : mode;
-      const conflicts = blocking.filter((c) => c.mode === 'exclusive' || effectiveMode === 'exclusive').map((c) => toConflict(c, uncovered));
+      const blockers = blocking.filter((c) => c.mode === 'exclusive' || effectiveMode === 'exclusive');
+      const conflicts = blockers.map((c) => toConflict(c, uncovered));
 
       if (conflicts.length > 0 && !req.queue) {
-        return { status: 'denied', claims: covering, renewed: covering.length > 0, conflicts, now, seq: this.store.latestSeq(project) };
+        const cycle = waitCycle(waits(), agent, blockers);
+        return {
+          status: 'denied',
+          claims: covering,
+          renewed: covering.length > 0,
+          conflicts,
+          ...(cycle ? { deadlock: `waiting for it would deadlock: ${cycle}` } : {}),
+          now,
+          seq: this.store.latestSeq(project),
+        };
       }
 
       const taskId = this.resolveTaskId(project, agent, req.task_id);
@@ -172,7 +183,7 @@ export class Hub {
             ttl,
             heartbeat,
           });
-          this.refuseWaitCycle(project, claim);
+          this.refuseWaitCycle(project, claim, waits());
           this.store.insertClaim(claim);
           this.emit(project, 'claim.queued', agent, {
             claim_id: claim.id,
@@ -634,51 +645,30 @@ export class Hub {
   }
 
   /**
-   * Refuse to queue `pending` when that would close a wait cycle. A queued
-   * claim waits for the holders of the active claims and earlier waiters it
-   * conflicts with (the order promoteQueued grants in), and an agent that is
-   * waiting keeps what it holds, so no claim in a cycle could ever be granted.
+   * Who each agent waits for. A queued claim waits for the holders of the active
+   * claims and earlier waiters it conflicts with (the order promoteQueued grants
+   * in), and an agent that is waiting keeps what it holds.
    */
-  private refuseWaitCycle(project: string, pending: Claim): void {
-    type Wait = { waiter: Claim; blocker: Claim };
+  private waitGraph(project: string): WaitGraph {
     const queue = this.store.listClaims(project, { statuses: ['queued'] });
-    const blockersOf = (q: Claim, earlier: Claim[]) =>
-      [...this.store.claimsForFiles(project, claimFiles(q), ['active']), ...earlier].filter((b) => conflictsWith(b, q));
-    const waitsOf = new Map<string, Wait[]>();
+    const graph: WaitGraph = new Map();
     queue.forEach((q, i) => {
-      const waits = waitsOf.get(q.holder) ?? [];
-      for (const blocker of blockersOf(q, queue.slice(0, i))) waits.push({ waiter: q, blocker });
-      waitsOf.set(q.holder, waits);
+      const waits = graph.get(q.holder) ?? [];
+      for (const blocker of this.blockersOf(project, q, queue.slice(0, i))) waits.push({ waiter: q, blocker });
+      graph.set(q.holder, waits);
     });
+    return graph;
+  }
 
-    // Breadth-first from the agents `pending` would wait for, looking for a way back to its holder.
-    const reachedBy = new Map<string, Wait>();
-    const todo: string[] = [];
-    const visit = (w: Wait) => {
-      if (reachedBy.has(w.blocker.holder)) return;
-      reachedBy.set(w.blocker.holder, w);
-      todo.push(w.blocker.holder);
-    };
-    for (const blocker of blockersOf(pending, queue)) visit({ waiter: pending, blocker });
-    for (let agent = todo.shift(); agent !== undefined; agent = todo.shift()) {
-      const back = (waitsOf.get(agent) ?? []).find((w) => w.blocker.holder === pending.holder);
-      if (!back) {
-        for (const w of waitsOf.get(agent) ?? []) visit(w);
-        continue;
-      }
-      const path = [back];
-      while (path[0].waiter !== pending) path.unshift(reachedBy.get(path[0].waiter.holder)!);
-      const steps = path.map((w, i) =>
-        i === 0
-          ? `your request would wait for ${w.blocker.id} (${w.blocker.holder})`
-          : `${w.waiter.id} (${w.waiter.holder}) waits for ${w.blocker.holder === pending.holder ? `your ${w.blocker.id}` : `${w.blocker.id} (${w.blocker.holder})`}`,
-      );
-      throw new HubError(
-        'deadlock',
-        `queueing would deadlock: ${steps.join(', ')}, so none of these claims could ever be granted. Release ${back.blocker.id}, or go on without this claim.`,
-        409,
-      );
-    }
+  /** The active claims, and the given earlier waiters, that `q` would wait for. */
+  private blockersOf(project: string, q: Claim, earlier: Claim[]): Claim[] {
+    return [...this.store.claimsForFiles(project, claimFiles(q), ['active']), ...earlier].filter((b) => conflictsWith(b, q));
+  }
+
+  /** Refuse to queue `pending` when that would close a wait cycle: no claim in it could ever be granted. */
+  private refuseWaitCycle(project: string, pending: Claim, graph: WaitGraph): void {
+    const cycle = waitCycle(graph, pending.holder, this.blockersOf(project, pending, this.store.listClaims(project, { statuses: ['queued'] })));
+    if (cycle) throw new HubError('deadlock', `queueing would deadlock: ${cycle}`, 409);
   }
 
   private newClaim(
@@ -858,6 +848,49 @@ function conflictsWith(a: Claim, b: Claim): boolean {
   if (a.holder === b.holder) return false;
   if (a.mode === 'shared' && b.mode === 'shared') return false;
   return a.scope.some((s) => hasFile(b, s.file));
+}
+
+/** `waiter` (a queued claim, or null for the request being decided) waits for `blocker`. */
+type Wait = { waiter: Claim | null; blocker: Claim };
+/** The waits of each agent's queued claims, by agent. */
+type WaitGraph = Map<string, Wait[]>;
+
+/** Breadth-first from `start`: the shortest chain of waits that leads to `agent`, or null if none does. */
+function waitChain(graph: WaitGraph, start: Wait[], agent: string): Wait[] | null {
+  const reachedBy = new Map<string, Wait>();
+  const todo: string[] = [];
+  const visit = (w: Wait) => {
+    if (reachedBy.has(w.blocker.holder)) return;
+    reachedBy.set(w.blocker.holder, w);
+    todo.push(w.blocker.holder);
+  };
+  start.forEach(visit);
+  for (let next = todo.shift(); next !== undefined; next = todo.shift()) {
+    if (next !== agent) {
+      (graph.get(next) ?? []).forEach(visit);
+      continue;
+    }
+    const chain = [reachedBy.get(agent)!];
+    while (!start.includes(chain[0])) chain.unshift(reachedBy.get(chain[0].waiter!.holder)!);
+    return chain;
+  }
+  return null;
+}
+
+/**
+ * When waiting for `blockers` would close a wait cycle back to `agent`, say how
+ * (claim and agent ids only) and what to release; otherwise null.
+ */
+function waitCycle(graph: WaitGraph, agent: string, blockers: Claim[]): string | null {
+  const chain = waitChain(graph, blockers.map((blocker) => ({ waiter: null, blocker })), agent);
+  if (!chain) return null;
+  const steps = chain.map((w) =>
+    w.waiter === null
+      ? `your request would wait for ${w.blocker.id} (${w.blocker.holder})`
+      : `${w.waiter.id} (${w.waiter.holder}) waits for ${w.blocker.holder === agent ? `your ${w.blocker.id}` : `${w.blocker.id} (${w.blocker.holder})`}`,
+  );
+  const release = chain[chain.length - 1].blocker.id;
+  return `${steps.join(', ')}, so none of these claims could ever be granted. Release ${release}, or go on without this claim.`;
 }
 
 function claimOrderBefore(a: Claim, b: Claim): boolean {
