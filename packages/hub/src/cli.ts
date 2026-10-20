@@ -10,10 +10,13 @@ const HELP = `hub-server — agenthub coordination hub
 
 Usage: hub-server [--port 7077] [--host 127.0.0.1] [--db ./hub.db]
                   [--lease-ttl-ms 120000] [--heartbeat-ms 30000] [--token SECRET]
-                  [--allow-origin https://dash.example.com]...
+                  [--allow-origin https://dash.example.com]... [--allow-host hub.example.com]...
 
 Requests from browsers (anything sending an Origin header) are refused unless
 their origin is given with --allow-origin, which may be repeated.
+Requests must address the hub by IP address, localhost or the --host name.
+Give any other name clients use in their hub URL with --allow-host, which may
+be repeated. This stops web pages that reach the hub through DNS rebinding.
 
 Environment: HUB_PORT, HUB_HOST, HUB_DB, HUB_LEASE_TTL_MS, HUB_HEARTBEAT_MS, HUB_TOKEN
 `;
@@ -27,6 +30,7 @@ const { values } = parseArgs({
     'heartbeat-ms': { type: 'string' },
     token: { type: 'string' },
     'allow-origin': { type: 'string', multiple: true },
+    'allow-host': { type: 'string', multiple: true },
     help: { type: 'boolean', short: 'h' },
   },
 });
@@ -53,7 +57,8 @@ const server = await startServer({
   host: values.host ?? env.HUB_HOST ?? '127.0.0.1',
   token: values.token ?? env.HUB_TOKEN ?? undefined,
   allowOrigins: values['allow-origin'],
-});
+  allowHosts: values['allow-host'],
+}).catch((err: Error) => fail(err.message));
 
 console.log(`agenthub hub listening on ${server.url}`);
 console.log(`  db: ${dbPath}`);
@@ -73,3 +78,9 @@ async function shutdown() {
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+/** Reports a startup error (a bad flag value, a port in use) in one line, without a stack trace. */
+function fail(message: string): never {
+  console.error(`hub-server: ${message}`);
+  process.exit(2);
+}

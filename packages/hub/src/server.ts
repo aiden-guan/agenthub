@@ -1,5 +1,5 @@
 import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { isIP, type AddressInfo } from 'node:net';
 import { timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { Hub, HubError, assertAgent, isVisibleTo } from './hub.js';
@@ -22,6 +22,13 @@ export interface ServerOptions {
    * developer's browser. Node clients send no Origin. Default: none.
    */
   allowOrigins?: string[];
+  /**
+   * Host names, besides IP addresses, `localhost`, `*.localhost` and `host`,
+   * that requests may be addressed to (the `Host` header). Anything else is
+   * refused with 403, which stops a web page that rebinds its own domain to
+   * the hub's address: it counts as same-origin, so it sends no Origin header.
+   */
+  allowHosts?: string[];
 }
 
 export interface RunningServer {
@@ -77,15 +84,28 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const maxWaitMs = opts.maxWaitMs ?? 600_000;
   const routes = buildRoutes(hub, maxWaitMs);
   const allowedOrigins = new Set((opts.allowOrigins ?? []).map(toOrigin));
+  const allowedHosts = new Set((opts.allowHosts ?? []).map(toHostname));
+  const bindName = opts.host && isIP(opts.host) === 0 ? hostnameOf(opts.host) : null;
+  if (bindName !== null) allowedHosts.add(bindName);
 
   /** Throws unless the request has no Origin or an allowed one; returns the allowed origin. */
   function checkOrigin(req: IncomingMessage): string | null {
-    const origin = req.headers.origin;
-    if (origin === undefined) return null;
-    if (!allowedOrigins.has(origin)) {
-      throw new HubError('forbidden_origin', `requests from origin ${JSON.stringify(origin)} are not allowed (see hub-server --allow-origin)`, 403);
+    // Sec-WebSocket-Origin is what browsers sent before RFC 6455 renamed it Origin.
+    for (const origin of [req.headers.origin, req.headers['sec-websocket-origin'] as string | undefined]) {
+      if (origin !== undefined && !allowedOrigins.has(origin)) {
+        throw new HubError('forbidden_origin', `requests from origin ${JSON.stringify(origin)} are not allowed (see hub-server --allow-origin)`, 403);
+      }
     }
-    return origin;
+    return req.headers.origin ?? null;
+  }
+
+  /** Throws unless the Host header is an IP address, a localhost name or an allowed name: none of these can be rebound. */
+  function checkHost(req: IncomingMessage): void {
+    const header = req.headers.host;
+    if (header === undefined) return;
+    const name = hostnameOf(header);
+    if (name !== null && (isIP(name.replace(/^\[(.*)\]$/, '$1')) !== 0 || name === 'localhost' || name.endsWith('.localhost') || allowedHosts.has(name))) return;
+    throw new HubError('forbidden_host', `requests for host ${JSON.stringify(name ?? header)} are not allowed (see hub-server --allow-host)`, 403);
   }
 
   const server = createServer((req, res) => {
@@ -94,6 +114,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://hub.local');
+    checkHost(req);
     const origin = checkOrigin(req);
     if (origin !== null) {
       res.setHeader('access-control-allow-origin', origin);
@@ -135,6 +156,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const sockets = new Set<WebSocket>();
   server.on('upgrade', (req, socket, head) => {
     try {
+      checkHost(req);
       checkOrigin(req);
       const url = new URL(req.url ?? '/', 'http://hub.local');
       const m = /^\/v1\/p\/([^/]+)\/feed$/.exec(url.pathname);
@@ -363,6 +385,26 @@ function toOrigin(s: string): string {
     throw new Error(`allowed origin ${JSON.stringify(s)} is not an origin; expected scheme://host[:port], e.g. https://dash.example.com`);
   }
   return url.origin;
+}
+
+/** The lowercased host name in a `Host` header (`name[:port]`), or null if it is something else. */
+function hostnameOf(header: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(`http://${header}`);
+  } catch {
+    return null;
+  }
+  return url.username === '' && url.password === '' && url.pathname === '/' && url.search === '' && url.hash === '' ? url.hostname : null;
+}
+
+/** Normalizes a host allowlist entry, which must be a bare name: no scheme, port or wildcard. */
+function toHostname(s: string): string {
+  const name = /^[^:/?#@\\[\]]+$/.test(s) ? hostnameOf(s) : null;
+  if (name === null || !/^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/.test(name)) {
+    throw new Error(`allowed host ${JSON.stringify(s)} is not a host name; expected a bare name such as hub.example.com`);
+  }
+  return name;
 }
 
 function safeDecode(s: string): string {

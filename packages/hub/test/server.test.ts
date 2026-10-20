@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -20,9 +21,9 @@ afterEach(async () => {
   for (const c of cleanups.splice(0)) c();
 });
 
-async function start(opts: { leaseTtlMs?: number; heartbeatIntervalMs?: number; sweepIntervalMs?: number; token?: string; allowOrigins?: string[] } = {}) {
+async function start(opts: { leaseTtlMs?: number; heartbeatIntervalMs?: number; sweepIntervalMs?: number; token?: string; allowOrigins?: string[]; allowHosts?: string[] } = {}) {
   const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: opts.leaseTtlMs, heartbeatIntervalMs: opts.heartbeatIntervalMs });
-  const server = await startServer({ hub, port: 0, sweepIntervalMs: opts.sweepIntervalMs, token: opts.token, allowOrigins: opts.allowOrigins });
+  const server = await startServer({ hub, port: 0, sweepIntervalMs: opts.sweepIntervalMs, token: opts.token, allowOrigins: opts.allowOrigins, allowHosts: opts.allowHosts });
   servers.push(server);
   return server;
 }
@@ -87,6 +88,20 @@ function upgradeStatus(base: string, headers: Record<string, string> = {}): Prom
       if (m) resolve(Number(m[1]));
       else reject(err);
     });
+  });
+}
+
+/** Sends a request to 127.0.0.1 with any Host header, the way a page on a rebound domain reaches the hub. */
+function requestAs(port: number, host: string, route: string, headers: Record<string, string> = {}, method = 'GET'): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port, path: route, method, headers: { ...headers, host } }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => (body += d));
+      res.on('end', () => resolve({ status: res.statusCode!, body }));
+    });
+    req.on('error', reject);
+    req.end();
   });
 }
 
@@ -337,6 +352,50 @@ describe('browser origins', () => {
     expect(noOrigin.status).toBe(404);
   });
 
+  it('checks the obsolete Sec-WebSocket-Origin header like Origin', async () => {
+    const s = await start({ allowOrigins: ['http://localhost:5173'] });
+    expect(await upgradeStatus(s.url, { 'sec-websocket-origin': 'https://evil.example' })).toBe(403);
+    expect(await upgradeStatus(s.url, { 'sec-websocket-origin': 'http://localhost:5173' })).toBe(101);
+  });
+
+  it('refuses requests addressed to a host name it does not serve, as after DNS rebinding', async () => {
+    const s = await start();
+    await api(s.url, 'POST', '/tasks', { title: 'secret project Falcon' }, A);
+    await api(s.url, 'POST', '/messages', { to: B, body: 'private note' }, A);
+
+    // A rebound page is same-origin with its own domain, so it sends no Origin; only Host gives it away.
+    const evil = `rebind.evil.example:${s.port}`;
+    for (const route of ['/healthz', '/v1/p/demo/status', '/v1/p/demo/events?since=0', '/v1/p/demo/inbox']) {
+      const res = await requestAs(s.port, evil, route, { 'x-hub-agent': B });
+      expect(res.status).toBe(403);
+      expect(JSON.parse(res.body)).toMatchObject({ error: { code: 'forbidden_host', message: expect.stringContaining('"rebind.evil.example"') } });
+      expect(res.body).not.toContain('Falcon');
+    }
+    expect((await requestAs(s.port, evil, '/v1/p/demo/heartbeat', { 'x-hub-agent': A }, 'POST')).status).toBe(403);
+    expect(await upgradeStatus(s.url, { host: evil })).toBe(403);
+    expect((await api(s.url, 'GET', '/inbox?peek=1', undefined, B)).json.messages).toHaveLength(1); // not consumed
+
+    // IP addresses and localhost names can't be rebound, so they always work.
+    for (const host of ['127.0.0.1', 'localhost', 'LocalHost', 'app.localhost', '[::1]', '10.0.0.7'].map((h) => `${h}:${s.port}`)) {
+      expect((await requestAs(s.port, host, '/v1/p/demo/status', { 'x-hub-agent': A })).status).toBe(200);
+    }
+    expect(await upgradeStatus(s.url, { host: `localhost:${s.port}` })).toBe(101);
+  });
+
+  it('serves host names given in the host allowlist', async () => {
+    const s = await start({ allowHosts: ['Hub.Example.com'] });
+    for (const host of ['hub.example.com', 'HUB.EXAMPLE.COM', 'hub.example.com:80']) {
+      expect((await requestAs(s.port, host, '/v1/p/demo/status')).status).toBe(200);
+    }
+    expect((await requestAs(s.port, 'other.example.com', '/v1/p/demo/status')).status).toBe(403);
+    expect(await upgradeStatus(s.url, { host: `hub.example.com:${s.port}` })).toBe(101);
+
+    const hub = new Hub({ store: new SqliteStore(':memory:') });
+    for (const bad of ['http://hub.example.com', 'hub.example.com:7077', 'hub.example.com/x', 'u@hub.example.com', '*', '*.example.com', '', 'a b']) {
+      await expect(startServer({ hub, port: 0, allowHosts: [bad] })).rejects.toThrow(/not a host name/);
+    }
+  });
+
   it('rejects an allowlist entry that is not an origin', async () => {
     const hub = new Hub({ store: new SqliteStore(':memory:') });
     for (const bad of ['localhost:5173', 'null', 'http://localhost:5173/app', 'file:///tmp/x.html', '*']) {
@@ -351,6 +410,29 @@ describe('browser origins', () => {
     expect(await upgradeStatus(s.url, { origin: 'https://evil.example' })).toBe(403);
     expect((await fetch(`${s.url}/healthz`, { headers: { origin: 'https://evil.example' } })).status).toBe(403);
     expect((await fetch(`${s.url}/healthz`)).status).toBe(200);
+  });
+
+  it('hub-server takes repeatable --allow-host flags', async () => {
+    const s = await startCli(['--allow-host', 'hub.example.com', '--allow-host', 'devbox.lan']);
+    expect((await requestAs(s.port, `hub.example.com:${s.port}`, '/v1/p/demo/status')).status).toBe(200);
+    expect((await requestAs(s.port, `devbox.lan:${s.port}`, '/v1/p/demo/status')).status).toBe(200);
+    expect((await requestAs(s.port, `rebind.evil.example:${s.port}`, '/v1/p/demo/status')).status).toBe(403);
+  });
+
+  it('hub-server reports a bad --allow-origin or --allow-host in one line, without a stack trace', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'agenthub-cli-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const bin = path.join(here, '..', 'bin', 'hub-server.js');
+    for (const [flag, value, want] of [
+      ['--allow-origin', 'localhost:5173', 'hub-server: allowed origin "localhost:5173" is not an origin'],
+      ['--allow-host', 'https://hub.example.com', 'hub-server: allowed host "https://hub.example.com" is not a host name'],
+    ]) {
+      const r = spawnSync(process.execPath, [bin, '--port', '0', '--db', path.join(dir, 'hub.db'), flag, value], { encoding: 'utf8', timeout: 10_000 });
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain(want);
+      expect(r.stderr.trim().split('\n')).toHaveLength(1);
+      expect(r.stdout).not.toContain('listening');
+    }
   });
 });
 
