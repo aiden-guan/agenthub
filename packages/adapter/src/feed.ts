@@ -186,8 +186,9 @@ export class Feed {
    */
   private async poll(cursor: number | undefined, waitMs: number, signal?: AbortSignal): Promise<{ events: HubEvent[]; next: number } | null> {
     const page = await this.client.events(cursor, waitMs, signal);
-    // A different database: a new epoch or, without two epochs to compare, a history that ends before `cursor` (it never goes back).
-    const otherDatabase = page.epoch !== undefined && this.epoch !== null ? page.epoch !== this.epoch : cursor !== undefined && page.seq < cursor;
+    // A different database: a new epoch, or a history that ends before `cursor`, which a live one
+    // never does: the same database restored from a backup keeps its epoch but goes back.
+    const otherDatabase = (page.epoch !== undefined && this.epoch !== null && page.epoch !== this.epoch) || (cursor !== undefined && page.seq < cursor);
     if (page.epoch !== undefined) this.epoch = page.epoch;
     if (otherDatabase) {
       this.resetHistory(page.seq);
@@ -275,6 +276,9 @@ export class Feed {
         this.onHello(frame, since);
       } else if (frame.type === 'event') {
         this.ingest(frame.event);
+      } else if (frame.type === 'replayed') {
+        // Past the events of the replay this agent can't see, so the next reconnect doesn't read them again.
+        if (typeof frame.next_since === 'number' && frame.next_since > this.lastSeq) this.lastSeq = frame.next_since;
       } else if (frame.type === 'heartbeat.ack') {
         this.askedAt = null;
         if (validMs(frame.next_heartbeat_ms)) this.ackMs = frame.next_heartbeat_ms;

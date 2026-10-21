@@ -59,9 +59,23 @@ export function hubCli(args: string[], opts: { cwd: string; env: NodeJS.ProcessE
   return run(process.execPath, [CLI, ...args], opts);
 }
 
-export async function startHub(opts: { leaseTtlMs?: number; sweepIntervalMs?: number; token?: string } = {}): Promise<RunningServer> {
+/** A hub on a fresh in-memory database, on a random port, or on `port` (to bring one back where another was). */
+export async function startHub(opts: { leaseTtlMs?: number; sweepIntervalMs?: number; token?: string; port?: number } = {}): Promise<RunningServer> {
   const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: opts.leaseTtlMs });
-  return startServer({ hub, port: 0, sweepIntervalMs: opts.sweepIntervalMs, token: opts.token });
+  return startServer({ hub, port: opts.port ?? 0, sweepIntervalMs: opts.sweepIntervalMs, token: opts.token });
+}
+
+/**
+ * The URL of a hub that is down: a port nothing listens on, so a connection is
+ * refused. (Not a port fetch blocks, such as 9: the adapter takes those for a
+ * setup mistake, not an outage.)
+ */
+export async function downUrl(): Promise<string> {
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return `http://127.0.0.1:${port}`;
 }
 
 export function client(url: string, agent: string | null, token: string | null = null): HubClient {

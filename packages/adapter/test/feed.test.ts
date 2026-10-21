@@ -217,18 +217,23 @@ describe('feed heartbeat period', () => {
     expect(got.events.map((e) => e.type)).toEqual(['message.posted']);
   });
 
-  it('heartbeats at the shortest interval a hub hands out (25 ms, with a 100 ms lease), so such a lease stays alive', async () => {
+  it('heartbeats at the shortest interval a hub hands out (25 ms, a third of its shortest lease, 100 ms)', async () => {
     const srv = await hubAt({ leaseTtlMs: 100 });
     expect(srv.hub.heartbeatIntervalMs).toBe(25);
     const { feed, client: raw } = await mcpFor(srv.url, A);
     await until(() => feed.connected);
-    const claim = (await raw.claim({ files: ['src/brief.ts'], intent: 'brief' })).claim!;
-    expect(claim.heartbeat_interval_ms).toBe(25);
+    const brief = (await raw.claim({ files: ['src/brief.ts'], intent: 'brief' })).claim!;
+    expect(brief).toMatchObject({ ttl_ms: 100, heartbeat_interval_ms: 25 });
+    // The same 25 ms interval on a lease with room for a busy machine's timer delays, which a
+    // 100 ms lease doesn't have: whether it stays alive depends on the code, not on the load.
+    const roomy = (await raw.claim({ files: ['src/roomy.ts'], intent: 'roomy', ttl_ms: 1500, heartbeat_interval_ms: 25 })).claim!;
+    feed.noteClaims([roomy]);
     const before = feed.heartbeatsSent;
-    await sleep(1000);
-    // A floor above the hub's interval (it was 100 ms) heartbeats once per lease, and the lease runs out between beats.
-    expect(feed.heartbeatsSent - before).toBeGreaterThanOrEqual(15);
-    expect((await raw.getClaim(claim.id)).status).toBe('active');
+    await sleep(2000);
+    // At 25 ms that is about 80 heartbeats. A floor above the hub's interval (it was 100 ms) sends 20 at most,
+    // once per lease of the hub's shortest kind, so such a lease runs out between beats.
+    expect(feed.heartbeatsSent - before).toBeGreaterThanOrEqual(26);
+    expect((await raw.getClaim(roomy.id)).status).toBe('active');
   });
 
   it('heartbeats at once at the interval of a claim it was just given', async () => {
@@ -545,6 +550,56 @@ describe('feed epochs and cursors', () => {
     const feed = new Feed(client(fake.url, A));
     expect(await feed.waitFor(40, () => true, 1000)).toEqual({ events: [], restarted: true });
     expect(fake.polled).toEqual(['40']);
+  });
+
+  it('a long-poll answer from the same database whose history went back (restored from a backup) ends the wait, as the hello does', async () => {
+    const page = (seq: number, events: HubEvent[] = []) => ({ events, seq, next_since: seq, epoch: 'db-1' });
+    let restored = false;
+    const fake = await fakeFeedHub({ hello: () => ({}), events: (since) => (restored ? page(2) : Number(since) < 43 ? page(43, [message(43)]) : page(43)) });
+    const feed = new Feed(client(fake.url, A)); // never started: hub_wait's HTTP path
+    expect((await feed.waitFor(42, () => true, 1000)).events.map((e) => e.seq)).toEqual([43]);
+    restored = true;
+    // Its cursor (43) is past the restored history's end (2): the events after 2 there are not the ones it saw.
+    expect(await feed.waitFor(43, () => true, 1000)).toEqual({ events: [], restarted: true });
+  });
+
+  it('forgets a restored database\'s old events while following it by long-poll, so a wait doesn\'t wake on them', async () => {
+    const page = (seq: number, events: HubEvent[] = []) => ({ events, seq, next_since: seq, epoch: 'db-1' });
+    let restored = false;
+    const fake = await fakeFeedHub({
+      hello: () => ({}),
+      events: (since) => (restored ? page(2) : since === null ? page(42) : Number(since) < 43 ? page(43, [message(43)]) : page(43)),
+    });
+    const raw = client(fake.url, A);
+    const noSocket = Object.create(raw) as HubClient;
+    noSocket.feedUrl = () => 'ws://127.0.0.1:9/feed';
+    const feed = new Feed(noSocket, { info: { client: 'mcp' } });
+    feed.start();
+    cleanups.push(() => feed.stop());
+    await until(() => feed.lastSeq === 43);
+    restored = true;
+    await until(() => feed.restarts === 1);
+    expect(feed.lastSeq).toBe(2);
+    expect((await feed.waitFor(2, () => true, 300)).events).toEqual([]);
+  });
+
+  it("reconnects from the cursor its replay ended with, past the events this agent can't see, instead of reading them again", async () => {
+    const fake = await fakeFeedHub({
+      hello: (n) => ({ epoch: 'db-1', seq: n === 1 ? 5 : 900 }),
+      onOpen: (ws, n) => {
+        if (n !== 1) return;
+        ws.send(JSON.stringify({ type: 'event', event: message(6) }));
+        ws.send(JSON.stringify({ type: 'replayed', next_since: 900 }));
+      },
+    });
+    const feed = new Feed(client(fake.url, A), { info: { client: 'mcp' } });
+    feed.start();
+    cleanups.push(() => feed.stop());
+    await until(() => feed.lastSeq === 900);
+    fake.dropAll();
+    await until(() => fake.sinces.length === 2 && feed.connected);
+    expect(fake.sinces[1]).toBe('900');
+    expect((await feed.waitFor(0, () => true, 50)).events.map((e) => e.seq)).toEqual([6]);
   });
 
   it('keeps its cursor at 0 on a hub with no events yet, instead of starting again from whatever is latest', async () => {

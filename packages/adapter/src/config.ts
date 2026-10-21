@@ -45,6 +45,8 @@ export interface HubConfig {
   warnings: string[];
   /** Why a hub token that is set is not sent to `url` (also in `warnings`): what to say when the hub rejects the credentials. */
   tokenWithheld?: string;
+  /** This checkout has no identity of its own: `agent` is that of the session working in it, whose checkout this is (see lendIdentity). */
+  lentBy?: string;
 }
 
 /**

@@ -17,7 +17,8 @@ import {
   showNames,
   statusText,
 } from './format.js';
-import { currentBranch, headCommit, toRepoPath } from './git.js';
+import { claimKey } from './checkout.js';
+import { currentBranch, headCommit } from './git.js';
 import { adoptClaims } from './pending.js';
 
 export const VERSION = '0.1.0';
@@ -37,6 +38,8 @@ interface Deps {
   feed: Feed | null;
   /** Directory relative file arguments resolve against. */
   cwd: string;
+  /** For reading the config of another checkout a file argument is in; default process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
 class ToolError extends Error {}
@@ -55,21 +58,24 @@ function errorText(err: unknown, cfg: HubConfig): string {
 }
 
 /** Build the MCP server. Exported separately from `runMcp` so tests can drive it over an in-memory transport. */
-export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
+export function createMcpServer({ cfg, client, feed, cwd, env = process.env }: Deps): McpServer {
   const server = new McpServer({ name: 'agenthub', version: VERSION }, { instructions: INSTRUCTIONS });
 
   const me = (): string => {
     if (!cfg.agent) throw new ToolError('This checkout has no agent identity. Ask your human to run `hub init --agent <human>/<agent>` or set HUB_AGENT.');
     return cfg.agent;
   };
-  const repoFiles = (files: string[]): string[] => {
-    if (!cfg.root) throw new ToolError('not inside a git repository, so file paths cannot be mapped to the shared repo');
-    return files.map((f) => {
-      const p = toRepoPath(f, cfg.root!, cwd);
-      if (!p) throw new ToolError(`${f} is outside the repository`);
-      return p;
+  // Keyed as the edit hook keys them: relative to the checkout each file is in, so a file in a
+  // worktree nested under this one (.claude/worktrees) is claimed, waited for and released by the
+  // name the hook denies it under.
+  const repoFiles = (files: string[]): string[] =>
+    files.map((f) => {
+      try {
+        return claimKey(f, cwd, cfg, env);
+      } catch (err) {
+        throw new ToolError((err as Error).message);
+      }
     });
-  };
   // What the feed learned about this agent's claims (a lease that ran out, a hub that lost them) rides on the next tool result.
   const noted = (text: string): string => {
     const notices = feed?.takeNotices() ?? [];
@@ -255,8 +261,9 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         return false;
       };
 
-      // Anything quoted (an intent, an unusual file name) was written by another agent.
-      const finish = (out: string[]): string => (out.some((l) => l.includes('"')) ? [...out, UNTRUSTED_NOTE] : out).join('\n');
+      // Other agents' claims and events carry their words: intents, and file names, plain ones included.
+      let othersWords = false;
+      const finish = (out: string[]): string => (othersWords || out.some((l) => l.includes('"')) ? [...out, UNTRUSTED_NOTE] : out).join('\n');
       // A hub back on a different database ends the wait: the claims it waited on are gone with the old one.
       const lines: string[] = [];
       let events: HubEvent[];
@@ -276,11 +283,15 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         lines.splice(0, 1, 'The hub came back with a different database while you waited; the claims it had are gone.');
       }
       const said = lines.length;
-      if (events.length) lines.push(`Woke up after: ${events.map(formatEvent).join('; ')}.`);
+      if (events.length) {
+        othersWords = true;
+        lines.push(`Woke up after: ${events.map(formatEvent).join('; ')}.`);
+      }
       const after = await ready();
       if (after) lines.push(after);
       else if (files.length) {
         const fresh = await blockersOf();
+        othersWords = true;
         lines.push(`Still claimed: ${fresh.conflicts.map((c) => formatConflict(c, fresh.now)).join('; ')}`);
       }
       if (!events.length) lines.splice(said, 0, `Nothing relevant happened in ${timeoutS}s.`);

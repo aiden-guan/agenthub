@@ -1,9 +1,11 @@
 import path from 'node:path';
 import type { ClaimResult } from '@agenthub/hub/protocol';
+import { claimRoot, lendIdentity, recordLending } from './checkout.js';
 import { HubClient, classifyFailure, type HubFailure } from './client.js';
-import { hasOwnSettings, loadConfig, type HubConfig } from './config.js';
-import { denyReason, digestText, inline } from './format.js';
-import { currentBranch, findRepoRoot, gitCommonDir, headCommit, isIgnored, realish, toRepoPath } from './git.js';
+import { hasOwnSettings, loadConfig, sameHub, type HubConfig } from './config.js';
+import { denyReason, digestText, inline, showNames } from './format.js';
+import { currentBranch, headCommit, isIgnored, toRepoPath, unclaimableReason } from './git.js';
+import { commitGuardOff } from './guard-status.js';
 import { PendingClaims, type StoredClaim } from './pending.js';
 
 export interface HookIO {
@@ -85,37 +87,6 @@ function sessionDir(input: Record<string, any>, io: HookIO): string {
   return io.env.CLAUDE_PROJECT_DIR || cwdFor(input, io);
 }
 
-const commonDirOf = (root: string): string => realish(gitCommonDir(root) ?? root);
-
-/** The git directory shared by every worktree of the repository `dir` is in. */
-function repositoryOf(dir: string): string | null {
-  const root = findRepoRoot(dir);
-  return root ? commonDirOf(root) : null;
-}
-
-/**
- * The checkout whose claims cover the files in `dir`: the nearest repository
- * around it that has agenthub settings. A submodule, or another repository
- * nested in a worktree, has none of its own, so its files are claimed as files
- * of the worktree around it (`vendor/lib/x.ts`), on the team's hub. A worktree
- * inside another worktree of the same repository (as Claude Code makes under
- * .claude/worktrees) is a checkout of its own. With no settings anywhere
- * around (HUB_* variables only), the same for the session's own repository;
- * null for any other (an added dependency, dotfiles): nobody coordinates it.
- */
-function claimRoot(dir: string, session: string): string | null {
-  const nearest = findRepoRoot(dir);
-  const sessionRepo = repositoryOf(session);
-  let checkout = nearest; // innermost root of the repository `root` belongs to
-  let own: string | null = null;
-  for (let root = nearest; root; root = findRepoRoot(path.dirname(root))) {
-    if (root !== checkout && commonDirOf(root) !== commonDirOf(checkout!)) checkout = root;
-    if (hasOwnSettings(root)) return checkout;
-    if (!own && commonDirOf(root) === sessionRepo) own = checkout;
-  }
-  return own;
-}
-
 /**
  * The repository and claim keys for the files a tool call edits, taken from the
  * files themselves: Claude's cwd follows `cd` (into a nested repository,
@@ -144,30 +115,10 @@ function editTarget(input: Record<string, any>, io: HookIO): { root: string; fil
  * Config for edits in the checkout at `root`. A checkout with no identity of
  * its own (a worktree Claude Code created under .claude/worktrees has no
  * .hub.json) takes the session's, from its project dir, else its cwd, when
- * that is in the same repository: an identity is never lent to another
- * project's checkout, or sent to its hub.
+ * that is in the same repository (see lendIdentity).
  */
 function configFor(root: string, input: Record<string, any>, io: HookIO): HubConfig {
-  const cfg = loadConfig({ cwd: root, env: io.env });
-  if (cfg.agent) return cfg;
-  const repo = repositoryOf(root);
-  for (const dir of [io.env.CLAUDE_PROJECT_DIR, cwdFor(input, io)]) {
-    if (!dir || repositoryOf(dir) !== repo) continue;
-    let session: HubConfig;
-    try {
-      session = loadConfig({ cwd: dir, env: io.env });
-    } catch {
-      continue;
-    }
-    if (!session.agent) continue;
-    return {
-      ...cfg,
-      agent: session.agent,
-      token: cfg.token ?? (session.url === cfg.url ? session.token : null),
-      failClosed: cfg.failClosed || session.failClosed,
-    };
-  }
-  return cfg;
+  return lendIdentity(loadConfig({ cwd: root, env: io.env }), io.env, [io.env.CLAUDE_PROJECT_DIR, cwdFor(input, io)]);
 }
 
 /** Which session, agent thread (main or a subagent) and tool call a hook event belongs to. */
@@ -196,8 +147,18 @@ function callIds(input: Record<string, any>): { session: string; thread: string;
 export async function preEditHook(io: HookIO): Promise<HookOutcome> {
   const input = parseInput(io.stdin);
   if (!input) return allowWithWarning('could not parse the hook input; edit not coordinated');
-  const target = editTarget(input, io);
-  if (!target) return ALLOW;
+  const edited = editTarget(input, io);
+  if (!edited) return ALLOW;
+  // A name the hub refuses can't be claimed by anyone, so it can't conflict: leave it out, and say so.
+  const refused = edited.files.flatMap((f) => {
+    const why = unclaimableReason(f);
+    return why ? [`${showNames([f])} (${why})`] : [];
+  });
+  const unclaimed = refused.length
+    ? `the hub can't hold a claim on ${refused.join('; ')}, so no agent can claim ${refused.length === 1 ? 'that file' : 'those files'}; edit not coordinated for ${refused.length === 1 ? 'it' : 'them'}`
+    : null;
+  const target = { ...edited, files: edited.files.filter((f) => unclaimableReason(f) === null) };
+  if (target.files.length === 0) return allowWithWarning(unclaimed!, 600);
 
   let cfg: HubConfig;
   try {
@@ -214,15 +175,20 @@ export async function preEditHook(io: HookIO): Promise<HookOutcome> {
     return allowWithWarning(`${why}; edit not coordinated.${also}`, 300 + also.length);
   }
 
+  // The guard in that checkout then acts as the same agent (see recordLending).
+  if (cfg.lentBy) recordLending(target.root, cfg.lentBy, callIds(input)?.session ?? null);
   try {
     const res = await hookClient(cfg).claim({ files: target.files, mode: 'auto', queue: false, base_commit: headCommit(target.root) ?? undefined });
     if (res.status === 'granted') {
-      trackClaim(input, target.root, res);
-      return ALLOW;
+      trackClaim(input, target.root, cfg, res);
+      return unclaimed ? allowWithWarning(unclaimed, 600) : ALLOW;
     }
-    const conflict = res.conflicts[0];
-    if (!conflict) return deny(`Edit blocked: the hub denied the claim on ${target.files.join(', ')} without naming a conflict. Tell your human.`);
-    return deny(denyReason(conflict.files[0] ?? target.files[0], conflict, res.now, res.deadlock));
+    const first = res.conflicts[0];
+    if (!first) return deny(`Edit blocked: the hub denied the claim on ${showNames(target.files)} without naming a conflict. Tell your human.`);
+    // Every claim in the way of that file: with shared holders and an exclusive waiter, the waiter is why.
+    const file = first.files[0] ?? target.files[0];
+    const inTheWay = res.conflicts.filter((c) => c.files.includes(file) || c.files.length === 0);
+    return deny(denyReason(file, inTheWay.length ? inTheWay : [first], res.now, res.deadlock));
   } catch (err) {
     const failure = classifyFailure(err, cfg);
     if (failure.kind !== 'unreachable') return deny(`Edit blocked: ${failureText(failure, cfg)}. Tell your human; edits stay blocked until the hub accepts the claim.`);
@@ -240,7 +206,7 @@ export async function preEditHook(io: HookIO): Promise<HookOutcome> {
  * renewed (a failed edit, retried; a subagent's rejected edit the main thread
  * then makes) now stands or falls with this call.
  */
-function trackClaim(input: Record<string, any>, root: string, res: ClaimResult): void {
+function trackClaim(input: Record<string, any>, root: string, cfg: HubConfig, res: ClaimResult): void {
   const ids = callIds(input);
   if (!ids?.tool) return;
   const call = { session: ids.session, thread: ids.thread, tool: ids.tool };
@@ -250,7 +216,8 @@ function trackClaim(input: Record<string, any>, root: string, res: ClaimResult):
     const created = res.renewed ? null : (res.claim ?? null);
     const renewed = (res.claims ?? []).map((c) => c.id).filter((id) => id !== created?.id);
     for (const e of store.find(renewed)) if (e.session !== call.session || e.tool !== call.tool) store.move(e, call);
-    if (created) store.add({ ...call, claim_id: created.id, root });
+    // Which claim this is, beyond its id: a hub back on a new database hands out the same ids again.
+    if (created) store.add({ ...call, claim_id: created.id, root, url: cfg.url, project: cfg.project, created_at: created.created_at });
   } catch {
     // Bookkeeping only: never fail an edit over it.
   }
@@ -276,8 +243,22 @@ async function releasePending(store: PendingClaims, entries: StoredClaim[], inpu
       store.remove(e);
       continue;
     }
+    // An entry for another hub or project, or for a claim of that id the hub made since
+    // (on a new database, ids start over), names nothing this agent should release.
+    if ((e.url !== undefined && !sameHub(e.url, cfg.url)) || (e.project !== undefined && e.project !== cfg.project)) {
+      store.remove(e);
+      continue;
+    }
     try {
-      await hookClient(cfg).release({ claim_id: e.claim_id });
+      const client = hookClient(cfg);
+      if (e.created_at !== undefined) {
+        const c = await client.getClaim(e.claim_id);
+        if (c.created_at !== e.created_at || c.holder !== cfg.agent) {
+          store.remove(e);
+          continue;
+        }
+      }
+      await client.release({ claim_id: e.claim_id });
       store.remove(e);
     } catch (err) {
       // The hub answered (no such claim, held by someone else): nothing is left to release.
@@ -363,6 +344,9 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
     return problem(`agenthub: configuration error (${inline((err as Error).message, 200)}). Edits in this checkout are blocked until it is fixed.`);
   }
   const warningOf = (ws: string[]) => ws.map((w) => `agenthub: ${inline(w, 400)}`).join('\n');
+  // A commit guard a hook manager took out (husky rewrites .husky/_ on install) goes unnoticed otherwise.
+  const guardOff = cfg.root && hasOwnSettings(cfg.root) ? commitGuardOff(cfg.root) : null;
+  if (guardOff) cfg.warnings.push(guardOff);
   const warning = warningOf(cfg.warnings);
   const also = warning ? `\n${warning}` : '';
   if (!cfg.agent) {

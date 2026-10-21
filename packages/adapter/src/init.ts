@@ -1,4 +1,4 @@
-import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   AGENT_ID_RE,
@@ -11,7 +11,8 @@ import {
   upstreamTeamConfig,
   type ConfigFile,
 } from './config.js';
-import { deriveProject, git, realish, recordedSettings } from './git.js';
+import { deriveProject, git, gitRaw, realish, recordedSettings } from './git.js';
+import { CALLED_HOOKS_DIR, GUARD_MARKER, commitGuardOff } from './guard-status.js';
 
 export interface InitOptions {
   cwd: string;
@@ -36,16 +37,20 @@ export const PRE_EDIT_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit';
 const EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit'];
 /** Events after which no tool call of the turn (or session) is still waiting: `hub hook settle` runs there. */
 const SETTLE_EVENTS = ['Stop', 'SubagentStop', 'UserPromptSubmit', 'SessionEnd'];
-const GUARD_MARKER = '# agenthub-guard';
 const CHAINED_SUFFIX = '.pre-agenthub';
+/**
+ * In the repository's git dir, beside its hooks directory: hooks hub init found
+ * that the guard can't run as their own file (see runsOnlyInPlace). The guard
+ * runs them from there, under their own name and at the same depth, so a
+ * relative symlink and a `$(dirname "$0")/../..` still lead where they did.
+ */
+const KEPT_HOOKS_DIR = 'agenthub-kept';
 /** The shells whose scripts hub init keeps and chains (see chainSh). */
 const SHELLS = ['sh', 'bash', 'dash', 'ksh', 'zsh'];
 /** A #! line chainSh runs in its shell: the same as its `case` patterns. */
 const SHELL_SHEBANG = new RegExp(`^#!.*[/ ](${SHELLS.join('|')})( .*)?$`);
 /** In the worktree's git dir: the pid of the `git commit` whose pre-commit ran the guard, so its prepare-commit-msg doesn't ask again. */
 const CHECKED_FILE = 'agenthub-pre-commit';
-/** In the repository's git dir: the guard hooks, for the hooks core.hooksPath points git at to call. */
-const CALLED_HOOKS_DIR = 'agenthub-hooks';
 /** The line that runs the guard from such a hook. It does nothing in a checkout where hub init hasn't run. */
 export const HOOKS_PATH_LINE =
   `agenthub_guard="$(git rev-parse --git-common-dir)/${CALLED_HOOKS_DIR}/$(basename "$0")"; ` +
@@ -63,10 +68,11 @@ export const HOOKS_PATH_LINE =
  *  - the git guard, as pre-commit, as prepare-commit-msg (for the commits git
  *    revert, cherry-pick and rebase make without pre-commit), as
  *    pre-merge-commit (merges git commits itself) and as pre-applypatch
- *    (git am, git rebase --apply); an existing hook that is a shell script is
- *    kept and chained. One that isn't (a symlink, another language, a binary)
- *    is left where it is, and so are the hooks core.hooksPath sends git to
- *    (see below)
+ *    (git am, git rebase --apply); an existing hook is kept and runs after the
+ *    guard (a shell script as its own file, anything else from
+ *    .git/agenthub-kept). Hooks core.hooksPath sends git to get the guard the
+ *    same way when the directory is the repository's own and git ignores it
+ *    (husky's .husky/_), and are left alone otherwise (see below)
  *  - the project id and hub URL in the repository's git config, which every
  *    worktree shares, for checkouts whose branch has no agenthub.json yet
  * Safe to run again; it only adds what's missing, and replaces its own hook
@@ -153,10 +159,11 @@ export function init(opts: InitOptions): string[] {
     const settingsPath = path.join(root, '.claude', 'settings.json');
     const settings = readJson(settingsPath);
     const hooks = (settings.hooks ??= {});
-    // The hook fails open by itself only when the hub is unreachable. If it can't
-    // run at all (`hub` or node missing, a crash, its timeout), Claude Code must
-    // block the edit rather than let it through uncoordinated.
-    let changed = addHook(hooks, 'PreToolUse', PRE_EDIT_MATCHER, `${command} hook pre-edit`, 'block');
+    // The hook fails open by itself only when the hub is unreachable. If it crashes or
+    // times out, Claude Code must block the edit rather than let it through
+    // uncoordinated. A CLI that isn't installed is a checkout not set up, as one
+    // with no identity is: a visible warning, or a block when fail-closed is set.
+    let changed = addHook(hooks, 'PreToolUse', PRE_EDIT_MATCHER, preEditCommand(command), 'block');
     // Confirms the claims of edits that ran; settle releases the ones of edits that never did.
     changed = addHook(hooks, 'PostToolUse', PRE_EDIT_MATCHER, `${command} hook post-edit`) || changed;
     changed = addHook(hooks, 'SessionStart', undefined, `${command} hook digest`) || changed;
@@ -188,49 +195,68 @@ export function init(opts: InitOptions): string[] {
     }
   }
 
-  // 5. git guard, in the repository's own hooks directory. Where core.hooksPath sends git elsewhere
-  // (husky's generated .husky/_, a directory the team tracks, a global one every repository runs),
-  // those hooks aren't hub init's to change: the guard goes where they can call it, and a note says how.
-  // So does the guard for a hook of the user's that the guard couldn't run after itself as git does.
+  // 5. git guard, in front of the hooks git runs. In the repository's own hooks directory, a hook
+  // that is a shell script is kept and runs after the guard as its own file (chainSh); one the guard
+  // can't run that way (a symlink, another language, a binary) moves to <git dir>/agenthub-kept and
+  // runs from there, under its own name. Where core.hooksPath sends git elsewhere, the guard goes in
+  // front of the hooks there the same way when that directory is this repository's own and git
+  // ignores it (husky's generated .husky/_). A directory the team tracks, or one other repositories
+  // may use (a global one, one outside this repository), isn't hub init's to change: the guard goes
+  // where their hooks can call it, and a note says how, and that the guard is off until then.
   if (opts.guard !== false) {
+    if (git(root, ['config', '--local', '--get', 'agenthub.guard']) === 'off') git(root, ['config', '--local', '--unset', 'agenthub.guard']);
     const common = git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
     const runs = git(root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']);
     if (!common || !runs) throw new Error('could not locate the git hooks directory');
     const own = path.join(common, 'hooks');
     const called = path.join(common, CALLED_HOOKS_DIR);
+    const keptDir = path.join(common, KEPT_HOOKS_DIR);
     const elsewhere = realish(runs) !== realish(own);
+    const target = elsewhere ? hooksPathTarget(root, runs, common) : own;
     const installed: string[] = [];
     const calledInstalled: string[] = [];
-    const inPlace: string[] = [];
-    for (const [name, script] of guardHooks(command)) {
-      if (elsewhere) {
+    const notChained: string[] = [];
+    for (const [name, script] of guardHooks(command, target === own)) {
+      if (!target) {
         installGitHook(called, name, script, calledInstalled);
         continue;
       }
-      const hookPath = path.join(own, name);
-      // An older hub init kept and chained any hook: one the guard can't run as git does goes back where it was.
-      if (isGuard(hookPath) && runsOnlyInPlace(hookPath + CHAINED_SUFFIX)) {
-        renameSync(hookPath + CHAINED_SUFFIX, hookPath);
-        installed.push(`moved your ${name} hook back from ${name}${CHAINED_SUFFIX} to ${hookPath}`);
-      }
+      const hookPath = path.join(target, name);
       const why = isGuard(hookPath) ? null : runsOnlyInPlace(hookPath);
-      if (why) {
+      if (target === own) {
+        // An older hub init kept such a hook as <name>.pre-agenthub, where it runs under another name: it gets its own back.
+        if (isGuard(hookPath) && runsOnlyInPlace(hookPath + CHAINED_SUFFIX)) {
+          const kept = keepHook(hookPath + CHAINED_SUFFIX, keptDir, name);
+          installed.push(`moved your ${name} hook from ${name}${CHAINED_SUFFIX} to ${kept}, where the guard runs it after its check under its own name`);
+        }
+        if (why) {
+          const kept = keepHook(hookPath, keptDir, name);
+          installed.push(`moved your ${name} hook, which ${why}, to ${kept}: the guard runs it from there after its check, under its own name`);
+        }
+      } else if (why) {
         installGitHook(called, name, script, calledInstalled);
-        inPlace.push(`${hookPath} ${why}`);
-      } else installGitHook(own, name, script, installed);
+        notChained.push(`${hookPath} ${why}`);
+        continue;
+      }
+      installGitHook(target, name, script, installed);
     }
     report.push(...installed);
     if (calledInstalled.length) report.push(`wrote the git guard to ${called}`);
-    if (elsewhere) notes.push(...hooksPathNotes(root, runs, own, called));
-    if (inPlace.length) {
-      const many = inPlace.length > 1;
+    if (elsewhere) notes.push(...hooksPathNotes(root, runs, own, called, target !== null));
+    if (notChained.length) {
+      const many = notChained.length > 1;
       notes.push(
-        `note: ${inPlace.join('; ')}, so hub init left ${many ? 'them where they are' : 'it where it is'}: run after the guard, a hook like that would no longer run as git runs it ` +
+        `note: ${notChained.join('; ')}, so hub init left ${many ? 'them where they are' : 'it where it is'}: run after the guard, a hook like that would no longer run as git runs it ` +
           `(under its own name, from its own place). The guard for ${many ? 'each' : 'it'} is in ${called}, under the hook's name, which git does not run by itself. ` +
           `To turn it on, have the hook run that guard first, with the hook's arguments, and stop if it fails. In a shell script (for a symlink, the script it links to) ` +
           `this line near the top does that, and does nothing in a checkout where hub init has not run: ${HOOKS_PATH_LINE}`,
       );
     }
+    const off = commitGuardOff(root);
+    if (off) notes.push(`warning: ${off}`);
+  } else {
+    // So the digest and `hub whoami` don't report a guard this repository chose to go without.
+    git(root, ['config', '--local', 'agenthub.guard', 'off']);
   }
 
   // A token in the environment looks as if it went everywhere: say now if it doesn't go to this hub.
@@ -254,26 +280,56 @@ function siblingTeamConfig(root: string): ConfigFile | null {
   return found.find((f) => f.url) ?? found[0] ?? null;
 }
 
-/** The guard hooks hub init installs, by git hook name. */
-function guardHooks(command: string): Array<[name: string, script: string]> {
+/** The guard hooks hub init installs, by git hook name; `kept`: in the repository's own hooks directory, where they run the hooks hub init moved to KEPT_HOOKS_DIR. */
+function guardHooks(command: string, kept: boolean): Array<[name: string, script: string]> {
   return [
-    ['pre-commit', guardScript(command)],
-    ['prepare-commit-msg', sequencerGuardScript(command)],
-    ['pre-merge-commit', mergeGuardScript(command)],
-    ['pre-applypatch', applyPatchGuardScript(command)],
+    ['pre-commit', guardScript(command, kept)],
+    ['prepare-commit-msg', sequencerGuardScript(command, kept)],
+    ['pre-merge-commit', mergeGuardScript(command, kept)],
+    ['pre-applypatch', applyPatchGuardScript(command, kept)],
   ];
 }
 
-/** What to say when core.hooksPath (`runs`) means git doesn't run the guard hub init put in `installed`. */
-function hooksPathNotes(root: string, runs: string, own: string, installed: string): string[] {
+/**
+ * The core.hooksPath directory `runs` when hub init may put the guard in front
+ * of its hooks: set for this repository alone (in its local or worktree git
+ * config), and inside its git dir, or inside the worktree where git ignores the
+ * hook files and tracks none of the directory (husky's generated .husky/_,
+ * whose .gitignore is `*`). Null for any other (a global one, which every
+ * repository on the machine runs; one the team tracks; one outside the repository).
+ */
+function hooksPathTarget(root: string, runs: string, common: string): string | null {
+  const scope = /^(\w+)\t/.exec(git(root, ['config', '--show-scope', '--get', 'core.hooksPath']) ?? '')?.[1];
+  if (scope !== 'local' && scope !== 'worktree') return null;
+  const dir = realish(runs);
+  const inside = (base: string) => dir === base || dir.startsWith(base + path.sep);
+  if (inside(realish(common))) return runs;
+  const top = realish(root);
+  if (!inside(top)) return null;
+  const rel = path.relative(top, dir).split(path.sep).join('/');
+  if (git(root, ['ls-files', '--', rel]) !== '') return null; // tracked (or git failed): the team's
+  for (const [name] of guardHooks('hub', false)) {
+    for (const f of [name, `${name}${CHAINED_SUFFIX}`]) if (gitRaw(root, ['check-ignore', '--', `${rel}/${f}`]) === null) return null; // would show up as new files
+  }
+  return runs;
+}
+
+/** What to say when core.hooksPath (`runs`) sends git to hooks other than `own`; `chained`: the guard went in front of them, else to `installed`. */
+function hooksPathNotes(root: string, runs: string, own: string, installed: string, chained: boolean): string[] {
   const m = /^(\w+)\t(.*)$/.exec(git(root, ['config', '--show-scope', '--get', 'core.hooksPath']) ?? '');
   const where = m ? `core.hooksPath (${m[2]}, set in the ${m[1]} git config)` : `core.hooksPath (${runs})`;
+  if (chained) {
+    return [
+      `note: git runs hooks from ${where}, not from ${own}, so the guard went in front of the hooks there. A hook manager may write that directory again ` +
+        '(husky does on every install), which takes the guard out: run `hub init` again then. The session digest and `hub whoami` say when the guard is off.',
+    ];
+  }
   const notes = [
     `note: git runs hooks from ${where}, not from ${own}. hub init leaves those alone (a hook manager, your team or other repositories may use them) ` +
       `and put the guard in ${installed}, which git does not run by itself. To turn it on, add this line near the top of your pre-commit, prepare-commit-msg, ` +
       `pre-merge-commit and pre-applypatch hooks (with husky: .husky/pre-commit and so on); it does nothing in a checkout where hub init has not run: ${HOOKS_PATH_LINE}`,
   ];
-  const stale = guardHooks('hub')
+  const stale = guardHooks('hub', false)
     .map(([name]) => path.join(runs, name))
     .filter((f) => existsSync(f) && readFileSync(f, 'utf8').includes(GUARD_MARKER));
   if (stale.length) {
@@ -294,14 +350,27 @@ function installGitHook(hooksDir: string, name: string, script: string, report: 
   if (current === script) return;
   if (stat && !current?.includes(GUARD_MARKER)) {
     const chained = path.join(hooksDir, `${name}${CHAINED_SUFFIX}`);
-    if (lstatSync(chained, { throwIfNoEntry: false })) throw new Error(`${hookPath} exists and ${chained} too; merge them by hand`);
-    renameSync(hookPath, chained);
+    const kept = lstatSync(chained, { throwIfNoEntry: false });
+    // A hook manager that wrote its hook again (husky on install) left the copy kept before as it was.
+    const same = kept?.isFile() && stat.isFile() && readFileSync(chained, 'utf8') === current;
+    if (kept && !same) throw new Error(`${hookPath} exists and ${chained} too; merge them by hand`);
+    if (same) rmSync(hookPath);
+    else renameSync(hookPath, chained);
     report.push(`kept your existing ${name} hook as ${name}${CHAINED_SUFFIX} (runs after the guard)`);
   }
   mkdirSync(hooksDir, { recursive: true });
   writeFileSync(hookPath, script);
   chmodSync(hookPath, 0o755);
   report.push(`installed ${name} guard at ${hookPath}`);
+}
+
+/** Move the hook at `file` to `keptDir` under `name`, where the guard runs it (see runKeptSh); returns where it went. */
+function keepHook(file: string, keptDir: string, name: string): string {
+  const kept = path.join(keptDir, name);
+  if (lstatSync(kept, { throwIfNoEntry: false })) throw new Error(`${file} exists and ${kept} too; merge them by hand`);
+  mkdirSync(keptDir, { recursive: true });
+  renameSync(file, kept);
+  return kept;
 }
 
 function isGuard(file: string): boolean {
@@ -313,7 +382,8 @@ function isGuard(file: string): boolean {
  * it, as that file (see chainSh), or null if it can (or git doesn't run it).
  * It can for a shell script; not for a symlink (the hook may find its target,
  * or the repository, through its own path, and the guard takes that path) or
- * for another kind of program, which sees the path it is started from.
+ * for another kind of program, which sees the path it is started from. Such a
+ * hook moves to KEPT_HOOKS_DIR instead (see runKeptSh).
  */
 function runsOnlyInPlace(file: string): string | null {
   const stat = lstatSync(file, { throwIfNoEntry: false });
@@ -389,6 +459,15 @@ AGENTHUB_KEPT_HOOK="$$ $0"; export AGENTHUB_KEPT_HOOK
 exec $shell "$0" "$@"
 `;
 
+/**
+ * Run the hook hub init moved to KEPT_HOOKS_DIR (a symlink, or not a shell
+ * script), the way git would have: under its own name, with the arguments
+ * git gave, one directory over from where git found it.
+ */
+const runKeptSh = (name: string): string => `kept="$(git rev-parse --git-common-dir 2>/dev/null)/${KEPT_HOOKS_DIR}/${name}"
+[ -x "$kept" ] && exec "$kept" "$@"
+`;
+
 /** The first lines of each guard: run as the kept hook when chainSh has the hook's shell run this file again (same process, so same $$). */
 const keptSh = (name: string): string => `if [ "\${AGENTHUB_KEPT_HOOK-}" = "$$ $0" ]; then
   unset AGENTHUB_KEPT_HOOK
@@ -396,7 +475,7 @@ const keptSh = (name: string): string => `if [ "\${AGENTHUB_KEPT_HOOK-}" = "$$ $
   exit
 fi`;
 
-export function guardScript(command: string): string {
+export function guardScript(command: string, kept = true): string {
   return `#!/bin/sh
 ${GUARD_MARKER} (installed by \`hub init\`)
 ${keptSh('pre-commit')}
@@ -408,7 +487,7 @@ ${FAIL_CLOSED_SH}
 ${runGuardSh(command, '')}
 # Checked: prepare-commit-msg, run next by the same git process ($PPID), skips it.
 gitdir="$(git rev-parse --git-dir 2>/dev/null)" && { echo "$PPID" > "$gitdir/${CHECKED_FILE}"; } 2>/dev/null
-${chainSh('pre-commit')}`;
+${kept ? runKeptSh('pre-commit') : ''}${chainSh('pre-commit')}`;
 }
 
 /**
@@ -425,7 +504,7 @@ ${chainSh('pre-commit')}`;
  * pre-commit (and --no-verify), and merge commits, which carry other branches'
  * work, are left alone.
  */
-export function sequencerGuardScript(command: string): string {
+export function sequencerGuardScript(command: string, kept = true): string {
   return `#!/bin/sh
 ${GUARD_MARKER} (installed by \`hub init\`)
 ${keptSh('prepare-commit-msg')}
@@ -445,7 +524,7 @@ if [ -n "$gitdir" ] && [ "$checked" != "$PPID" ] && [ ! -f "$gitdir/MERGE_HEAD" 
   { [ -f "$gitdir/MERGE_MSG" ] || [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; }; then
 ${runGuardSh(command, ' --sequencer').replace(/^/gm, '  ')}
 fi
-${chainSh('prepare-commit-msg')}`;
+${kept ? runKeptSh('prepare-commit-msg') : ''}${chainSh('prepare-commit-msg')}`;
 }
 
 /**
@@ -453,7 +532,7 @@ ${chainSh('prepare-commit-msg')}`;
  * pre-commit. It runs this before it writes MERGE_HEAD: `--merge` tells the
  * guard to find the merged commits elsewhere (see mergeHeads).
  */
-export function mergeGuardScript(command: string): string {
+export function mergeGuardScript(command: string, kept = true): string {
   return `#!/bin/sh
 ${GUARD_MARKER} (installed by \`hub init\`)
 ${keptSh('pre-merge-commit')}
@@ -464,11 +543,11 @@ ${keptSh('pre-merge-commit')}
 ${FAIL_CLOSED_SH}
 
 ${runGuardSh(command, ' --merge')}
-${chainSh('pre-merge-commit')}`;
+${kept ? runKeptSh('pre-merge-commit') : ''}${chainSh('pre-merge-commit')}`;
 }
 
 /** pre-applypatch: git am, and git rebase --apply through it, commit each patch without pre-commit or prepare-commit-msg. */
-export function applyPatchGuardScript(command: string): string {
+export function applyPatchGuardScript(command: string, kept = true): string {
   return `#!/bin/sh
 ${GUARD_MARKER} (installed by \`hub init\`)
 ${keptSh('pre-applypatch')}
@@ -479,7 +558,31 @@ ${keptSh('pre-applypatch')}
 ${FAIL_CLOSED_SH}
 
 ${runGuardSh(command, ' --sequencer')}
-${chainSh('pre-applypatch')}`;
+${kept ? runKeptSh('pre-applypatch') : ''}${chainSh('pre-applypatch')}`;
+}
+
+/**
+ * The PreToolUse entry's command: the hook, and what to do when the shell can't
+ * start the CLI (exit 127: not on PATH, or node missing), which hasn't read the
+ * fail-closed setting. Like the guard script: HUB_FAIL_CLOSED, else failClosed
+ * in the project's agenthub.json or .hub.json, blocks the edit (exit 2);
+ * otherwise it goes ahead with a warning the user sees, as in a checkout with
+ * no identity. Anything else the hook can't do (a crash, its timeout) is a
+ * failure, which `onFailure: "block"` turns into a denial.
+ */
+export function preEditCommand(command: string): string {
+  const shown = command.replace(/["'`$\\]/g, '');
+  const warning = JSON.stringify({
+    systemMessage: `agenthub: could not run ${shown} (not on PATH, or node is missing), so this edit is not coordinated with other agents. Install the agenthub CLI or put it on PATH.`,
+  });
+  const files = '"$CLAUDE_PROJECT_DIR/agenthub.json" "$CLAUDE_PROJECT_DIR/.hub.json"';
+  return (
+    `${command} hook pre-edit; s=$?; [ "$s" -ne 127 ] && exit "$s"; ` +
+    `case "$HUB_FAIL_CLOSED" in ` +
+    `'') grep -qs '"failClosed"[[:space:]]*:[[:space:]]*true' ${files} || { printf '%s\\n' '${warning}'; exit 0; } ;; ` +
+    `0|false|no|off|FALSE|NO|OFF|False|No|Off) printf '%s\\n' '${warning}'; exit 0 ;; ` +
+    `esac; echo "agenthub: could not run ${shown} (not on PATH, or node is missing); edit blocked (fail-closed)" >&2; exit 2`
+  );
 }
 
 type HookEntry = { type: string; command: string; timeout?: number; onFailure?: 'block' | 'continue' };
@@ -509,8 +612,14 @@ function runsHub(prefix: string): boolean {
  */
 function addHook(hooks: Record<string, HookGroup[]>, event: string, matcher: string | undefined, command: string, onFailure?: 'block'): boolean {
   const groups = (hooks[event] ??= []);
-  const subcommand = command.slice(command.lastIndexOf(' hook '));
-  const isOurs = (c: unknown) => typeof c === 'string' && (c === command || (c.endsWith(subcommand) && runsHub(c.slice(0, -subcommand.length))));
+  // `<cli> hook <name>`, as older versions wrote it, or followed by what preEditCommand adds.
+  const subcommand = / hook [a-z-]+/.exec(command.slice(command.lastIndexOf(' hook ')))![0];
+  const prefixOf = (c: string): string | null => {
+    if (c.endsWith(subcommand)) return c.slice(0, -subcommand.length);
+    const at = c.indexOf(`${subcommand}; s=$?;`);
+    return at > 0 ? c.slice(0, at) : null;
+  };
+  const isOurs = (c: unknown) => typeof c === 'string' && (c === command || (prefixOf(c) !== null && runsHub(prefixOf(c)!)));
   const ours = groups.flatMap((g) => (g.hooks ?? []).filter((h) => isOurs(h?.command)).map((h) => ({ group: g, entry: h })));
   const kept = ours.find((o) => o.entry.command === command) ?? ours[0];
   let changed = false;

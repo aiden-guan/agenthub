@@ -13,6 +13,10 @@ export interface PendingClaim {
   /** Root of the worktree the edited file is in; its config says which hub and identity to release with. */
   root: string;
   at: number;
+  /** The hub and project the claim was made on, and when the hub made it: a hub back on a new database hands out the same ids. Missing in entries an older adapter wrote. */
+  url?: string;
+  project?: string;
+  created_at?: number;
 }
 
 export type StoredClaim = PendingClaim & { file: string };

@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
@@ -6,13 +6,14 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { HubClient } from '../src/client.js';
 import { loadConfig } from '../src/config.js';
 import { stagedPaths } from '../src/git.js';
-import { PRE_EDIT_MATCHER as EDIT_MATCHER, HOOKS_PATH_LINE, guardScript, init, splitCommand } from '../src/init.js';
+import { PRE_EDIT_MATCHER as EDIT_MATCHER, HOOKS_PATH_LINE, guardScript, init, preEditCommand, splitCommand } from '../src/init.js';
 import {
   A,
   B,
   CLI_COMMAND,
   PROJECT,
   client,
+  downUrl,
   failingHub,
   fakeHub,
   git,
@@ -62,8 +63,9 @@ describe('hub init', () => {
     expect(settings.permissions).toEqual({ allow: ['Bash(npm test)'] });
     expect(settings.hooks.PreToolUse).toEqual([
       { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo bash' }] },
-      { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: 'hub hook pre-edit', timeout: 30, onFailure: 'block' }] },
+      { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: preEditCommand('hub'), timeout: 30, onFailure: 'block' }] },
     ]);
+    expect(preEditCommand('hub')).toMatch(/^hub hook pre-edit; s=\$\?; /);
     expect(settings.hooks.PostToolUse).toEqual([{ matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: 'hub hook post-edit', timeout: 30 }] }]);
     expect(settings.hooks.SessionStart).toEqual([{ hooks: [{ type: 'command', command: 'hub hook digest', timeout: 30 }] }]);
     for (const event of ['Stop', 'SubagentStop', 'UserPromptSubmit', 'SessionEnd']) {
@@ -117,7 +119,7 @@ describe('hub init', () => {
     writeFileSync(settingsPath, JSON.stringify(settings));
     expect(init({ cwd: repo.main, project: PROJECT, guard: false }).join('\n')).toMatch(/updated \.claude\/settings\.json/);
     expect(JSON.parse(readFileSync(settingsPath, 'utf8')).hooks.PreToolUse[1].hooks).toEqual([
-      { type: 'command', command: 'hub hook pre-edit', timeout: 30, onFailure: 'block' },
+      { type: 'command', command: preEditCommand('hub'), timeout: 30, onFailure: 'block' },
     ]);
 
     entry().onFailure = 'continue';
@@ -135,7 +137,7 @@ describe('hub init', () => {
     expect(init({ cwd: repo.main, project: PROJECT, guard: false, env: {} }).join('\n')).toMatch(/updated \.claude\/settings\.json/);
     const hooks = JSON.parse(readFileSync(settingsPath, 'utf8')).hooks;
     expect(hooks.PreToolUse).toHaveLength(2);
-    expect(hooks.PreToolUse[1]).toMatchObject({ matcher: EDIT_MATCHER, hooks: [{ command: 'hub hook pre-edit' }] });
+    expect(hooks.PreToolUse[1]).toMatchObject({ matcher: EDIT_MATCHER, hooks: [{ command: preEditCommand('hub') }] });
     // a group shared with someone else's hook keeps its matcher; the hub entry moves to a group of its own
     expect(hooks.PostToolUse).toEqual([
       { matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'echo mine' }] },
@@ -163,7 +165,7 @@ describe('hub init', () => {
       init(opts); // `hub`, which turns out not to be on Claude's PATH
       expect(init({ ...opts, command: CLI_COMMAND }).join('\n')).toMatch(/updated \.claude\/settings\.json/);
       const expected = {
-        PreToolUse: [mine, { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: `${CLI_COMMAND} hook pre-edit`, timeout: 30, onFailure: 'block' }] }],
+        PreToolUse: [mine, { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: preEditCommand(CLI_COMMAND), timeout: 30, onFailure: 'block' }] }],
         PostToolUse: [{ matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: `${CLI_COMMAND} hook post-edit`, timeout: 30 }] }],
         SessionStart: [{ hooks: [{ type: 'command', command: 'echo hello' }] }, { hooks: [{ type: 'command', command: `${CLI_COMMAND} hook digest`, timeout: 30 }] }],
         ...Object.fromEntries(['Stop', 'SubagentStop', 'UserPromptSubmit', 'SessionEnd'].map((e) => [e, [{ hooks: [{ type: 'command', command: `${CLI_COMMAND} hook settle`, timeout: 30 }] }]])),
@@ -205,10 +207,40 @@ describe('hub init', () => {
       const hooks = JSON.parse(readFileSync(settingsPath, 'utf8')).hooks;
       expect(hooks.PreToolUse).toEqual([
         ...before.PreToolUse,
-        { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: `${CLI_COMMAND} hook pre-edit`, timeout: 30, onFailure: 'block' }] },
+        { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: preEditCommand(CLI_COMMAND), timeout: 30, onFailure: 'block' }] },
       ]);
       expect(hooks.SessionStart).toEqual([...before.SessionStart, { hooks: [{ type: 'command', command: `${CLI_COMMAND} hook digest`, timeout: 30 }] }]);
       expect(hooks.Stop).toEqual([...before.Stop, { hooks: [{ type: 'command', command: `${CLI_COMMAND} hook settle`, timeout: 30 }] }]);
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it('lets an edit through with a visible warning when the hub CLI is not installed, as when there is no identity, and blocks it when fail-closed is set', async () => {
+    const x = makeRepo();
+    try {
+      const input = preToolUseInput(x.main, path.join(x.main, 'src', 'auth.ts'));
+      const hookAs = (command: string, extra: Record<string, string | undefined> = {}) =>
+        run('/bin/sh', ['-c', preEditCommand(command)], { cwd: x.main, env: testEnv({ CLAUDE_PROJECT_DIR: x.main, ...extra }), input });
+      const missing = 'agenthub-cli-missing-for-test';
+      const open = await hookAs(missing);
+      expect(open.code).toBe(0);
+      expect(JSON.parse(open.stdout)).toEqual({
+        systemMessage: `agenthub: could not run ${missing} (not on PATH, or node is missing), so this edit is not coordinated with other agents. Install the agenthub CLI or put it on PATH.`,
+      });
+      // Exit 2 blocks the edit and shows Claude why; the CLI couldn't read the fail-closed setting, so the command does.
+      const closed = { code: 2, stdout: '', stderr: expect.stringMatching(/could not run agenthub-cli-missing-for-test .*; edit blocked \(fail-closed\)\n$/) };
+      expect(await hookAs(missing, { HUB_FAIL_CLOSED: '1' })).toMatchObject(closed);
+      expect((await hookAs(missing, { HUB_FAIL_CLOSED: 'off' })).code).toBe(0);
+      writeFileSync(path.join(x.main, '.hub.json'), JSON.stringify({ failClosed: true }));
+      expect(await hookAs(missing)).toMatchObject(closed);
+      expect((await hookAs(missing, { HUB_FAIL_CLOSED: '0' })).code).toBe(0);
+      rmSync(path.join(x.main, '.hub.json'));
+      // A CLI that runs answers as it does; one that fails exits with its own code, which onFailure: "block" turns into a denial.
+      const real = await hookAs(CLI_COMMAND, { HUB_URL: srv.url, HUB_PROJECT: PROJECT });
+      expect(real.code).toBe(0);
+      expect(JSON.parse(real.stdout).systemMessage).toMatch(/no agent identity/);
+      expect((await hookAs('sh -c "exit 3" --')).code).toBe(3);
     } finally {
       x.cleanup();
     }
@@ -323,6 +355,17 @@ describe('hub guard: only an unreachable hub may let a commit through unchecked'
     }
   });
 
+  it("blocks the commit when the hub URL has a port Node's fetch refuses to connect to, which is a setup mistake, not an outage", async () => {
+    stage('src/users.ts', 'export const users = [];\n');
+    try {
+      const res = await hubCli(['guard'], { cwd: r.wtB, env: env({ HUB_URL: 'http://127.0.0.1:6667' }) });
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/^hub guard: hub URL http:\/\/127\.0\.0\.1:6667 uses port 6667, which Node's fetch refuses to connect to .*; commit blocked/);
+    } finally {
+      unstage();
+    }
+  });
+
   it('blocks on a 4xx refusal (such as a staged path the hub rejects) and fails open, with a warning, only on a 5xx', async () => {
     const refusing = await failingHub(400, 'invalid_path', 'path "notes\\u0007.txt" has control characters');
     const broken = await failingHub(503, 'unavailable', 'shutting down');
@@ -343,27 +386,47 @@ describe('hub guard: only an unreachable hub may let a commit through unchecked'
     }
   });
 
-  it("blocks a commit with a name the real hub refuses, with the hub's escaped reason, and checks legal odd names like a:b.md and ..env", async () => {
-    const bad = 'notes\u0007.txt';
-    stage(bad, 'x\n');
-    try {
-      const res = await hubCli(['guard'], { cwd: r.wtB, env: env() });
-      expect(res.code).toBe(1);
-      expect(res.stderr).toContain('refused the request (HTTP 400 invalid_path: invalid path "notes\\u0007.txt": contains U+0007;');
-      expect(res.stderr).not.toContain('\u0007');
-    } finally {
-      unstage();
-      rmSync(path.join(r.wtB, bad), { force: true });
+  it("checks the rest of a commit with a name the real hub refuses, which no agent can claim, saying so, and checks legal odd names like a:b.md and ..env", async () => {
+    // Before, one such name made the whole check fail (open, then blocked): a commit of it alone was refused outright.
+    const bad = ['notes\u0007.txt', 'he\u200fbrew.txt', 'C:/x.txt'];
+    for (const f of bad) {
+      mkdirSync(path.dirname(path.join(r.wtB, f)), { recursive: true });
+      stage(f, 'x\n');
     }
-    for (const odd of ['a:b.md', '..env']) stage(odd, 'x\n');
-    stage('src/auth.ts', 'export const login = () => "b";\n');
     try {
+      const alone = await hubCli(['guard'], { cwd: r.wtB, env: env() });
+      expect(alone.code).toBe(0);
+      expect(alone.stderr).toContain("hub guard: warning: not checked, as the hub can't hold a claim on them and no agent can claim them: ");
+      expect(alone.stderr).toContain('"notes\\u0007.txt" (it contains U+0007');
+      expect(alone.stderr).toContain('"he\\u200fbrew.txt" (it contains U+200F');
+      expect(alone.stderr).toContain('C:/x.txt (it starts like an absolute path');
+      expect(alone.stderr).not.toMatch(/[\u0007\u200f]/);
+      for (const odd of ['a:b.md', '..env']) stage(odd, 'x\n');
+      stage('src/auth.ts', 'export const login = () => "b";\n');
       const res = await hubCli(['guard'], { cwd: r.wtB, env: env() });
       expect(res.code).toBe(1);
       expect(res.stderr).toMatch(/commit blocked[\s\S]*src\/auth\.ts — claimed by maya\/claude-1/);
+      expect(res.stderr).toContain('hub guard: warning: not checked');
     } finally {
       unstage();
-      for (const odd of ['a:b.md', '..env']) rmSync(path.join(r.wtB, odd), { force: true });
+      for (const f of [...bad, 'a:b.md', '..env']) rmSync(path.join(r.wtB, f), { force: true });
+      rmSync(path.join(r.wtB, 'C:'), { recursive: true, force: true });
+    }
+  });
+
+  it('refuses the same names the hub refuses, so a name it skips could never have been claimed', async () => {
+    const { normalizeRepoPath } = await import('@agenthub/hub');
+    const { unclaimableReason } = await import('../src/git.js');
+    const names = ['a.ts', 'a:b.md', '..env', 'src/café.ts', 'x\u0000y', 'x\ny', 'x\u0085y', 'x\u2028y', 'x\u061Cy', 'x\u200Ey', 'x\u202Ey', 'x\u2066y', 'x\uD800y',
+      '/abs', 'C:/x', 'c:\\x', 'a//b', 'a/./b', 'a/../b', 'a/', 'x'.repeat(4096), 'x'.repeat(4097), 'src/a\u200Bb.ts', 'src/\u3164.ts'];
+    for (const n of names) {
+      let hubRefuses = false;
+      try {
+        normalizeRepoPath(n);
+      } catch {
+        hubRefuses = true;
+      }
+      expect(unclaimableReason(n) !== null, JSON.stringify(n)).toBe(hubRefuses);
     }
   });
 
@@ -768,7 +831,7 @@ describe('hub guard: commits git makes without running pre-commit', () => {
     writeFileSync(path.join(r.wtB, 'src', 'users.ts'), 'export const users = ["picked"];\n');
     expect((await gitB(['commit', '-qam', 'sam: users again'])).code).toBe(0);
     await conflictedPick('src/users.ts');
-    const unchecked = await gitB(['commit', '-q', '--no-edit'], { HUB_URL: 'http://127.0.0.1:9', HUB_TIMEOUT_MS: '1000' });
+    const unchecked = await gitB(['commit', '-q', '--no-edit'], { HUB_URL: await downUrl(), HUB_TIMEOUT_MS: '1000' });
     expect(unchecked.code).toBe(0);
     expect(unchecked.stderr.match(/claims not checked/g)).toHaveLength(1); // pre-commit ran, so prepare-commit-msg did not ask again
   });
@@ -921,22 +984,22 @@ describe('hub init where git runs hooks from somewhere else (core.hooksPath)', (
     await hub.close();
   });
 
-  it("leaves husky's hooks alone, so the project's own pre-commit keeps running, and puts the guard where husky's hooks can call it", async () => {
+  it("puts the guard in front of husky's generated hooks, so the project's own pre-commit runs after it, and says when a husky install took it out", async () => {
     const x = makeRepo();
     try {
       const stubs = huskify(x.main);
-      const before = snapshot(stubs);
+      const stub = readFileSync(path.join(stubs, 'pre-commit'), 'utf8');
       expect(await commit(x.main, 'src/users.ts')).toMatchObject({ code: 1, stderr: expect.stringMatching(/husky lint: FAILED/) });
 
       const report = init({ cwd: x.main, ...opts }).join('\n');
-      expect(snapshot(stubs)).toEqual(before);
-      expect(report).toMatch(/note: git runs hooks from core\.hooksPath \(\.husky\/_, set in the local git config\)/);
-      expect(report).toContain(HOOKS_PATH_LINE);
+      expect(report).toContain(`installed pre-commit guard at ${path.join(realpathSync(stubs), 'pre-commit')}`);
+      expect(report).toContain('kept your existing pre-commit hook as pre-commit.pre-agenthub (runs after the guard)');
+      expect(report).toMatch(/note: git runs hooks from core\.hooksPath \(\.husky\/_, set in the local git config\), not from .*, so the guard went in front of the hooks there/);
+      expect(report).not.toMatch(/warning: the commit guard is off/);
+      expect(git(x.main, 'status', '--porcelain', '--untracked-files=all', '--', '.husky/_')).toBe(''); // all of it ignored, as husky's own files are
+      // husky's hook runs after the guard, under its own name, so it still finds .husky/pre-commit
       expect(await commit(x.main, 'src/users.ts')).toMatchObject({ code: 1, stderr: expect.stringMatching(/husky lint: FAILED/) });
-      expect(init({ cwd: x.main, ...opts })[0]).toBe('already set up; nothing to change'); // and no "merge them by hand"
-
-      // Wired in as the note says, the guard runs from husky's pre-commit, before the project's own checks.
-      writeFileSync(path.join(x.main, '.husky', 'pre-commit'), `${HOOKS_PATH_LINE}\necho "husky lint: ok" >&2\n`);
+      writeFileSync(path.join(x.main, '.husky', 'pre-commit'), 'echo "husky lint: ok" >&2\n');
       await client(hub.url, A).claim({ files: ['src/auth.ts'], intent: 'Migrate login to OAuth2' });
       const blocked = await commit(x.main, 'src/auth.ts');
       expect(blocked.code).not.toBe(0);
@@ -944,26 +1007,46 @@ describe('hub init where git runs hooks from somewhere else (core.hooksPath)', (
       expect(blocked.stderr).not.toMatch(/husky lint: ok/);
       git(x.main, 'reset', '-q');
       expect(await commit(x.main, 'src/users.ts')).toMatchObject({ code: 0, stderr: expect.stringMatching(/husky lint: ok/) });
-      // A clone that has not run hub init commits as before: the line does nothing there.
+      expect(init({ cwd: x.main, ...opts })[0]).toBe('already set up; nothing to change');
+
+      // A husky install writes its hooks again, which takes the guard out: hub whoami and the session digest say so,
+      // and hub init puts it back (with no "merge them by hand").
+      for (const name of ['pre-commit', 'prepare-commit-msg', 'pre-merge-commit', 'pre-applypatch']) writeFileSync(path.join(stubs, name), stub);
+      const whoami = async () => JSON.parse((await hubCli(['whoami'], { cwd: x.main, env: env(B) })).stdout).commitGuard;
+      expect(await whoami()).toMatch(/^the commit guard is off in this checkout: git runs .*\.husky\/_\/pre-commit before each commit, and it doesn't call the guard/);
+      const digest = JSON.parse((await hubCli(['hook', 'digest'], { cwd: x.main, env: env(B), input: '{}' })).stdout);
+      expect(digest.systemMessage).toMatch(/^agenthub: the commit guard is off in this checkout/);
+      expect(digest.hookSpecificOutput.additionalContext).toMatch(/the commit guard is off in this checkout[\s\S]*agenthub team state/);
+      expect(init({ cwd: x.main, ...opts }).join('\n')).toContain('installed pre-commit guard at');
+      expect(await whoami()).toBe('on');
+      expect((await commit(x.main, 'src/auth.ts')).stderr).toMatch(/hub guard: commit blocked/);
+      git(x.main, 'reset', '-q');
+      // A clone that has not run hub init commits as before.
       const clone = path.join(x.dir, 'lee');
       git(x.dir, 'clone', '-q', x.main, clone);
-      cpHusky(x.main, clone);
+      huskify(clone);
+      writeFileSync(path.join(clone, '.husky', 'pre-commit'), 'echo "husky lint: ok" >&2\n');
       expect(await commit(clone, 'src/users.ts')).toMatchObject({ code: 0, stderr: 'husky lint: ok\n' });
     } finally {
       x.cleanup();
     }
   });
 
-  it('says how to undo a guard an older hub init put in a core.hooksPath directory, instead of refusing to run', () => {
+  it('says how to undo a guard an older hub init put in a hooks directory the team tracks, instead of refusing to run', () => {
     const x = makeRepo();
     try {
-      const stubs = huskify(x.main);
+      const team = path.join(x.main, '.githooks');
+      mkdirSync(team);
+      writeFileSync(path.join(team, 'pre-commit'), '#!/bin/sh\necho "team lint ran" >&2\n');
+      git(x.main, 'add', '.githooks');
+      git(x.main, 'commit', '-q', '-m', 'team hooks');
+      git(x.main, 'config', 'core.hooksPath', '.githooks');
       // what an older hub init left there
-      writeFileSync(path.join(stubs, 'pre-commit.pre-agenthub'), readFileSync(path.join(stubs, 'pre-commit')));
-      writeFileSync(path.join(stubs, 'pre-commit'), guardScript(CLI_COMMAND));
+      renameSync(path.join(team, 'pre-commit'), path.join(team, 'pre-commit.pre-agenthub'));
+      writeFileSync(path.join(team, 'pre-commit'), guardScript(CLI_COMMAND));
       const report = init({ cwd: x.main, ...opts }).join('\n');
-      expect(report).toMatch(/\.husky\/_\/pre-commit is a guard an older hub init installed there/);
-      expect(report).toMatch(/pre-commit\.pre-agenthub/);
+      expect(report).toMatch(/\.githooks\/pre-commit is a guard an older hub init installed there/);
+      expect(report).toMatch(/move .*\.githooks\/pre-commit\.pre-agenthub back to .*\.githooks\/pre-commit/);
     } finally {
       x.cleanup();
     }
@@ -990,7 +1073,7 @@ describe('hub init where git runs hooks from somewhere else (core.hooksPath)', (
       git(other, 'add', '-A');
       const unrelated = await run('git', ['commit', '-q', '-m', 'unrelated'], {
         cwd: other,
-        env: testEnv({ GIT_CONFIG_GLOBAL: gitconfig, HUB_URL: 'http://127.0.0.1:9', HUB_FAIL_CLOSED: '1' }),
+        env: testEnv({ GIT_CONFIG_GLOBAL: gitconfig, HUB_URL: await downUrl(), HUB_FAIL_CLOSED: '1' }),
       });
       expect(unrelated).toMatchObject({ code: 0, stderr: 'corp secret scan ran\n' });
     } finally {
@@ -1060,11 +1143,11 @@ describe('hub init where git runs hooks from somewhere else (core.hooksPath)', (
     }
   });
 
-  it('leaves a symlinked or non-shell hook where it is, which the guard could not run as git does, and says how to call the guard from it', async () => {
+  it('moves a symlinked or non-shell hook beside the hooks directory, where the guard runs it after its check under its own name, and keeps the guard on for one an older hub init chained', async () => {
     const x = makeRepo();
     try {
       const hooksDir = git(x.main, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks').trim();
-      const called = path.join(git(x.main, 'rev-parse', '--path-format=absolute', '--git-common-dir').trim(), 'agenthub-hooks');
+      const kept = path.join(git(x.main, 'rev-parse', '--path-format=absolute', '--git-common-dir').trim(), 'agenthub-kept', 'pre-commit');
       mkdirSync(hooksDir, { recursive: true });
       // A hook linked to a dispatcher in the checkout, which finds the checkout through its own place
       // and runs tools/<its own name>.d/*.
@@ -1079,63 +1162,105 @@ describe('hub init where git runs hooks from somewhere else (core.hooksPath)', (
       expect(await commit(x.main, 'src/users.ts')).toMatchObject(dispatched);
 
       const report = init({ cwd: x.main, ...opts }).join('\n');
-      expect(readlinkSync(path.join(hooksDir, 'pre-commit'))).toBe('../../tools/dispatch');
-      expect(existsSync(path.join(hooksDir, 'pre-commit.pre-agenthub'))).toBe(false);
-      expect(report).toContain(`note: ${path.join(hooksDir, 'pre-commit')} is a symlink (to ../../tools/dispatch), so hub init left it where it is`);
-      expect(report).toContain(HOOKS_PATH_LINE);
-      expect(readFileSync(path.join(called, 'pre-commit'), 'utf8')).toBe(guardScript(CLI_COMMAND));
-      expect(readFileSync(path.join(hooksDir, 'prepare-commit-msg'), 'utf8')).toContain('# agenthub-guard'); // the other hooks get theirs
-      expect(await commit(x.main, 'src/users.ts')).toMatchObject(dispatched);
-      expect(init({ cwd: x.main, ...opts })[0]).toBe('already set up; nothing to change');
-
-      // Wired in as the note says, the guard runs first.
-      writeFileSync(path.join(tools, 'dispatch'), dispatch.replace('\n', `\n${HOOKS_PATH_LINE}\n`));
+      expect(readlinkSync(kept)).toBe('../../tools/dispatch'); // the same link, one directory over: it leads to the same file
+      expect(readFileSync(path.join(hooksDir, 'pre-commit'), 'utf8')).toBe(guardScript(CLI_COMMAND));
+      expect(report).toContain(`moved your pre-commit hook, which is a symlink (to ../../tools/dispatch), to ${kept}: the guard runs it from there after its check, under its own name`);
+      expect(report).not.toMatch(/warning: the commit guard is off/);
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject(dispatched); // still finds tools/pre-commit.d
       await client(hub.url, A).claim({ files: ['src/auth.ts'], intent: 'Migrate login to OAuth2' });
       const blocked = await commit(x.main, 'src/auth.ts');
       expect(blocked.code).not.toBe(0);
       expect(blocked.stderr).toMatch(/hub guard: commit blocked[\s\S]*src\/auth\.ts — claimed by maya\/claude-1/);
       expect(blocked.stderr).not.toMatch(/dispatched lint/);
       git(x.main, 'reset', '-q');
-      expect(await commit(x.main, 'src/users.ts')).toMatchObject(dispatched);
+      expect(init({ cwd: x.main, ...opts })[0]).toBe('already set up; nothing to change');
 
-      // A hook in another language, which sees the path it is started from.
+      // A hook in another language, which sees the path it is started from: its own name.
+      rmSync(kept);
       rmSync(path.join(hooksDir, 'pre-commit'));
       const nodeHook =
-        '#!/usr/bin/env node\nconst p = require("path"), me = process.argv[1];\nconsole.error(`node lint (${p.basename(p.dirname(me))}/${p.basename(me)}): FAILED`);\nprocess.exit(1);\n';
+        '#!/usr/bin/env node\nconst p = require("path"), me = process.argv[1];\nconsole.error(`node lint (${p.basename(me)}, ${process.argv.length - 2} args): FAILED`);\nprocess.exit(1);\n';
       writeFileSync(path.join(hooksDir, 'pre-commit'), nodeHook);
       chmodSync(path.join(hooksDir, 'pre-commit'), 0o755);
-      const named = { code: 1, stderr: expect.stringMatching(/node lint \(hooks\/pre-commit\): FAILED/) };
+      const named = { code: 1, stderr: expect.stringMatching(/node lint \(pre-commit, 0 args\): FAILED/) };
       expect(await commit(x.main, 'src/users.ts')).toMatchObject(named);
-      expect(init({ cwd: x.main, ...opts }).join('\n')).toContain(`note: ${path.join(hooksDir, 'pre-commit')} is not a shell script, so hub init left it where it is`);
-      expect(readFileSync(path.join(hooksDir, 'pre-commit'), 'utf8')).toBe(nodeHook);
+      expect(init({ cwd: x.main, ...opts }).join('\n')).toContain(`moved your pre-commit hook, which is not a shell script, to ${kept}`);
+      expect(readFileSync(kept, 'utf8')).toBe(nodeHook);
       expect(await commit(x.main, 'src/users.ts')).toMatchObject(named);
 
-      // Kept and chained by an older hub init: it goes back where it was.
-      rmSync(path.join(hooksDir, 'pre-commit'));
+      // Kept as pre-commit.pre-agenthub by an older hub init, whose guard ran it: running hub init again (the upgrade
+      // step) keeps the guard on, where it used to move the hook back over it, and the hook gets its own name back.
+      rmSync(kept);
       writeFileSync(path.join(hooksDir, 'pre-commit.pre-agenthub'), nodeHook);
       chmodSync(path.join(hooksDir, 'pre-commit.pre-agenthub'), 0o755);
       writeFileSync(path.join(hooksDir, 'pre-commit'), guardScript(CLI_COMMAND));
-      expect(init({ cwd: x.main, ...opts }).join('\n')).toMatch(/moved your pre-commit hook back from pre-commit\.pre-agenthub/);
-      expect(readFileSync(path.join(hooksDir, 'pre-commit'), 'utf8')).toBe(nodeHook);
+      expect(init({ cwd: x.main, ...opts }).join('\n')).toContain(`moved your pre-commit hook from pre-commit.pre-agenthub to ${kept}`);
       expect(existsSync(path.join(hooksDir, 'pre-commit.pre-agenthub'))).toBe(false);
+      expect(readFileSync(path.join(hooksDir, 'pre-commit'), 'utf8')).toBe(guardScript(CLI_COMMAND));
       expect(await commit(x.main, 'src/users.ts')).toMatchObject(named);
+      const stillBlocked = await commit(x.main, 'src/auth.ts');
+      expect(stillBlocked.code).not.toBe(0);
+      expect(stillBlocked.stderr).toMatch(/hub guard: commit blocked[\s\S]*src\/auth\.ts — claimed by maya\/claude-1/);
+      expect(stillBlocked.stderr).not.toMatch(/node lint/);
     } finally {
       x.cleanup();
     }
   });
 });
 
-/** Copy husky's setup into a clone (.husky/_ is not committed, and core.hooksPath is local). */
-function cpHusky(from: string, to: string): void {
-  const stubs = path.join(from, '.husky', '_');
-  mkdirSync(path.join(to, '.husky', '_'), { recursive: true });
-  for (const f of readdirSync(stubs)) {
-    writeFileSync(path.join(to, '.husky', '_', f), readFileSync(path.join(stubs, f)));
-    chmodSync(path.join(to, '.husky', '_', f), 0o755);
-  }
-  writeFileSync(path.join(to, '.husky', 'pre-commit'), readFileSync(path.join(from, '.husky', 'pre-commit')));
-  git(to, 'config', 'core.hooksPath', '.husky/_');
-}
+describe("hub guard in a worktree Claude Code made inside the session's (.claude/worktrees)", () => {
+  let hub: RunningServer;
+  let r: SampleRepo;
+  let sub: string;
+  const quiet = { code: 0, stdout: '', stderr: '' };
+  const edit = (session: string, file: string) =>
+    hubCli(['hook', 'pre-edit'], { cwd: sub, env: testEnv({ CLAUDE_PROJECT_DIR: r.wtA }), input: preToolUseInput(sub, path.join(sub, file), 'Edit', { session, toolUseId: `toolu_${file}` }) });
+  /** `git commit` as Claude's Bash tool runs it: no CLAUDE_PROJECT_DIR, Claude Code's session id. */
+  const commitIn = (cwd: string, file: string, extra: Record<string, string | undefined> = {}) => {
+    writeFileSync(path.join(cwd, file), `export const at = ${Date.now()}${Math.random()};\n`);
+    git(cwd, 'add', file);
+    return run('git', ['commit', '-q', '-m', `change ${file}`], { cwd, env: testEnv(extra) });
+  };
+
+  beforeAll(async () => {
+    hub = await startHub();
+    r = makeRepo();
+    init({ cwd: r.main, project: PROJECT, url: hub.url, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+    git(r.main, 'add', '-A');
+    git(r.main, 'commit', '-q', '-m', 'agenthub setup');
+    for (const [wt, agent] of [[r.wtA, A], [r.wtB, B]]) {
+      git(wt, 'merge', '-q', '--ff-only', 'main');
+      init({ cwd: wt, agent, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+    }
+    sub = path.join(r.wtA, '.claude', 'worktrees', 'sub'); // no .hub.json: the edit hook lends it maya's identity
+    git(r.wtA, 'worktree', 'add', '-q', sub, '-b', 'sub');
+  });
+  afterAll(async () => {
+    await hub.close();
+    r.cleanup();
+  });
+
+  it("acts as the agent whose session edits there, so that agent's own claims don't block its commits", async () => {
+    expect(await edit('sess-maya', 'src/users.ts')).toEqual(quiet);
+    expect((await client(hub.url, A).status()).claims.map((c) => `${c.holder} ${c.scope[0].file}`)).toEqual([`${A} src/users.ts`]);
+    expect(await commitIn(sub, 'src/users.ts', { CLAUDE_CODE_SESSION_ID: 'sess-maya' })).toMatchObject({ code: 0 });
+    // Without the session id too (a terminal in that worktree): the session that last edited there.
+    expect(await commitIn(sub, 'src/users.ts')).toMatchObject({ code: 0 });
+    expect(JSON.parse((await hubCli(['whoami'], { cwd: sub, env: testEnv() })).stdout)).toMatchObject({ agent: A, lentBy: realpathSync(r.wtA) });
+  });
+
+  it("still blocks commits there of files another agent holds, and other agents' commits of the agent's files", async () => {
+    await client(hub.url, B).claim({ files: ['src/auth.ts'], intent: 'sam holds auth' });
+    const theirs = await commitIn(sub, 'src/auth.ts', { CLAUDE_CODE_SESSION_ID: 'sess-maya' });
+    expect(theirs.code).not.toBe(0);
+    expect(theirs.stderr).toMatch(/hub guard: commit blocked\. These staged files are exclusively claimed by other agents:\n {2}src\/auth\.ts — claimed by sam\/claude-1/);
+    git(sub, 'reset', '-q', '--hard');
+    const sams = await commitIn(r.wtB, 'src/users.ts');
+    expect(sams.code).not.toBe(0);
+    expect(sams.stderr).toMatch(/src\/users\.ts — claimed by maya\/claude-1/);
+    git(r.wtB, 'reset', '-q', '--hard');
+  });
+});
 
 describe('hub guard: merge commits', () => {
   let hub: RunningServer;

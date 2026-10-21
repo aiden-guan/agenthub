@@ -1,8 +1,9 @@
 import type { CheckResult } from '@agenthub/hub/protocol';
+import { lendIdentity, lendingSessions } from './checkout.js';
 import { HubClient, classifyFailure } from './client.js';
 import { loadConfig, type HubConfig } from './config.js';
-import { INTENTS_NOTE, inline, minutesLeft } from './format.js';
-import { mergeHeads, stagedPaths } from './git.js';
+import { INTENTS_NOTE, inline, minutesLeft, showName } from './format.js';
+import { mergeHeads, stagedPaths, unclaimableReason } from './git.js';
 import type { HookOutcome } from './hooks.js';
 
 const BYPASS = 'Emergency bypass: git commit --no-verify, or HUB_GUARD=off.';
@@ -32,7 +33,11 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
   } catch (err) {
     return blocked((err as Error).message);
   }
-  if (!cfg.root) return { stdout: '', stderr: '', exitCode: 0 };
+  const root = cfg.root;
+  if (!root) return { stdout: '', stderr: '', exitCode: 0 };
+  // A checkout with no identity of its own (a worktree Claude Code made under .claude/worktrees)
+  // is the session's that edits in it, as for the edit hook: its own claims don't block it.
+  cfg = lendIdentity(cfg, io.env, [io.env.CLAUDE_PROJECT_DIR, ...lendingSessions(root, io.env.CLAUDE_CODE_SESSION_ID)]);
   const notes = [...cfg.warnings];
   if (cfg.projectSource === 'derived') {
     notes.push(
@@ -48,14 +53,22 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
   let files: string[];
   let merging: string[];
   try {
-    merging = mergeHeads(cfg.root, io.env);
+    merging = mergeHeads(root, io.env);
     // Without the merged commits, the changes a merge brings in would all count as this commit's.
     if (io.merge && merging.length === 0) return { stdout: '', stderr: 'hub guard: warning: could not tell which commits this merge brings in; claims not checked\n', exitCode: 0 };
-    files = stagedPaths(cfg.root, merging);
+    files = stagedPaths(root, merging);
   } catch (err) {
     return blocked(`could not list the staged files (${(err as Error).message}); commit blocked. ${bypass}`);
   }
-  if (files.length === 0) return { stdout: '', stderr: '', exitCode: 0 };
+  // A name the hub refuses can't be claimed by anyone, so it can't conflict: check the rest, and say so.
+  const unclaimable = files.filter((f) => unclaimableReason(f) !== null);
+  if (unclaimable.length) {
+    const shown = unclaimable.slice(0, 5).map((f) => `${showName(f)} (${unclaimableReason(f)})`);
+    if (unclaimable.length > 5) shown.push(`${unclaimable.length - 5} more`);
+    notes.push(`not checked, as the hub can't hold a claim on ${unclaimable.length === 1 ? 'it' : 'them'} and no agent can claim ${unclaimable.length === 1 ? 'it' : 'them'}: ${shown.join(', ')}`);
+    files = files.filter((f) => unclaimableReason(f) === null);
+  }
+  if (files.length === 0) return withNotes({ stdout: '', stderr: '', exitCode: 0 });
 
   let res: CheckResult;
   try {
@@ -73,7 +86,7 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
   const lines = [`hub guard: commit blocked. ${merging.length ? 'This merge changes files' : 'These staged files are'} exclusively claimed by ${holders}:`];
   for (const c of res.conflicts) {
     for (const f of c.files) {
-      lines.push(`  ${f} — claimed by ${c.holder} (${c.claim_id}) to "${inline(c.intent)}" (expires in ${minutesLeft(c.expires_at, res.now)} min)`);
+      lines.push(`  ${showName(f)} — claimed by ${c.holder} (${c.claim_id}) to "${inline(c.intent)}" (expires in ${minutesLeft(c.expires_at, res.now)} min)`);
     }
   }
   lines.push(

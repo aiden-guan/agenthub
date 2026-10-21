@@ -76,6 +76,20 @@ export function toRepoPath(file: string, root: string, cwd: string): string | nu
 }
 
 /**
+ * Why the hub refuses `key` (an NFC repo path) as a claim key, or null if it
+ * takes it: the same rules the hub applies (shared wire contract item 1), so a
+ * file named that way can never be claimed, by anyone, and never conflicts.
+ */
+export function unclaimableReason(key: string): string | null {
+  const bad = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\p{Cs}]/u.exec(key);
+  if (bad) return `it contains U+${bad[0].codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}, a control, line-separator or bidi character`;
+  if (key.length > 4096) return 'it is longer than 4096 characters';
+  if (key.startsWith('/') || /^[A-Za-z]:[\\/]/.test(key)) return 'it starts like an absolute path (a drive root such as C:/)';
+  if (key.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return 'it has a ".", ".." or empty segment';
+  return null;
+}
+
+/**
  * Whether git ignores this untracked file (`.env`, `node_modules/…`), asked of
  * the repository that holds it and of each one around it up to `root`: a
  * submodule's .gitignore is its own (git in the worktree refuses to look
@@ -132,17 +146,22 @@ function checkIgnore(root: string, repoPath: string): boolean {
  * and its `commondir`) without starting git: the edit hook runs before every edit.
  */
 export function gitCommonDir(root: string): string | null {
+  const gitDir = ownGitDir(root);
+  if (!gitDir) return null;
+  try {
+    return path.resolve(gitDir, readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim());
+  } catch {
+    return gitDir; // the main checkout, or a submodule: its git dir is its own
+  }
+}
+
+/** The git directory of this checkout alone (a linked worktree's `.git/worktrees/<name>`), read as gitCommonDir reads it. */
+export function ownGitDir(root: string): string | null {
   const dotGit = path.join(root, '.git');
   try {
     if (statSync(dotGit).isDirectory()) return dotGit;
     const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, 'utf8'));
-    if (!m) return null;
-    const gitDir = path.resolve(root, m[1].trim());
-    try {
-      return path.resolve(gitDir, readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim());
-    } catch {
-      return gitDir; // a submodule: its git dir is its own
-    }
+    return m ? path.resolve(root, m[1].trim()) : null;
   } catch {
     return null;
   }

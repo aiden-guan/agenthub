@@ -114,6 +114,14 @@ export class HubClient {
         signal,
       });
     } catch (err) {
+      // fetch refuses some ports before it connects (the Fetch standard's "bad ports"), so a hub
+      // running there is never reached. That's this machine's setup, not an outage: it must not fail open.
+      if (((err as Error).cause as Error | undefined)?.message === 'bad port') {
+        throw new Error(
+          `hub URL ${this.cfg.url} uses port ${new URL(this.cfg.url).port || '80'}, which Node's fetch refuses to connect to (as browsers do); ` +
+            'run the hub on another port (hub-server --port) and point HUB_URL or the url in agenthub.json at it',
+        );
+      }
       throw unreachable(err);
     }
     let text: string;
