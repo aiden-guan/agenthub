@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -56,7 +56,10 @@ describe('config', () => {
     const root = repo('other-hub', { 'agenthub.json': { project: 'oss/proj', url: 'http://oss-hub:7077' }, '.hub.json': { agent: 'maya/claude-1' } });
     const cfg = loadConfig({ cwd: root, env: { HUB_CONFIG: global } });
     expect(cfg).toMatchObject({ url: 'http://oss-hub:7077', token: null });
-    expect(cfg.warnings).toEqual([expect.stringMatching(/^the hub token in .*global-company\.json is for https:\/\/hub\.company, so it is not sent to http:\/\/oss-hub:7077/)]);
+    expect(cfg.warnings).toEqual([cfg.tokenWithheld]);
+    expect(cfg.tokenWithheld).toMatch(
+      /^the hub token in .*global-company\.json is not sent to http:\/\/oss-hub:7077: it is for https:\/\/hub\.company\. If http:\/\/oss-hub:7077 is your team's hub, put its token in this worktree's \.hub\.json\.$/,
+    );
     expect(loadConfig({ cwd: root, env: { HUB_CONFIG: global, HUB_URL: 'http://oss-hub:7077' } })).toMatchObject({ token: null });
     expect(loadConfig({ cwd: root, env: { HUB_CONFIG: global, HUB_URL: 'http://oss-hub:7077', HUB_TOKEN: 'OSS' } })).toMatchObject({ token: 'OSS', warnings: [] });
     // The same hub, however it is spelled.
@@ -73,16 +76,18 @@ describe('config', () => {
     const team = (url: string) => writeFileSync(path.join(root, 'agenthub.json'), JSON.stringify({ project: 'co/app', url }));
     team('https://hub.company');
     expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ url: 'https://hub.company', token: 'LOCAL-SECRET', warnings: [] });
-    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'ENV-SECRET' } })).toMatchObject({ token: 'ENV-SECRET', warnings: [] });
+    // HUB_TOKEN without HUB_URL is not for a hub only the repository names: this worktree's own token goes instead.
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'ENV-SECRET' } })).toMatchObject({ token: 'LOCAL-SECRET', warnings: [] });
 
     team('http://attacker:8080'); // a checked-out branch points the committed file at another hub
-    for (const [env, from] of [[noGlobal, /\.hub\.json/], [{ ...noGlobal, HUB_TOKEN: 'ENV-SECRET' }, /HUB_TOKEN/]] as const) {
-      const cfg = loadConfig({ cwd: root, env });
-      expect(cfg).toMatchObject({ url: 'http://attacker:8080', token: null });
-      expect(cfg.warnings).toHaveLength(1);
-      expect(cfg.warnings[0]).toMatch(from);
-      expect(cfg.warnings[0]).toMatch(/is not sent to http:\/\/attacker:8080: only the committed .*agenthub\.json names that hub.*`hub init --url http:\/\/attacker:8080`/);
-    }
+    const cfg = loadConfig({ cwd: root, env: noGlobal });
+    expect(cfg).toMatchObject({ url: 'http://attacker:8080', token: null });
+    expect(cfg.warnings).toEqual([cfg.tokenWithheld]);
+    expect(cfg.tokenWithheld).toBe(
+      "the hub token in this worktree's .hub.json is not sent to http://attacker:8080: only the committed agenthub.json names that hub, " +
+        "but the repository's git config (agenthub.url) names https://hub.company. If http://attacker:8080 is your team's hub now, run `hub init --url http://attacker:8080` here.",
+    );
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'ENV-SECRET' } })).toMatchObject({ token: null, tokenWithheld: expect.stringMatching(/^HUB_TOKEN is not sent/) });
     // Chosen on this machine: the token goes there.
     expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_URL: 'http://attacker:8080' } })).toMatchObject({ token: 'LOCAL-SECRET', warnings: [] });
     git(root, 'config', 'agenthub.url', 'http://attacker:8080'); // hub init --url http://attacker:8080
@@ -108,15 +113,106 @@ describe('config', () => {
       expect(cfg).toMatchObject({ url: 'http://attacker:8080', agent: null, token: null });
       expect(cfg.warnings).toEqual([
         expect.stringMatching(/\.hub\.json is tracked by git, so it is shared like agenthub\.json, not this worktree's own: an agent or token in it is ignored.*git rm --cached \.hub\.json/),
-        expect.stringMatching(/is not sent to http:\/\/attacker:8080: only the committed .*\.hub\.json names that hub/),
+        expect.stringMatching(/is not sent to http:\/\/attacker:8080: .*, and only the \.hub\.json that git tracks names this one\./),
       ]);
     }
     // The hub this machine chose still gets its token; the identity still doesn't come from the file.
     writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'maya/claude-1', url: 'https://hub.company' }));
-    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'ENV-SECRET' } })).toMatchObject({ agent: null, token: 'ENV-SECRET' });
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'ENV-SECRET', HUB_URL: 'https://hub.company' } })).toMatchObject({ agent: null, token: 'ENV-SECRET' });
     // Out of git, it is this worktree's own again.
     git(root, 'rm', '-q', '--cached', '-f', '.hub.json');
     expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ agent: 'maya/claude-1', warnings: [] });
+  });
+
+  it('treats a .hub.json that opens a tracked file of another name (a committed .Hub.json where case does not matter) as tracked', () => {
+    const root = path.join(dir, 'tracked-alias');
+    mkdirSync(root);
+    git(root, 'init', '-q');
+    git(root, 'config', 'agenthub.url', 'https://hub.company');
+    writeFileSync(path.join(root, 'agenthub.json'), JSON.stringify({ project: 'co/app', url: 'https://hub.company' }));
+    const ignoresCase = existsSync(path.join(root, 'AGENTHUB.JSON'));
+    // A branch commits .Hub.json; on macOS or Windows checking it out replaces this worktree's .hub.json, which then
+    // opens it. Where case matters, a hard link stands in for that.
+    writeFileSync(path.join(root, '.Hub.json'), JSON.stringify({ agent: 'maya/claude-1', url: 'http://attacker:8080' }));
+    if (!ignoresCase) linkSync(path.join(root, '.Hub.json'), path.join(root, '.hub.json'));
+    git(root, 'add', '-f', '.Hub.json');
+    expect(git(root, 'ls-files', '--', '.hub.json').trim()).toBe(''); // git itself goes by the exact name
+    const cfg = loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'ENV-SECRET' } });
+    expect(cfg).toMatchObject({ url: 'http://attacker:8080', agent: null, token: null });
+    expect(cfg.warnings).toEqual([expect.stringMatching(/\.hub\.json is tracked by git/), cfg.tokenWithheld]);
+    if (!ignoresCase) {
+      // A .hub.json of this worktree's own beside a tracked .Hub.json is still its own.
+      rmSync(path.join(root, '.hub.json'));
+      writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'sam/claude-1' }));
+      expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ agent: 'sam/claude-1', warnings: [] });
+    }
+  });
+
+  it('sends HUB_TOKEN without HUB_URL, or a global token without a url, only to a hub this machine names, not to one only the repository names (even after hub init recorded it)', () => {
+    const root = path.join(dir, 'oss-clone');
+    mkdirSync(root);
+    git(root, 'init', '-q');
+    git(root, 'config', 'agenthub.url', 'http://oss-hub:7077'); // a plain hub init, copied from the repository's own agenthub.json
+    writeFileSync(path.join(root, 'agenthub.json'), JSON.stringify({ project: 'oss/proj', url: 'http://oss-hub:7077' }));
+    writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'maya/claude-1' }));
+    const fromEnv = loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'COMPANY-SECRET' } });
+    expect(fromEnv).toMatchObject({ url: 'http://oss-hub:7077', token: null });
+    expect(fromEnv.warnings).toEqual([fromEnv.tokenWithheld]);
+    expect(fromEnv.tokenWithheld).toBe(
+      'HUB_TOKEN is not sent to http://oss-hub:7077: set without HUB_URL, it goes only to a hub this machine names, and only the committed agenthub.json names this one. ' +
+        'If it is that hub\'s token, also set HUB_URL=http://oss-hub:7077.',
+    );
+    const urlless = path.join(dir, 'global-token-only.json');
+    writeFileSync(urlless, JSON.stringify({ token: 'COMPANY-SECRET' }));
+    expect(loadConfig({ cwd: root, env: { HUB_CONFIG: urlless } }).tokenWithheld).toBe(
+      `the hub token in ${urlless} is not sent to http://oss-hub:7077: with no "url" beside it, it goes only to a hub this machine names, and only the committed agenthub.json names this one. ` +
+        'If it is that hub\'s token, add "url": "http://oss-hub:7077" beside it.',
+    );
+    rmSync(path.join(root, 'agenthub.json')); // a branch without it: the url hub init recorded
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'COMPANY-SECRET' } })).toMatchObject({
+      url: 'http://oss-hub:7077',
+      token: null,
+      tokenWithheld: expect.stringMatching(/and only the repository's git config \(agenthub\.url\) names this one/),
+    });
+
+    // Named on this machine, or set in this worktree's own .hub.json: sent.
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'OSS', HUB_URL: 'http://oss-hub:7077' } })).toMatchObject({ token: 'OSS', warnings: [] });
+    writeFileSync(urlless, JSON.stringify({ token: 'OSS', url: 'http://oss-hub:7077' }));
+    expect(loadConfig({ cwd: root, env: { HUB_CONFIG: urlless } })).toMatchObject({ token: 'OSS', warnings: [] });
+    writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'maya/claude-1', token: 'OSS-LOCAL' }));
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'COMPANY-SECRET' } })).toMatchObject({ token: 'OSS-LOCAL', warnings: [] });
+    // The default hub is this machine's.
+    git(root, 'config', '--unset', 'agenthub.url');
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'LOCALHOST' } })).toMatchObject({ url: DEFAULT_URL, token: 'LOCALHOST', warnings: [] });
+  });
+
+  it("sends a .hub.json token without a url to the hub origin's default branch names: a setup from before hub init recorded hubs, or a team that moved its hub", () => {
+    const upstream = path.join(dir, 'upstream');
+    mkdirSync(upstream);
+    git(upstream, 'init', '-q', '-b', 'main');
+    writeFileSync(path.join(upstream, 'agenthub.json'), JSON.stringify({ project: 'co/app', url: 'https://hub.company' }));
+    git(upstream, 'add', '-A');
+    git(upstream, 'commit', '-q', '-m', 'agenthub setup');
+    const root = path.join(dir, 'upstream-clone');
+    git(dir, 'clone', '-q', upstream, root);
+    writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'maya/claude-1', token: 'LOCAL-SECRET' }));
+    // Nothing recorded in the git config: an older hub init.
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ url: 'https://hub.company', token: 'LOCAL-SECRET', warnings: [] });
+
+    writeFileSync(path.join(root, 'agenthub.json'), JSON.stringify({ project: 'co/app', url: 'http://attacker:8080' })); // a pull request's branch
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({
+      token: null,
+      tokenWithheld: expect.stringMatching(/only the committed agenthub\.json names that hub, but the agenthub\.json on origin's default branch names https:\/\/hub\.company\./),
+    });
+    git(root, 'config', 'agenthub.url', 'https://hub.company');
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ token: null });
+
+    // The team moves its hub on the default branch; this clone fetches it.
+    writeFileSync(path.join(upstream, 'agenthub.json'), JSON.stringify({ project: 'co/app', url: 'https://hub2.company' }));
+    git(upstream, 'commit', '-q', '-am', 'move the hub');
+    git(root, 'checkout', '-q', '--', 'agenthub.json');
+    git(root, 'pull', '-q', '--ff-only');
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ url: 'https://hub2.company', token: 'LOCAL-SECRET', warnings: [] });
   });
 
   it('rejects malformed agent ids', () => {

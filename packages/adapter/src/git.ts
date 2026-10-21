@@ -93,9 +93,27 @@ export function isIgnored(file: string, root: string): boolean {
   return false;
 }
 
-/** Whether `repoPath` (relative to `root`) is in the index: committed, or staged to be. */
-export function isTracked(root: string, repoPath: string): boolean {
-  return git(root, ['ls-files', '--', repoPath]) === repoPath;
+/**
+ * Whether the file `name` directly in `root` is in the index (committed, or
+ * staged to be), under that name or another one that opens the same file: where
+ * the file system ignores case (macOS, Windows), checking out a branch that
+ * commits `.Hub.json` replaces `.hub.json`, and git's own lookup goes by the exact name.
+ */
+export function isTracked(root: string, name: string): boolean {
+  const tracked = gitRaw(root, ['ls-files', '-z', '--', ':(glob)*'])?.split('\0') ?? [];
+  if (tracked.includes(name)) return true;
+  const stat = (p: string) => {
+    try {
+      return statSync(path.join(root, p), { throwIfNoEntry: false });
+    } catch {
+      return undefined;
+    }
+  };
+  const file = stat(name);
+  return !!file && tracked.some((t) => {
+    const s = t && stat(t);
+    return !!s && s.ino === file.ino && s.dev === file.dev;
+  });
 }
 
 function checkIgnore(root: string, repoPath: string): boolean {

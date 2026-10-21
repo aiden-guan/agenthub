@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { deriveProject, findRepoRoot, isTracked, recordedSettings } from './git.js';
+import { deriveProject, findRepoRoot, git, gitRaw, isTracked, recordedSettings } from './git.js';
 
 export const DEFAULT_URL = 'http://127.0.0.1:7077';
 /** Per-worktree, never committed: agent identity, token, local overrides. */
@@ -43,6 +43,8 @@ export interface HubConfig {
   projectSource: 'env' | 'file' | 'recorded' | 'derived' | 'default';
   /** Settings that work but are probably not what the user meant, for the digest, the guard and `hub whoami`. */
   warnings: string[];
+  /** Why a hub token that is set is not sent to `url` (also in `warnings`): what to say when the hub rejects the credentials. */
+  tokenWithheld?: string;
 }
 
 /**
@@ -94,18 +96,24 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
     );
   }
   const local = root && !committedLocal ? files[2] : null;
-  // The committed file the url comes from, unless something on this machine overrides it.
-  const urlFrom = committedLocal?.url ? sources[2][0] : team?.url ? sources[1][0] : null;
-  const token = tokenFor(
+  // Is `url` named here (the environment, this worktree's own .hub.json, the global file, the default),
+  // or only by the repository: a committed file, or the url `hub init` copied from one?
+  const machineChosen = [env.HUB_URL, local?.url, files[0].url, DEFAULT_URL].some((u) => sameHub(u, url));
+  const namedBy = committedLocal?.url
+    ? `the ${CONFIG_FILE_NAME} that git tracks`
+    : team?.url
+      ? `the committed ${TEAM_CONFIG_FILE_NAME}`
+      : "the repository's git config (agenthub.url)";
+  const { token, withheld } = tokenFor(
     url,
     [
       { token: env.HUB_TOKEN, url: env.HUB_URL, from: 'HUB_TOKEN' },
-      { token: local?.token, url: local?.url, from: root ? sources[2][0] : '' },
-      { token: files[0].token, url: files[0].url, from: sources[0][0] },
+      { token: local?.token, url: local?.url, from: `the hub token in this worktree's ${CONFIG_FILE_NAME}`, local: true },
+      { token: files[0].token, url: files[0].url, from: `the hub token in ${sources[0][0]}` },
     ],
-    root && urlFrom && !env.HUB_URL && !local?.url ? { file: urlFrom, root, globalUrl: files[0].url } : null,
-    warnings,
+    root && !machineChosen ? { root, namedBy } : null,
   );
+  if (withheld) warnings.push(withheld);
   const localFile = root ? sources[2] : null;
   const localAgent = localFile?.[1]?.agent;
   if (env.HUB_AGENT && localAgent && env.HUB_AGENT !== localAgent) {
@@ -132,40 +140,111 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
     configFiles: sources.filter(([, f]) => f !== null).map(([p]) => p),
     projectSource,
     warnings,
+    ...(withheld ? { tokenWithheld: withheld } : {}),
   };
 }
 
 /**
- * The token that may go to `url`, or null with a warning saying why. `tokens`
- * come highest precedence first, each with the url set beside it (in the same
- * file; HUB_URL for HUB_TOKEN), and a token set with a url is for that hub
- * alone. One set on its own is for a hub this machine chose: any url but one
- * that only a committed file (agenthub.json, or a .hub.json in git) names
- * (`teamOnly`), unless it is also the global file's url, the default, or the
- * one `hub init` recorded for the repository. A checked-out branch can change
- * those files; it must not be able to send this machine's token to a host of
- * its choosing.
+ * The token that may go to `url` (`tokens` come highest precedence first), or
+ * why none may. A token set with a url (in the same file; HUB_URL for
+ * HUB_TOKEN) is for that hub alone. One set without is for a hub this machine
+ * names, so not for one only the repository names (`repoNamed`): a checked-out
+ * branch can change that, and HUB_TOKEN and the global file apply in every
+ * repository. Only a token in this worktree's own .hub.json also goes to the
+ * repository's hub (see otherRepositoryHub).
  */
 function tokenFor(
   url: string,
-  tokens: Array<{ token?: string; url?: string; from: string }>,
-  teamOnly: { file: string; root: string; globalUrl?: string } | null,
-  warnings: string[],
-): string | null {
+  tokens: Array<{ token?: string; url?: string; from: string; local?: boolean }>,
+  repoNamed: { root: string; namedBy: string } | null,
+): { token: string | null; withheld?: string } {
   const set = tokens.filter((t) => t.token);
-  if (set.length === 0) return null;
-  const chosenHere = !teamOnly || [teamOnly.globalUrl, DEFAULT_URL].some((u) => sameHub(u, url)) || sameHub(recordedSettings(teamOnly.root).url, url);
-  const usable = set.find((t) => (t.url ? sameHub(t.url, url) : chosenHere));
-  if (usable) return usable.token!;
-  const first = set[0];
-  warnings.push(
-    first.url
-      ? `the hub token in ${first.from} is for ${first.url}, so it is not sent to ${url}. ` +
-          `If ${url} is your team's hub, set its token in .hub.json or HUB_TOKEN${teamOnly ? ` and run \`hub init --url ${url}\` here` : ''}.`
-      : `the hub token from ${first.from} is not sent to ${url}: only the committed ${teamOnly!.file} names that hub, and nothing on this machine chose it. ` +
-          `If it is your team's hub, run \`hub init --url ${url}\` here.`,
-  );
+  if (set.length === 0) return { token: null };
+  let other: ReturnType<typeof otherRepositoryHub> | undefined;
+  const otherHub = () => (other === undefined ? (other = otherRepositoryHub(repoNamed!.root, url)) : other);
+  const usable = set.find((t) => (t.url ? sameHub(t.url, url) : !repoNamed || (t.local && !otherHub())));
+  if (usable) return { token: usable.token! };
+  const t = set[0];
+  let why: string;
+  if (t.url) {
+    const fix = !repoNamed
+      ? 'set HUB_TOKEN to its token'
+      : `${otherHub() ? `run \`hub init --url ${url}\` here and ` : ''}put its token in this worktree's ${CONFIG_FILE_NAME}`;
+    why = `${t.from} is not sent to ${url}: it is for ${t.url}. If ${url} is your team's hub, ${fix}.`;
+  } else if (t.local) {
+    const o = otherHub()!;
+    why =
+      `${t.from} is not sent to ${url}: only ${repoNamed!.namedBy} names that hub, but ${o.where} names ${o.url}. ` +
+      `If ${url} is your team's hub now, run \`hub init --url ${url}\` here.`;
+  } else {
+    const env = t.from === 'HUB_TOKEN';
+    why =
+      `${t.from} is not sent to ${url}: ${env ? 'set without HUB_URL' : 'with no "url" beside it'}, it goes only to a hub this machine names, ` +
+      `and only ${repoNamed!.namedBy} names this one. If it is that hub's token, ${env ? `also set HUB_URL=${url}` : `add "url": "${url}" beside it`}.`;
+  }
+  return { token: null, withheld: why };
+}
+
+/**
+ * Null when `url` is this repository's hub, the one a token in a worktree's own
+ * .hub.json is for; else the hub that is, and what names it. That is the hub
+ * `hub init` recorded for the repository, or the one agenthub.json on origin's
+ * default branch names (a team that moves its hub changes it there). Without
+ * either, `url` is the one `hub init` would record: unless another worktree's
+ * agenthub.json names a different hub.
+ */
+export function otherRepositoryHub(root: string, url: string): { where: string; url: string } | null {
+  const recorded = recordedSettings(root).url;
+  if (sameHub(recorded, url)) return null;
+  const upstream = upstreamTeamConfig(root);
+  if (upstream) {
+    const hub = upstream.url ?? DEFAULT_URL;
+    return sameHub(hub, url) ? null : { where: `the ${TEAM_CONFIG_FILE_NAME} on origin's default branch`, url: hub };
+  }
+  if (recorded) return { where: "the repository's git config (agenthub.url)", url: recorded };
+  for (const { file, config } of siblingTeamConfigs(root)) {
+    const hub = config.url ?? DEFAULT_URL;
+    if (!sameHub(hub, url)) return { where: file, url: hub };
+  }
   return null;
+}
+
+/**
+ * agenthub.json as committed on origin's default branch. A fresh clone has
+ * none of the repository's git config, so this is all that tells `hub init`,
+ * run first on a branch made before the setup commit, what the team uses.
+ */
+export function upstreamTeamConfig(root: string): ConfigFile | null {
+  for (const ref of ['refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master']) {
+    const text = gitRaw(root, ['cat-file', 'blob', `${ref}:${TEAM_CONFIG_FILE_NAME}`]);
+    if (text === null) continue;
+    try {
+      const f = parseConfigFile(text, `${TEAM_CONFIG_FILE_NAME} on ${ref}`);
+      if (f.project) return f;
+    } catch {
+      // unreadable there: keep looking, then derive (and say so)
+    }
+  }
+  return null;
+}
+
+/** The agenthub.json files (with a project) of the repository's other worktrees. */
+export function siblingTeamConfigs(root: string): Array<{ file: string; config: ConfigFile }> {
+  const out = git(root, ['worktree', 'list', '--porcelain']) ?? '';
+  const found: Array<{ file: string; config: ConfigFile }> = [];
+  for (const line of out.split('\n')) {
+    if (!line.startsWith('worktree ')) continue;
+    const dir = line.slice('worktree '.length);
+    if (path.resolve(dir) === path.resolve(root)) continue;
+    const file = path.join(dir, TEAM_CONFIG_FILE_NAME);
+    try {
+      const f = readConfigFile(file);
+      if (f?.project) found.push({ file, config: f });
+    } catch {
+      // unreadable there: that checkout will report it itself
+    }
+  }
+  return found;
 }
 
 /** Whether two hub URLs name the same hub, however they are spelled (case, default port, trailing slash). */

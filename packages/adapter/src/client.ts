@@ -56,11 +56,17 @@ export interface HubFailure {
   message: string;
 }
 
-export function classifyFailure(err: unknown, url: string): HubFailure {
+/**
+ * An auth error with `cfg.tokenWithheld` set starts with that: the token is
+ * set, just not for this hub, so "set the token" would be the wrong advice.
+ */
+export function classifyFailure(err: unknown, cfg: Pick<HubConfig, 'url' | 'tokenWithheld'>): HubFailure {
+  const { url } = cfg;
   if (err instanceof HubUnavailableError) return { kind: 'unreachable', message: err.message };
   if (err instanceof HubApiError) {
     const detail = `HTTP ${err.status} ${err.code}: ${err.message}`;
     if (err.status === 401 || err.status === 403) {
+      if (cfg.tokenWithheld) return { kind: 'auth', message: `${cfg.tokenWithheld} The hub rejected the request without it (${detail})` };
       return { kind: 'auth', message: `hub at ${url} rejected this agent's credentials (${detail}); set HUB_TOKEN (or "token" in .hub.json) to the hub's token` };
     }
     if (err.status >= 400 && err.status < 500) return { kind: 'refused', message: `hub at ${url} refused the request (${detail})` };

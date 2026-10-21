@@ -36,7 +36,10 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
         'If your team uses another project id, run `hub init` in a checkout that has agenthub.json.',
     );
   }
-  const withNotes = (out: HookOutcome): HookOutcome => ({ ...out, stderr: out.stderr + notes.map((n) => `hub guard: warning: ${n}\n`).join('') });
+  const withNotes = (out: HookOutcome, shown?: string): HookOutcome => ({
+    ...out,
+    stderr: out.stderr + notes.filter((n) => n !== shown).map((n) => `hub guard: warning: ${n}\n`).join(''),
+  });
 
   let files: string[];
   try {
@@ -50,8 +53,9 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
   try {
     res = await new HubClient(cfg).check(files);
   } catch (err) {
-    const failure = classifyFailure(err, cfg.url);
-    if (failure.kind !== 'unreachable') return withNotes(blocked(`${failure.message}; commit blocked. ${bypass}`));
+    const failure = classifyFailure(err, cfg);
+    // An auth error's message already says why the token was withheld.
+    if (failure.kind !== 'unreachable') return withNotes(blocked(`${failure.message}; commit blocked. ${bypass}`), failure.kind === 'auth' ? cfg.tokenWithheld : undefined);
     if (cfg.failClosed) return withNotes(blocked(`${failure.message}; commit blocked (HUB_FAIL_CLOSED)`));
     return withNotes({ stdout: '', stderr: `hub guard: ${failure.message}; claims not checked\n`, exitCode: 0 });
   }

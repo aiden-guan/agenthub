@@ -1,6 +1,6 @@
 import path from 'node:path';
 import type { ClaimResult } from '@agenthub/hub/protocol';
-import { HubClient, classifyFailure } from './client.js';
+import { HubClient, classifyFailure, type HubFailure } from './client.js';
 import { hasOwnSettings, loadConfig, type HubConfig } from './config.js';
 import { denyReason, digestText, inline } from './format.js';
 import { currentBranch, findRepoRoot, gitCommonDir, headCommit, isIgnored, realish, toRepoPath } from './git.js';
@@ -42,6 +42,11 @@ function allowWithWarning(msg: string, max = 300): HookOutcome {
 }
 
 const deny = (reason: string): HookOutcome => ({ stdout: denyJson(reason), stderr: '', exitCode: 0 });
+
+/** A hub failure for Claude: why the config withheld the token in full, the hub's own words capped. */
+function failureText(failure: HubFailure, cfg: HubConfig): string {
+  return inline(failure.message, 300 + (failure.kind === 'auth' ? (cfg.tokenWithheld?.length ?? 0) : 0));
+}
 
 function hookClient(cfg: HubConfig): HubClient {
   return new HubClient({ ...cfg, timeoutMs: Math.min(cfg.timeoutMs, HOOK_REQUEST_TIMEOUT_MS) });
@@ -214,10 +219,8 @@ export async function preEditHook(io: HookIO): Promise<HookOutcome> {
     const conflict = res.conflicts[0];
     return deny(denyReason(conflict.files[0] ?? target.files[0], conflict, res.now));
   } catch (err) {
-    const failure = classifyFailure(err, cfg.url);
-    // A token the config withheld from this hub comes back as an auth error: say why.
-    const why = failure.kind === 'auth' ? cfg.warnings.map((w) => ` ${inline(w, 400)}`).join('') : '';
-    if (failure.kind !== 'unreachable') return deny(`Edit blocked: ${inline(failure.message, 300)}.${why} Tell your human; edits stay blocked until the hub accepts the claim.`);
+    const failure = classifyFailure(err, cfg);
+    if (failure.kind !== 'unreachable') return deny(`Edit blocked: ${failureText(failure, cfg)}. Tell your human; edits stay blocked until the hub accepts the claim.`);
     if (cfg.failClosed) {
       return deny(`Edit blocked: ${inline(failure.message, 200)}. This project requires a hub claim before editing (HUB_FAIL_CLOSED).`);
     }
@@ -273,7 +276,7 @@ async function releasePending(store: PendingClaims, entries: StoredClaim[], inpu
       store.remove(e);
     } catch (err) {
       // The hub answered (no such claim, held by someone else): nothing is left to release.
-      if (classifyFailure(err, cfg.url).kind !== 'unreachable') store.remove(e);
+      if (classifyFailure(err, cfg).kind !== 'unreachable') store.remove(e);
       else configs.set(e.root, null);
     }
   }
@@ -354,7 +357,8 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
   } catch (err) {
     return problem(`agenthub: configuration error (${inline((err as Error).message, 200)}). Edits in this checkout are blocked until it is fixed.`);
   }
-  const warning = cfg.warnings.map((w) => `agenthub: ${inline(w, 400)}`).join('\n');
+  const warningOf = (ws: string[]) => ws.map((w) => `agenthub: ${inline(w, 400)}`).join('\n');
+  const warning = warningOf(cfg.warnings);
   const also = warning ? `\n${warning}` : '';
   if (!cfg.agent) {
     return problem(
@@ -373,9 +377,11 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
       exitCode: 0,
     };
   } catch (err) {
-    const failure = classifyFailure(err, cfg.url);
+    const failure = classifyFailure(err, cfg);
     if (failure.kind !== 'unreachable') {
-      return problem(`agenthub: ${inline(failure.message, 300)}. Edits in this checkout are blocked until this is fixed; tell your human.${also}`);
+      // An auth error's message already says why the token was withheld.
+      const rest = warningOf(cfg.warnings.filter((w) => failure.kind !== 'auth' || w !== cfg.tokenWithheld));
+      return problem(`agenthub: ${failureText(failure, cfg)}. Edits in this checkout are blocked until this is fixed; tell your human.${rest ? `\n${rest}` : ''}`);
     }
     const mode = cfg.failClosed ? 'Edits will be blocked until it is back.' : 'Edits are not being coordinated until it is back.';
     return problem(`agenthub: the team hub is unavailable (${inline(failure.message, 200)}). ${mode}${also}`);

@@ -1,7 +1,9 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { HubClient } from '../src/client.js';
 import { loadConfig } from '../src/config.js';
 import { stagedPaths } from '../src/git.js';
 import { PRE_EDIT_MATCHER as EDIT_MATCHER, guardScript, init, splitCommand } from '../src/init.js';
@@ -26,6 +28,8 @@ import {
 
 let srv: RunningServer;
 let repo: SampleRepo;
+/** Whether the temp dir's file system ignores case (macOS, Windows by default). */
+const IGNORES_CASE = existsSync(tmpdir().toUpperCase()) && existsSync(tmpdir().toLowerCase());
 
 beforeAll(async () => {
   srv = await startHub();
@@ -372,14 +376,23 @@ describe('the hub token goes only to a hub this machine set up, whatever a check
     expect(seen.length).toBeGreaterThanOrEqual(4);
     expect(seen.filter((auth) => auth !== null)).toEqual([]);
 
-    const warning = /hub token from .*\.hub\.json is not sent to http:\/\/127\.0\.0\.1:\d+: only the committed .*agenthub\.json names that hub/;
+    const withheld =
+      `the hub token in this worktree's .hub.json is not sent to ${other.url}: only the committed agenthub.json names that hub, ` +
+      `but the repository's git config (agenthub.url) names ${company.url}. If ${other.url} is your team's hub now, run \`hub init --url ${other.url}\` here.`;
+    const warning = new RegExp(withheld.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
     expect(guarded.code).not.toBe(0);
     expect(guarded.stderr).toMatch(warning);
+    expect(guarded.stderr.split(withheld)).toHaveLength(2); // once, as the reason the hub rejected the commit
+    expect(guarded.stderr).not.toContain('set HUB_TOKEN (or');
     const denied = JSON.parse(edit.stdout).hookSpecificOutput;
     expect(denied.permissionDecision).toBe('deny');
-    expect(denied.permissionDecisionReason).toMatch(/^Edit blocked: hub at .* rejected this agent's credentials/);
-    expect(denied.permissionDecisionReason).toMatch(warning);
+    // The reason the token was withheld replaces the generic advice, and its fix is there in full.
+    expect(denied.permissionDecisionReason).toBe(
+      `Edit blocked: ${withheld} The hub rejected the request without it (HTTP 401 unauthorized: missing or wrong bearer token). ` +
+        'Tell your human; edits stay blocked until the hub accepts the claim.',
+    );
     expect(JSON.parse(digest.stdout).systemMessage).toMatch(warning);
+    expect(JSON.parse(digest.stdout).systemMessage.split(withheld)).toHaveLength(2);
     expect(status.code).not.toBe(0);
     expect(status.stderr).toMatch(/missing or wrong bearer token/);
     expect(status.stderr).toMatch(warning);
@@ -410,11 +423,76 @@ describe('the hub token goes only to a hub this machine set up, whatever a check
 
       const tracked = /\.hub\.json is tracked by git, so it is shared like agenthub\.json, not this worktree's own: an agent or token in it is ignored/;
       expect(guarded.code).not.toBe(0);
-      expect(guarded.stderr).toMatch(/rejected this agent's credentials/);
+      expect(guarded.stderr).toMatch(/HUB_TOKEN is not sent to .* The hub rejected the request without it \(HTTP 401 unauthorized: missing or wrong bearer token\); commit blocked/);
       expect(guarded.stderr).toMatch(tracked);
       expect(JSON.parse(edit.stdout).systemMessage).toMatch(tracked);
       expect(JSON.parse(digest.stdout).systemMessage).toMatch(/no agent identity[\s\S]*tracked by git/);
-      expect(status.stderr).toMatch(/hub token from HUB_TOKEN is not sent to http:\/\/127\.0\.0\.1:\d+: only the committed .*\.hub\.json names that hub/);
+      expect(status.stderr).toMatch(/HUB_TOKEN is not sent to http:\/\/127\.0\.0\.1:\d+: set without HUB_URL, .* and only the \.hub\.json that git tracks names this one/);
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it.runIf(IGNORES_CASE)('does the same for a .Hub.json a branch commits, which .hub.json opens where case does not matter', async () => {
+    const x = makeRepo();
+    try {
+      init({ cwd: x.wtB, agent: B, project: PROJECT, url: company.url, command: CLI_COMMAND, hooks: false, mcp: false });
+      rmSync(path.join(x.wtA, '.hub.json'), { force: true });
+      writeFileSync(path.join(x.wtA, '.Hub.json'), JSON.stringify({ agent: A, url: other.url }));
+      git(x.wtA, 'add', '-f', '.Hub.json');
+      git(x.wtA, 'commit', '-q', '-m', 'pr: add .Hub.json');
+      git(x.wtB, 'checkout', '-q', '--detach', 'agent-a');
+      expect(JSON.parse(readFileSync(path.join(x.wtB, '.hub.json'), 'utf8'))).toEqual({ agent: A, url: other.url });
+
+      const tokenEnv = env({ HUB_TOKEN: 's3cret' });
+      const who = JSON.parse((await hubCli(['whoami'], { cwd: x.wtB, env: tokenEnv })).stdout);
+      expect(who).toMatchObject({ agent: null, token: null, url: other.url });
+      writeFileSync(path.join(x.wtB, 'src', 'auth.ts'), 'export const login = () => "b";\n');
+      git(x.wtB, 'add', 'src/auth.ts');
+      seen.length = 0;
+      const guarded = await run('git', ['commit', '-q', '-m', 'auth'], { cwd: x.wtB, env: tokenEnv });
+      expect(guarded.code).not.toBe(0);
+      expect(guarded.stderr).toMatch(/\.hub\.json is tracked by git/);
+      expect(seen.length).toBeGreaterThanOrEqual(1);
+      expect(seen.filter((auth) => auth !== null)).toEqual([]);
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it("keeps a setup made before hub init recorded hubs working (the .hub.json token goes to the hub origin's default branch names), and binds HUB_TOKEN to HUB_URL", async () => {
+    const x = makeRepo();
+    const project = 'legacy/app';
+    const legacy = path.join(x.dir, 'legacy');
+    try {
+      writeFileSync(path.join(x.main, 'agenthub.json'), JSON.stringify({ project, url: company.url }));
+      git(x.main, 'add', 'agenthub.json');
+      git(x.main, 'commit', '-q', '-m', 'agenthub setup');
+      git(x.dir, 'clone', '-q', x.main, legacy);
+      init({ cwd: legacy, agent: B, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+      // What an older hub init left: nothing in the repository's git config, the token in .hub.json.
+      git(legacy, 'config', '--unset', 'agenthub.url');
+      git(legacy, 'config', '--unset', 'agenthub.project');
+      writeFileSync(path.join(legacy, '.hub.json'), JSON.stringify({ agent: B, token: 's3cret' }));
+      const edit = (e: NodeJS.ProcessEnv, file = 'users.ts') => hubCli(['hook', 'pre-edit'], { cwd: legacy, env: e, input: preToolUseInput(legacy, path.join(legacy, 'src', file)) });
+      expect(await edit(env())).toMatchObject({ code: 0, stdout: '' });
+      await new HubClient({ url: company.url, project, agent: A, token: 's3cret', timeoutMs: 3000 }).claim({ files: ['src/auth.ts'], intent: 'Migrate login to OAuth2' });
+      writeFileSync(path.join(legacy, 'src', 'auth.ts'), 'export const login = () => "b";\n');
+      git(legacy, 'add', 'src/auth.ts');
+      const guarded = await run('git', ['commit', '-q', '-m', 'auth'], { cwd: legacy, env: env() });
+      expect(guarded.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1/); // checked with the token
+      git(legacy, 'restore', '--staged', 'src/auth.ts');
+
+      // An agent configured through the environment alone: HUB_TOKEN goes to HUB_URL only.
+      writeFileSync(path.join(legacy, '.hub.json'), JSON.stringify({ agent: B }));
+      const denied = JSON.parse((await edit(env({ HUB_TOKEN: 's3cret' }), 'other.ts')).stdout).hookSpecificOutput;
+      expect(denied.permissionDecision).toBe('deny');
+      expect(denied.permissionDecisionReason).toBe(
+        `Edit blocked: HUB_TOKEN is not sent to ${company.url}: set without HUB_URL, it goes only to a hub this machine names, and only the committed agenthub.json names this one. ` +
+          `If it is that hub's token, also set HUB_URL=${company.url}. The hub rejected the request without it (HTTP 401 unauthorized: missing or wrong bearer token). ` +
+          'Tell your human; edits stay blocked until the hub accepts the claim.',
+      );
+      expect(await edit(env({ HUB_TOKEN: 's3cret', HUB_URL: company.url }), 'other.ts')).toMatchObject({ code: 0, stdout: '' });
     } finally {
       x.cleanup();
     }
@@ -453,6 +531,14 @@ describe('the hub token goes only to a hub this machine set up, whatever a check
       git(x.dir, 'clone', '-q', x.main, clone);
       expect(init({ cwd: clone, agent: 'lee/claude-1', ...opts }).join('\n')).not.toMatch(/not recorded/);
       expect(recordedUrl(clone)).toBe(companyUrl);
+      // Recorded or not, HUB_TOKEN goes only to HUB_URL: hub init says so when that leaves this hub without it.
+      const withToken = { ...opts, env: { HUB_CONFIG: '/nonexistent.json', HUB_TOKEN: 'COMPANY-SECRET' } };
+      expect(init({ cwd: clone, ...withToken })).toEqual([
+        'already set up; nothing to change',
+        `note: HUB_TOKEN is not sent to ${companyUrl}: set without HUB_URL, it goes only to a hub this machine names, and only the committed agenthub.json names this one. ` +
+          `If it is that hub's token, also set HUB_URL=${companyUrl}.`,
+      ]);
+      expect(init({ cwd: clone, ...withToken, env: { ...withToken.env, HUB_URL: companyUrl } })).toEqual(['already set up; nothing to change']);
       const prClone = path.join(x.dir, 'lee-pr');
       git(x.dir, 'clone', '-q', '-b', 'pr-7', x.main, prClone);
       expect(init({ cwd: prClone, agent: 'lee/claude-2', ...opts }).join('\n')).toMatch(/but the agenthub\.json on origin's default branch names https:\/\/hub\.company\.invalid/);

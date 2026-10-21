@@ -1,7 +1,17 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { AGENT_ID_RE, CONFIG_FILE_NAME, DEFAULT_URL, TEAM_CONFIG_FILE_NAME, parseConfigFile, readConfigFile, sameHub, type ConfigFile } from './config.js';
-import { deriveProject, git, gitRaw, recordedSettings } from './git.js';
+import {
+  AGENT_ID_RE,
+  CONFIG_FILE_NAME,
+  TEAM_CONFIG_FILE_NAME,
+  loadConfig,
+  otherRepositoryHub,
+  readConfigFile,
+  siblingTeamConfigs,
+  upstreamTeamConfig,
+  type ConfigFile,
+} from './config.js';
+import { deriveProject, git, recordedSettings } from './git.js';
 
 export interface InitOptions {
   cwd: string;
@@ -86,14 +96,14 @@ export function init(opts: InitOptions): string[] {
   // checkout recorded is only replaced on purpose (--project, --url).
   const record: Array<[key: 'project' | 'url', value: string]> = [];
   if (team.project && (!recorded.project || (opts.project && recorded.project !== team.project))) record.push(['project', team.project]);
-  // A recorded url gets this machine's hub token (see loadConfig). A branch can change agenthub.json,
+  // A recorded url gets the token in a worktree's .hub.json (see loadConfig). A branch can change agenthub.json,
   // so without --url one is recorded only if the team's own copy names the same hub.
-  const disputed = team.url && !recorded.url && !opts.url ? otherTeamHub(root, team.url) : null;
+  const disputed = team.url && !recorded.url && !opts.url ? otherRepositoryHub(root, team.url) : null;
   if (team.url && !disputed && (!recorded.url || (opts.url && recorded.url !== team.url))) record.push(['url', team.url]);
   if (disputed) {
     notes.push(
       `note: this checkout's ${TEAM_CONFIG_FILE_NAME} names hub ${team.url}, but ${disputed.where} names ${disputed.url}, so ${team.url} was not recorded as the repository's hub ` +
-        `and this machine's hub token is not sent to it. If it is your team's hub, run \`hub init --url ${team.url}\`.`,
+        `and a hub token in ${CONFIG_FILE_NAME} is not sent to it. If it is your team's hub, run \`hub init --url ${team.url}\`.`,
     );
   }
   const written = record.filter(([key, value]) => git(root, ['config', '--local', `agenthub.${key}`, value]) !== null);
@@ -173,26 +183,17 @@ export function init(opts: InitOptions): string[] {
     installGitHook(hooksDir, 'pre-applypatch', applyPatchGuardScript(command), report);
   }
 
-  return [...(report.length ? report : ['already set up; nothing to change']), ...notes];
-}
-
-/** The agenthub.json files (with a project) of the repository's other worktrees. */
-function siblingTeamConfigs(root: string): Array<{ file: string; config: ConfigFile }> {
-  const out = git(root, ['worktree', 'list', '--porcelain']) ?? '';
-  const found: Array<{ file: string; config: ConfigFile }> = [];
-  for (const line of out.split('\n')) {
-    if (!line.startsWith('worktree ')) continue;
-    const dir = line.slice('worktree '.length);
-    if (path.resolve(dir) === path.resolve(root)) continue;
-    const file = path.join(dir, TEAM_CONFIG_FILE_NAME);
+  // A token in the environment looks as if it went everywhere: say now if it doesn't go to this hub.
+  if ((opts.env ?? process.env).HUB_TOKEN) {
     try {
-      const f = readConfigFile(file);
-      if (f?.project) found.push({ file, config: f });
+      const withheld = loadConfig({ cwd: root, env: opts.env ?? process.env }).tokenWithheld;
+      if (withheld) notes.push(`note: ${withheld}`);
     } catch {
-      // unreadable there: that checkout will report it itself
+      // a config the hooks can't read: they say so themselves
     }
   }
-  return found;
+
+  return [...(report.length ? report : ['already set up; nothing to change']), ...notes];
 }
 
 /** The project (and hub URL) the other worktrees' agenthub.json files agree on; throws if they don't. */
@@ -201,42 +202,6 @@ function siblingTeamConfig(root: string): ConfigFile | null {
   const projects = [...new Set(found.map((f) => f.project))];
   if (projects.length > 1) throw new Error(`the worktrees' ${TEAM_CONFIG_FILE_NAME} files name different projects (${projects.join(', ')}); run hub init --project ID`);
   return found.find((f) => f.url) ?? found[0] ?? null;
-}
-
-/**
- * agenthub.json as committed on origin's default branch. A fresh clone has
- * none of the repository's git config, so this is all that tells `hub init`,
- * run first on a branch made before the setup commit, what the team uses.
- */
-function upstreamTeamConfig(root: string): ConfigFile | null {
-  for (const ref of ['refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master']) {
-    const text = gitRaw(root, ['cat-file', 'blob', `${ref}:${TEAM_CONFIG_FILE_NAME}`]);
-    if (text === null) continue;
-    try {
-      const f = parseConfigFile(text, `${TEAM_CONFIG_FILE_NAME} on ${ref}`);
-      if (f.project) return f;
-    } catch {
-      // unreadable there: keep looking, then derive (and say so)
-    }
-  }
-  return null;
-}
-
-/**
- * Where the team's own agenthub.json names a hub other than `url`: the one on
- * origin's default branch, or, in a repository without one, any of the other
- * worktrees'. Null when they agree, or when there is nothing to compare with.
- */
-function otherTeamHub(root: string, url: string): { where: string; url: string } | null {
-  const upstream = upstreamTeamConfig(root);
-  const copies = upstream
-    ? [{ where: `the ${TEAM_CONFIG_FILE_NAME} on origin's default branch`, config: upstream }]
-    : siblingTeamConfigs(root).map((s) => ({ where: s.file, config: s.config }));
-  for (const { where, config } of copies) {
-    const hub = config.url ?? DEFAULT_URL;
-    if (!sameHub(hub, url)) return { where, url: hub };
-  }
-  return null;
 }
 
 /** Write a guard hook; a hook of the user's already there is kept and chained after it. */
