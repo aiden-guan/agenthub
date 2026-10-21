@@ -1,4 +1,17 @@
-import type { Landing } from './protocol.js';
+import type { LandPolicy, Landing, LanderControl } from './protocol.js';
+
+/** The policy the hub applies until a lander reports trunk's agenthub.json (design §1.2). */
+export const DEFAULT_LAND_POLICY: Readonly<LandPolicy> = Object.freeze({
+  keep_place_retries: 2,
+  sendback_grace_min: 30,
+  approval_timeout_hours: 24,
+  claim_gate: 'fail',
+});
+
+/** A project's lander control before anything was written: not paused, no trunk known, the default policy. */
+export function defaultLanderControl(): LanderControl {
+  return { paused: null, trunk: null, policy: { ...DEFAULT_LAND_POLICY } };
+}
 
 /** The columns a Phase 1 (record-mode) landing row has. */
 export type Phase1LandingRow = Pick<Landing, 'id' | 'project' | 'agent' | 'task_id' | 'branch' | 'commit' | 'summary' | 'status' | 'created_at'>;

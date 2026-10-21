@@ -430,7 +430,7 @@ export class Hub {
 
   /** Expire every lease whose heartbeat stopped, across all projects. Returns the projects touched. */
   sweep(): string[] {
-    const projects = this.store.projectsWithDueClaims(this.clock());
+    const projects = this.store.projectsWithDueWork(this.clock());
     for (const project of projects) this.write(project, () => undefined);
     return projects;
   }
@@ -657,7 +657,7 @@ export class Hub {
         tasks,
         unread: agent ? this.store.countMessagesFor(project, agent, this.store.getInboxCursor(project, agent)) : 0,
         decisions: this.store.listDecisions(project, 10),
-        landings: this.store.listLandings(project, 5),
+        landings: this.store.listLandings(project, { order: 'recent', limit: 5 }),
         queue: [],
         lander: null,
         control: {
