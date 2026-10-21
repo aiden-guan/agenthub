@@ -94,9 +94,9 @@ export class HubClient {
     return h;
   }
 
-  async request<T>(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = this.cfg.timeoutMs): Promise<T> {
+  async request<T>(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = this.cfg.timeoutMs, abort?: AbortSignal): Promise<T> {
     // Built outside the try: a local mistake (a bad timeout) must not read as "hub unreachable".
-    const signal = AbortSignal.timeout(timeoutMs);
+    const signal = abort ? AbortSignal.any([AbortSignal.timeout(timeoutMs), abort]) : AbortSignal.timeout(timeoutMs);
     const unreachable = (err: unknown) => {
       const reason = (err as Error).name === 'TimeoutError' ? `no answer within ${timeoutMs} ms` : ((err as Error).cause as Error)?.message ?? (err as Error).message;
       return new HubUnavailableError(`hub at ${this.cfg.url} is unreachable (${reason})`);
@@ -203,10 +203,10 @@ export class HubClient {
   /**
    * Long-poll: events after `since`, waiting up to `waitMs` for the first one.
    * Newer hubs add `epoch` (their database's id) and `next_since` (the cursor
-   * for the next call, past events this agent can't see).
+   * for the next call, past events this agent can't see). `abort` ends the wait early.
    */
-  events(since: number, waitMs = 0): Promise<{ events: HubEvent[]; seq: number; epoch?: string; next_since?: number }> {
-    return this.request('GET', `/events?since=${since}&wait_ms=${waitMs}`, undefined, waitMs + this.cfg.timeoutMs + 5000);
+  events(since: number, waitMs = 0, abort?: AbortSignal): Promise<{ events: HubEvent[]; seq: number; epoch?: string; next_since?: number }> {
+    return this.request('GET', `/events?since=${since}&wait_ms=${waitMs}`, undefined, waitMs + this.cfg.timeoutMs + 5000, abort);
   }
 
   feedUrl(since?: number): string {

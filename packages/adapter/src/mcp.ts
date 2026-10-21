@@ -218,13 +218,15 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
       const agent = me();
       const files = args.files ? repoFiles(args.files) : [];
       const timeoutS = args.timeout_s ?? 120;
-      const status = await client.status();
+      const deadline = Date.now() + timeoutS * 1000;
+      const waiter = feed ?? new Feed(client);
 
       const blockersOf = (claims: Claim[]) =>
         claims.filter((c) => c.status === 'active' && c.holder !== agent && c.mode === 'exclusive' && c.scope.some((s) => files.includes(s.file)));
       const ready = async (): Promise<string | null> => {
         if (args.claim_id) {
           const c = await client.getClaim(args.claim_id);
+          if (c.holder !== agent) return `${c.id} is ${c.holder}'s claim, not yours; wait on the id of a claim you queued.`;
           if (c.status === 'active') return `${c.id} is granted: you now hold ${claimFiles(c).join(', ')}.`;
           if (c.status !== 'queued') return `${c.id} is ${c.status}${c.end_reason ? ` (${c.end_reason})` : ''}; claim again if you still need it.`;
         }
@@ -235,15 +237,11 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         return null;
       };
 
-      const immediate = await ready();
-      if (immediate) return immediate;
-      if (!files.length && !args.claim_id && status.unread > 0) return `You have ${status.unread} unread message(s); read them with inbox.`;
-
       const relevant = (e: HubEvent): boolean => {
         const d = e.data as Record<string, any>;
         if (e.type === 'message.posted') return d.from !== agent;
         if (e.type === 'task.unblocked') return true;
-        if (args.claim_id && d.claim_id === args.claim_id) return true;
+        if (args.claim_id && d.claim_id === args.claim_id && d.holder === agent) return true;
         if (files.length && (e.type === 'claim.released' || e.type === 'claim.expired')) {
           return d.holder !== agent && Array.isArray(d.files) && d.files.some((f: string) => files.includes(f));
         }
@@ -251,9 +249,25 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         return false;
       };
 
-      const waiter = feed ?? new Feed(client);
-      const events = await waiter.waitFor(status.seq, relevant, timeoutS * 1000);
+      // A hub back on a different database ends the wait: the claims it waited on are gone with the old one.
       const lines: string[] = [];
+      let events: HubEvent[];
+      for (;;) {
+        const restarts = waiter.restarts;
+        const status = await client.status();
+        const immediate = await ready();
+        if (immediate) return [...lines, immediate].join('\n');
+        if (!files.length && !args.claim_id && status.unread > 0) return [...lines, `You have ${status.unread} unread message(s); read them with inbox.`].join('\n');
+        const res = await waiter.waitFor(status.seq, relevant, Math.max(0, deadline - Date.now()), restarts);
+        events = res.events;
+        if (!res.restarted) break;
+        // Its claim ids mean nothing on the new database (another agent's claim may have the same one).
+        if (args.claim_id) {
+          return `The hub came back with a different database while you waited, so your queued claim ${args.claim_id} is gone. Claim again if you still need it.`;
+        }
+        lines.splice(0, 1, 'The hub came back with a different database while you waited; the claims it had are gone.');
+      }
+      const said = lines.length;
       if (events.length) lines.push(`Woke up after: ${events.map(formatEvent).join('; ')}.`);
       const after = await ready();
       if (after) lines.push(after);
@@ -261,7 +275,7 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         const fresh = await client.status();
         lines.push(`Still claimed: ${blockersOf(fresh.claims).map((c) => formatClaim(c, fresh.now, agent)).join('; ')}`);
       }
-      if (!events.length) lines.unshift(`Nothing relevant happened in ${timeoutS}s.`);
+      if (!events.length) lines.splice(said, 0, `Nothing relevant happened in ${timeoutS}s.`);
       if (lines.some((l) => l.includes('"'))) lines.push(UNTRUSTED_NOTE);
       return lines.join('\n');
     }),

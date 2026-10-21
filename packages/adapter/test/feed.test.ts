@@ -298,13 +298,56 @@ describe('feed after the hub comes back with a fresh database', () => {
     expect(woke).toMatch(new RegExp(`Woke up after: sam/claude-1 released ${held.id} \\(src/y\\.ts\\)`));
     expect(woke).not.toContain('gone');
   });
+
+  /** A hub whose history is well past what a fresh one has, with B holding src/y.ts. */
+  async function busyHub() {
+    const srv = await hubAt();
+    const a = await mcpFor(srv.url, A);
+    await until(() => a.feed.connected);
+    const b = client(srv.url, B);
+    for (let i = 0; i < 20; i++) {
+      const c = (await b.claim({ files: [`gen/f${i}.ts`], intent: 'busy' })).claim!;
+      await b.release({ claim_id: c.id });
+    }
+    await b.claim({ files: ['src/y.ts'], intent: 'B holds y' });
+    return { srv, a };
+  }
+
+  it('ends a hub_wait on files when the hub comes back on a fresh database, which has no claims on them', async () => {
+    const { srv, a } = await busyHub();
+    const t0 = Date.now();
+    const waiting = a.call('hub_wait', { files: ['src/y.ts'], timeout_s: 10 });
+    await sleep(300);
+    await srv.close();
+    await hubAt({ port: srv.port });
+    const woke = await waiting;
+    expect(Date.now() - t0).toBeLessThan(6000);
+    expect(woke).toMatch(/^The hub came back with a different database while you waited; the claims it had are gone\.\nsrc\/y\.ts is free of other agents' claims now\./);
+  });
+
+  it("ends a hub_wait on a queued claim when the hub comes back on a fresh database, even where someone else's claim reuses its id", async () => {
+    const { srv, a } = await busyHub();
+    const id = /Queued as (C-\d+)/.exec(await a.call('claim', { files: ['src/y.ts'], intent: 'A needs y' }))![1];
+    const t0 = Date.now();
+    const waiting = a.call('hub_wait', { claim_id: id, timeout_s: 8 });
+    await sleep(300);
+    await srv.close();
+    const srv2 = await hubAt({ port: srv.port });
+    const b = client(srv2.url, B);
+    for (let i = 0; i < Number(id.slice(2)); i++) await b.claim({ files: [`other/b${i}.ts`], intent: "B's own work" });
+    expect((await b.getClaim(id)).holder).toBe(B);
+    const woke = await waiting;
+    expect(Date.now() - t0).toBeLessThan(6000);
+    expect(woke).toMatch(new RegExp(`^The hub came back with a different database while you waited, so your queued claim ${id} is gone\\. Claim again if you still need it\\.`));
+    expect(woke).not.toContain('is granted');
+  });
 });
 
-/** A stand-in hub feed: answers each WebSocket with what `hello` returns for that connection, and GET /events with `events`. */
+/** A stand-in hub feed: answers each WebSocket with what `hello` returns for that connection, and GET /events with `events` (never, for null). */
 async function fakeFeedHub(opts: {
   hello: (n: number, since: string | null) => Record<string, unknown>;
   onOpen?: (ws: WebSocket, n: number) => void;
-  events?: (since: string | null) => Record<string, unknown>;
+  events?: (since: string | null) => Record<string, unknown> | null;
 }) {
   const sinces: Array<string | null> = [];
   const polled: Array<string | null> = [];
@@ -313,7 +356,9 @@ async function fakeFeedHub(opts: {
     req.resume();
     if (url.pathname.endsWith('/events') && opts.events) {
       polled.push(url.searchParams.get('since'));
-      return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(opts.events(url.searchParams.get('since'))));
+      const page = opts.events(url.searchParams.get('since'));
+      if (page) res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(page));
+      return;
     }
     if (url.pathname.endsWith('/heartbeat')) {
       fake.onHeartbeat();
@@ -381,13 +426,13 @@ describe('feed epochs and cursors', () => {
     feed.start();
     cleanups.push(() => feed.stop());
     await until(() => feed.lastSeq === 6);
-    expect(await feed.waitFor(0, () => true, 50)).toHaveLength(1);
+    expect((await feed.waitFor(0, () => true, 50)).events).toHaveLength(1);
 
     fake.dropAll();
     await until(() => fake.sinces.length === 2 && feed.connected);
     expect(fake.sinces[1]).toBe('6');
     expect(feed.lastSeq).toBe(10);
-    expect(await feed.waitFor(0, () => true, 50)).toEqual([]); // db-1's event is gone
+    expect((await feed.waitFor(0, () => true, 50)).events).toEqual([]); // db-1's event is gone
 
     fake.dropAll();
     await until(() => fake.sinces.length === 4 && feed.connected);
@@ -412,16 +457,66 @@ describe('feed epochs and cursors', () => {
     expect(notices).toEqual(['your claim C-9 (src/a.ts) is gone (the hub no longer has it), so other agents can claim those files now. Claim them again before you edit them.']);
   });
 
-  it('long-polls from next_since and starts over when the epoch changes', async () => {
+  it('long-polls from next_since, and a new epoch ends the wait (what it waited on went with the old database)', async () => {
     const pages: Array<Record<string, unknown>> = [
       { events: [], seq: 50, next_since: 40, epoch: 'db-1' }, // nothing visible up to 40
-      { events: [], seq: 3, next_since: 40, epoch: 'db-2' }, // a new database: since=40 means nothing there
+      { events: [], seq: 60, next_since: 40, epoch: 'db-2' }, // a new database: since=40 means nothing there
       { events: [message(4)], seq: 4, next_since: 4, epoch: 'db-2' },
     ];
     const fake = await fakeFeedHub({ hello: () => ({}), events: () => pages.shift() ?? { events: [], seq: 3, epoch: 'db-2' } });
     const feed = new Feed(client(fake.url, A)); // never started: hub_wait's HTTP path
-    const got = await feed.waitFor(0, (e) => e.type === 'message.posted', 5000);
-    expect(got.map((e) => e.seq)).toEqual([4]);
+    expect(await feed.waitFor(0, (e) => e.type === 'message.posted', 5000)).toEqual({ events: [], restarted: true });
+    expect(fake.polled).toEqual(['0', '40']);
+    const got = await feed.waitFor(3, (e) => e.type === 'message.posted', 5000);
+    expect(got).toEqual({ events: [message(4)].map((e) => ({ ...e, at: expect.any(Number) })), restarted: false });
     expect(fake.polled).toEqual(['0', '40', '3']);
+  });
+
+  it('a long-poll answer whose history ends before the cursor ends the wait too (a hub that sends no epoch)', async () => {
+    const fake = await fakeFeedHub({ hello: () => ({}), events: (since) => (Number(since) < 4 ? { events: [message(4)], seq: 4 } : { events: [], seq: 3 }) });
+    const feed = new Feed(client(fake.url, A));
+    expect(await feed.waitFor(40, () => true, 1000)).toEqual({ events: [], restarted: true });
+    expect(fake.polled).toEqual(['40']);
+  });
+
+  it("stops a long-poll that the socket's coming back makes moot", async () => {
+    // GET /events never answers; the socket opens 300 ms in and brings an event.
+    const fake = await fakeFeedHub({
+      hello: () => ({ seq: 0 }),
+      onOpen: (ws) => setTimeout(() => ws.send(JSON.stringify({ type: 'event', event: message(1) })), 50),
+      events: () => null,
+    });
+    const raw = client(fake.url, A);
+    const late = Object.create(raw) as HubClient;
+    let opened = false;
+    late.feedUrl = (since) => (opened ? raw.feedUrl(since) : 'ws://127.0.0.1:9/feed');
+    setTimeout(() => (opened = true), 300);
+    const feed = new Feed(late);
+    feed.start();
+    cleanups.push(() => feed.stop());
+    const t0 = Date.now();
+    const got = await feed.waitFor(0, () => true, 8000);
+    expect(got.events.map((e) => e.seq)).toEqual([1]);
+    expect(Date.now() - t0).toBeLessThan(3000);
+  });
+});
+
+describe('feed heartbeat period that shrinks', () => {
+  it('drops a socket that left a heartbeat unanswered for half the new, shorter period', async () => {
+    const srv = await hubAt({ leaseTtlMs: 8000 }); // heartbeat every 2 s
+    const proxy = await proxyTo(srv.port);
+    const raw = client(proxy.url, A);
+    const feed = new Feed(raw, { info: { client: 'mcp' } });
+    feed.start();
+    cleanups.push(() => feed.stop());
+    await until(() => feed.connected && feed.heartbeatsSent >= 1);
+    proxy.freeze();
+    const sent = feed.heartbeatsSent;
+    await until(() => feed.heartbeatsSent > sent, 4000); // this one goes into the black hole
+    // Answered by now on a live socket; this lease needs a heartbeat every 200 ms.
+    const res = await raw.claim({ files: ['src/fast.ts'], intent: 'fast', ttl_ms: 600 });
+    feed.noteClaims([res.claim!]);
+    await sleep(2000);
+    expect((await raw.getClaim(res.claim!.id)).status).toBe('active');
   });
 });

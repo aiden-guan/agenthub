@@ -14,6 +14,15 @@ export interface FeedOptions {
 /** The hello frame. `epoch` names the hub's database; hubs older than it don't send one. */
 type Hello = Extract<FeedServerFrame, { type: 'hello' }> & { epoch?: string };
 
+export interface WaitResult {
+  events: HubEvent[];
+  /**
+   * The hub's history restarted (a different database), which ended the wait:
+   * the claims of the old database are gone, and `since` counted in it.
+   */
+  restarted: boolean;
+}
+
 const BUFFER_LIMIT = 1000;
 const NOTICE_LIMIT = 50;
 /** However short a claim's interval, heartbeats don't come faster than this. */
@@ -27,7 +36,7 @@ const validMs = (v: unknown): v is number => typeof v === 'number' && Number.isF
  *  - keeps a WebSocket to the project feed open (reconnecting with backoff and
  *    replaying missed events by sequence number), buffering recent events for
  *    hub_wait. When the hub's database changes (a new `epoch`, or the sequence
- *    going back), the old events and claims are forgotten;
+ *    going back), the old events and claims are forgotten and waits end;
  *  - sends a heartbeat every period, over the socket when it's open and over
  *    HTTP otherwise, which renews every claim this agent holds. A socket that
  *    hasn't answered one heartbeat when the next is due is dropped, so a
@@ -38,8 +47,10 @@ const validMs = (v: unknown): v is number => typeof v === 'number' && Number.isF
 export class Feed {
   lastSeq = 0;
   heartbeatsSent = 0;
-  /** The hub database's id from the last hello; null before one arrives or from a hub that doesn't send it. */
+  /** The hub database's id, from the last hello or long-poll answer; null before one or from a hub that doesn't send it. */
   epoch: string | null = null;
+  /** How often the hub's history restarted (a different database) since this feed began. */
+  restarts = 0;
   private ws: WebSocket | null = null;
   private open = false;
   private stopped = true;
@@ -51,8 +62,8 @@ export class Feed {
   private heartbeatDueAt = Infinity;
   private lastBeatAt = 0;
   private beating = false;
-  /** A heartbeat went out over the socket and the hub hasn't answered yet: the socket counts as dead after this time. */
-  private answerBy: number | null = null;
+  /** When the oldest heartbeat the hub hasn't answered went out over the socket. */
+  private askedAt: number | null = null;
   /** The hub renewed fewer claims than this process knows of: heartbeat over HTTP, whose answer lists them. */
   private reconcile = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -64,9 +75,6 @@ export class Feed {
   private held = new Map<string, { files: string[]; interval: number | null }>();
   private readonly reportedLost = new Set<string>();
   private notices: string[] = [];
-  /** Bumped when the hub's history restarts; `resetSeq` is where the new history stood then. */
-  private resets = 0;
-  private resetSeq = 0;
 
   constructor(
     private readonly client: HubClient,
@@ -123,50 +131,55 @@ export class Feed {
   }
 
   /**
-   * Wait for visible events after `since` that match `pred`. Resolves [] on
-   * timeout. Reads the buffer while the socket is open and long-polls over
-   * HTTP while it isn't, switching as the socket comes and goes.
+   * Wait for visible events after `since` that match `pred`; none on timeout.
+   * Reads the buffer while the socket is open and long-polls over HTTP while
+   * it isn't, switching as the socket comes and goes. Ends early when the
+   * hub's history restarts after the count of `restarts` (default: now).
    */
-  async waitFor(since: number, pred: (e: HubEvent) => boolean, timeoutMs: number): Promise<HubEvent[]> {
+  async waitFor(since: number, pred: (e: HubEvent) => boolean, timeoutMs: number, restarts = this.restarts): Promise<WaitResult> {
     const deadline = Date.now() + timeoutMs;
     let cursor = since;
-    // The history `cursor` counts in: if the hub's database changes under the wait, it moves to the new one.
-    let epoch = this.epoch;
-    let resets = this.resets;
+    // The first poll after the socket or the hub went away answers at once, so a hub back on a fresh database shows at once.
+    let probe = true;
     for (;;) {
-      if (this.resets !== resets) {
-        resets = this.resets;
-        if (epoch === null || epoch !== this.epoch) cursor = this.resetSeq;
-        epoch = this.epoch;
-      }
-      if (this.halted) return this.buffer.filter((e) => e.seq > cursor && pred(e));
+      if (this.restarts !== restarts) return { events: [], restarted: true };
+      if (this.halted) return { events: this.buffer.filter((e) => e.seq > cursor && pred(e)), restarted: false };
       const remaining = deadline - Date.now();
       if (this.open) {
         const hits = this.buffer.filter((e) => e.seq > cursor && pred(e));
-        if (hits.length || remaining <= 0) return hits;
+        if (hits.length || remaining <= 0) return { events: hits, restarted: false };
         await this.nap(remaining);
+        probe = true;
         continue;
       }
-      if (remaining <= 0) return [];
+      if (remaining <= 0) return { events: [], restarted: false };
       let page: Awaited<ReturnType<HubClient['events']>>;
+      // The socket opening (or closing, or the feed stopping) makes this poll moot.
+      const moot = new AbortController();
+      const stop = () => moot.abort();
+      this.waiters.add(stop);
       try {
-        page = await this.client.events(cursor, Math.min(remaining, 60_000));
+        page = await this.client.events(cursor, probe ? 0 : Math.min(remaining, 60_000), moot.signal);
       } catch (err) {
+        if (moot.signal.aborted) continue;
         if (classifyFailure(err, this.client.cfg).kind !== 'unreachable') throw err;
         await this.nap(Math.min(remaining, 1000)); // down for now: ask again, or use the socket once it's back
+        probe = true;
+        continue;
+      } finally {
+        this.waiters.delete(stop);
+      }
+      probe = false;
+      if (this.restarts !== restarts) continue; // the socket's hello saw it first
+      // A different database: a new epoch or, without two epochs to compare, a history that ends before `cursor` (it never goes back).
+      const otherDatabase = page.epoch !== undefined && this.epoch !== null ? page.epoch !== this.epoch : page.seq < cursor;
+      if (page.epoch !== undefined) this.epoch = page.epoch;
+      if (otherDatabase) {
+        this.resetHistory(page.seq);
         continue;
       }
-      if (page.epoch !== undefined) {
-        const changed = epoch !== null && page.epoch !== epoch;
-        epoch = page.epoch;
-        if (changed) {
-          // A new database: `cursor` means nothing there. Count from where it stands now.
-          cursor = page.seq;
-          continue;
-        }
-      }
       const hits = page.events.filter(pred);
-      if (hits.length) return hits;
+      if (hits.length) return { events: hits, restarted: false };
       cursor = page.next_since ?? page.events[page.events.length - 1]?.seq ?? cursor;
     }
   }
@@ -210,12 +223,12 @@ export class Feed {
         this.track(frame.event);
         this.wake();
       } else if (frame.type === 'heartbeat.ack') {
-        this.answerBy = null;
+        this.askedAt = null;
         if (validMs(frame.next_heartbeat_ms)) this.ackMs = frame.next_heartbeat_ms;
         if (typeof frame.renewed === 'number' && frame.renewed < this.held.size) this.reconcile = true;
         this.tighten();
       } else if (frame.type === 'error') {
-        this.answerBy = null; // the hub read the heartbeat, it just refused it
+        this.askedAt = null; // the hub read the heartbeat, it just refused it
         this.opts.log?.(`hub feed error: ${frame.code}: ${frame.message}`);
       }
     });
@@ -224,8 +237,8 @@ export class Feed {
       const wasOpen = this.open;
       this.ws = null;
       this.open = false;
-      this.answerBy = null;
-      this.wake();
+      this.askedAt = null;
+      if (wasOpen) this.wake(); // waits switch to HTTP (one that never opened changes nothing for them)
       if (this.stopped) return;
       if (wasOpen) {
         this.opts.log?.('hub feed connection lost; heartbeats continue over HTTP, reconnecting');
@@ -246,13 +259,10 @@ export class Feed {
     const newDatabase = (hello.epoch !== undefined && this.epoch !== null && hello.epoch !== this.epoch) || hello.seq < this.lastSeq;
     if (hello.epoch !== undefined) this.epoch = hello.epoch;
     this.backoffMs = 500;
-    if (newDatabase) {
-      this.resetHistory(hello.seq);
-      // A hub that kept this socket at our old, larger cursor would skip its events up to there.
-      if (since !== undefined && since > hello.seq) return this.dropSocket(0);
-    } else if (this.lastSeq === 0) {
-      this.lastSeq = hello.seq;
-    }
+    if (newDatabase) this.resetHistory(hello.seq);
+    else if (this.lastSeq === 0) this.lastSeq = hello.seq;
+    // A socket opened at a cursor from the old database, past where this one stands, would skip its events up to there.
+    if (since !== undefined && since > hello.seq) return this.dropSocket(0);
     this.open = true;
     if (this.reportedDown) this.opts.log?.('hub feed reconnected');
     this.reportedDown = false;
@@ -265,8 +275,7 @@ export class Feed {
     this.opts.log?.(`hub event history restarted (a different database); following it from seq ${seq}`);
     this.buffer = [];
     this.lastSeq = seq;
-    this.resets++;
-    this.resetSeq = seq;
+    this.restarts++;
     this.ackMs = null;
     if (this.held.size > 0) {
       const gone = [...this.held].map(([id, c]) => `${id} (${c.files.join(', ')})`).join(', ');
@@ -281,7 +290,7 @@ export class Feed {
     const ws = this.ws;
     this.ws = null;
     this.open = false;
-    this.answerBy = null;
+    this.askedAt = null;
     ws?.terminate();
     this.wake();
     this.reconnectLater(delayMs);
@@ -384,15 +393,16 @@ export class Feed {
     if (this.stopped) return;
     this.lastBeatAt = Date.now();
     try {
-      if (this.ws && this.open && this.answerBy !== null && Date.now() >= this.answerBy) {
-        // The last heartbeat is still unanswered when the next is due: the path is dead even if TCP hasn't noticed.
+      if (this.ws && this.open && this.askedAt !== null && Date.now() - this.askedAt >= this.periodMs / 2) {
+        // A heartbeat is still unanswered when the next is due: the path is dead even if TCP hasn't noticed.
         this.opts.log?.('hub feed stopped answering heartbeats; reconnecting, heartbeats continue over HTTP');
         this.reportedDown = true;
         this.dropSocket();
       }
       if (this.ws && this.open && !this.reconcile) {
-        // Half a period, so the next regular beat always finds an unanswered one overdue (and one brought forward doesn't).
-        this.answerBy ??= Date.now() + this.periodMs / 2;
+        // Overdue after half the period as it is then (it may have shrunk since), so the next regular beat
+        // always finds an unanswered one overdue and one brought forward right after doesn't.
+        this.askedAt ??= Date.now();
         this.ws.send(JSON.stringify({ type: 'heartbeat', ...this.opts.info }));
       } else {
         this.reconcile = false;

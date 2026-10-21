@@ -88,6 +88,16 @@ describe('hub mcp', () => {
     expect(res.text).toContain('src/users.ts is free of other agents\' claims now.');
   });
 
+  it("hub_wait on another agent's claim id says so instead of reporting it as granted to you", async () => {
+    const a = await connect(A, repo.wtA);
+    const b = await connect(B, repo.wtB);
+    const id = /^Granted (C-\d+)/.exec((await a.call('claim', { files: ['src/theirs.ts'], intent: 'mine' })).text)![1];
+    const res = await b.call('hub_wait', { claim_id: id, timeout_s: 1 });
+    expect(res.text).not.toContain('is granted');
+    expect(res.text).toBe(`${id} is maya/claude-1's claim, not yours; wait on the id of a claim you queued.`);
+    await a.call('release', { all: true });
+  });
+
   it("labels other agents' messages as untrusted and keeps them from escaping the label", async () => {
     const a = await connect(A, repo.wtA);
     const b = await connect(B, repo.wtB);
