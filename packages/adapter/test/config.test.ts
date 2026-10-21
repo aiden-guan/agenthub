@@ -29,7 +29,8 @@ describe('config', () => {
       '.hub.json': { agent: 'maya/claude-1' },
     });
     const cfg = loadConfig({ cwd: path.join(root, 'src'), env: { HUB_CONFIG: global } });
-    expect(cfg).toMatchObject({ project: 'team/app', url: 'http://team:2', agent: 'maya/claude-1', token: 'global-token', root });
+    // The global token is for http://global:1, not for the hub the committed file names.
+    expect(cfg).toMatchObject({ project: 'team/app', url: 'http://team:2', agent: 'maya/claude-1', token: null, root });
     expect(cfg.configFiles).toEqual([global, path.join(root, 'agenthub.json'), path.join(root, '.hub.json')]);
 
     const env = loadConfig({ cwd: root, env: { HUB_CONFIG: global, HUB_AGENT: 'sam/codex-1', HUB_URL: 'http://env:3/', HUB_PROJECT: 'p' } });
@@ -39,6 +40,56 @@ describe('config', () => {
   it('ignores an agent id that only the committed file provides', () => {
     const root = repo('team-only', { 'agenthub.json': { project: 'x', agent: 'maya/claude-1' } });
     expect(loadConfig({ cwd: root, env: noGlobal }).agent).toBeNull();
+  });
+
+  it('takes nothing from a "__proto__" key in a config file (the committed one cannot smuggle in an identity or token that way)', () => {
+    const root = repo('proto', {});
+    writeFileSync(path.join(root, 'agenthub.json'), '{"project":"demo","__proto__":{"agent":"maya/claude-1","token":"committed-token","url":"http://evil:1"}}');
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ project: 'demo', agent: null, token: null, url: DEFAULT_URL });
+    writeFileSync(path.join(root, '.hub.json'), '{"__proto__":{"failClosed":"yes"},"agent":"sam/claude-1"}');
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ agent: 'sam/claude-1', token: null, failClosed: false });
+  });
+
+  it('sends a token set together with a url (in one file, or HUB_TOKEN with HUB_URL) only to that hub', () => {
+    const global = path.join(dir, 'global-company.json');
+    writeFileSync(global, JSON.stringify({ url: 'https://hub.company', token: 'COMPANY-SECRET' }));
+    const root = repo('other-hub', { 'agenthub.json': { project: 'oss/proj', url: 'http://oss-hub:7077' }, '.hub.json': { agent: 'maya/claude-1' } });
+    const cfg = loadConfig({ cwd: root, env: { HUB_CONFIG: global } });
+    expect(cfg).toMatchObject({ url: 'http://oss-hub:7077', token: null });
+    expect(cfg.warnings).toEqual([expect.stringMatching(/^the hub token in .*global-company\.json is for https:\/\/hub\.company, so it is not sent to http:\/\/oss-hub:7077/)]);
+    expect(loadConfig({ cwd: root, env: { HUB_CONFIG: global, HUB_URL: 'http://oss-hub:7077' } })).toMatchObject({ token: null });
+    expect(loadConfig({ cwd: root, env: { HUB_CONFIG: global, HUB_URL: 'http://oss-hub:7077', HUB_TOKEN: 'OSS' } })).toMatchObject({ token: 'OSS', warnings: [] });
+    // The same hub, however it is spelled.
+    writeFileSync(path.join(root, 'agenthub.json'), JSON.stringify({ project: 'oss/proj', url: 'https://Hub.Company:443/' }));
+    expect(loadConfig({ cwd: root, env: { HUB_CONFIG: global } })).toMatchObject({ token: 'COMPANY-SECRET', warnings: [] });
+  });
+
+  it('sends a token set without a url only to a hub this machine chose, not to one that only a changed agenthub.json names', () => {
+    const root = path.join(dir, 'pr-branch');
+    mkdirSync(root);
+    git(root, 'init', '-q');
+    git(root, 'config', 'agenthub.url', 'https://hub.company'); // recorded by hub init
+    writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'maya/claude-1', token: 'LOCAL-SECRET' }));
+    const team = (url: string) => writeFileSync(path.join(root, 'agenthub.json'), JSON.stringify({ project: 'co/app', url }));
+    team('https://hub.company');
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ url: 'https://hub.company', token: 'LOCAL-SECRET', warnings: [] });
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'ENV-SECRET' } })).toMatchObject({ token: 'ENV-SECRET', warnings: [] });
+
+    team('http://attacker:8080'); // a checked-out branch points the committed file at another hub
+    for (const [env, from] of [[noGlobal, /\.hub\.json/], [{ ...noGlobal, HUB_TOKEN: 'ENV-SECRET' }, /HUB_TOKEN/]] as const) {
+      const cfg = loadConfig({ cwd: root, env });
+      expect(cfg).toMatchObject({ url: 'http://attacker:8080', token: null });
+      expect(cfg.warnings).toHaveLength(1);
+      expect(cfg.warnings[0]).toMatch(from);
+      expect(cfg.warnings[0]).toMatch(/is not sent to http:\/\/attacker:8080: only the committed .*agenthub\.json names that hub.*`hub init --url http:\/\/attacker:8080`/);
+    }
+    // Chosen on this machine: the token goes there.
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_URL: 'http://attacker:8080' } })).toMatchObject({ token: 'LOCAL-SECRET', warnings: [] });
+    git(root, 'config', 'agenthub.url', 'http://attacker:8080'); // hub init --url http://attacker:8080
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ token: 'LOCAL-SECRET', warnings: [] });
+    // No agenthub.json url at all: the default hub, or the one recorded for the repository.
+    rmSync(path.join(root, 'agenthub.json'));
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ url: 'http://attacker:8080', token: 'LOCAL-SECRET', warnings: [] });
   });
 
   it('rejects malformed agent ids', () => {

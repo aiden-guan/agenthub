@@ -1,7 +1,7 @@
 import type { CheckResult } from '@agenthub/hub/protocol';
 import { HubClient, classifyFailure } from './client.js';
 import { loadConfig, type HubConfig } from './config.js';
-import { inline, minutesLeft } from './format.js';
+import { INTENTS_NOTE, inline, minutesLeft } from './format.js';
 import { stagedPaths } from './git.js';
 import type { HookOutcome } from './hooks.js';
 
@@ -64,6 +64,7 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
     }
   }
   lines.push(
+    INTENTS_NOTE,
     io.sequencer
       ? 'Undo the operation (git reset --merge, or git rebase --abort / git am --abort if one is in progress), coordinate with the holder (hub_post), or wait for the claim to be released (hub_wait).'
       : 'Unstage them (git restore --staged <file>), coordinate with the holder (hub_post), or wait for the claim to be released (hub_wait).',

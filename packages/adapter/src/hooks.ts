@@ -213,7 +213,9 @@ export async function preEditHook(io: HookIO): Promise<HookOutcome> {
     return deny(denyReason(conflict.files[0] ?? target.files[0], conflict, res.now));
   } catch (err) {
     const failure = classifyFailure(err, cfg.url);
-    if (failure.kind !== 'unreachable') return deny(`Edit blocked: ${inline(failure.message, 300)}. Tell your human; edits stay blocked until the hub accepts the claim.`);
+    // A token the config withheld from this hub comes back as an auth error: say why.
+    const why = failure.kind === 'auth' ? cfg.warnings.map((w) => ` ${inline(w, 400)}`).join('') : '';
+    if (failure.kind !== 'unreachable') return deny(`Edit blocked: ${inline(failure.message, 300)}.${why} Tell your human; edits stay blocked until the hub accepts the claim.`);
     if (cfg.failClosed) {
       return deny(`Edit blocked: ${inline(failure.message, 200)}. This project requires a hub claim before editing (HUB_FAIL_CLOSED).`);
     }
@@ -326,8 +328,8 @@ export async function settleHook(io: HookIO): Promise<HookOutcome> {
  * `hub hook digest` — SessionStart hook. Marks the agent present and returns
  * a short team summary as `additionalContext`: active claims by others,
  * recent decisions, open tasks and the unread count (never message bodies).
- * Configuration warnings (HUB_AGENT overriding this checkout's identity) go to
- * the user as well.
+ * Configuration warnings (HUB_AGENT overriding this checkout's identity, a
+ * token withheld from the hub) go to the user as well, also when the hub fails.
  */
 export async function digestHook(io: HookIO): Promise<HookOutcome> {
   const input = parseInput(io.stdin) ?? {};
@@ -355,12 +357,13 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
     );
   }
   const client = hookClient(cfg);
+  const warning = cfg.warnings.map((w) => `agenthub: ${inline(w, 400)}`).join('\n');
+  const also = warning ? `\n${warning}` : '';
   try {
     await client.heartbeat({ client: 'claude-code', branch: cfg.root ? (currentBranch(cfg.root) ?? undefined) : undefined, worktree: cfg.root ?? undefined });
     const status = await client.status();
     const text = digestText(status, cfg.agent, cfg.url);
-    if (cfg.warnings.length === 0) return context(text);
-    const warning = cfg.warnings.map((w) => `agenthub: ${inline(w, 400)}`).join('\n');
+    if (!warning) return context(text);
     return {
       stdout: JSON.stringify({ systemMessage: warning, hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `${warning}\n\n${text}` } }),
       stderr: '',
@@ -369,9 +372,9 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
   } catch (err) {
     const failure = classifyFailure(err, cfg.url);
     if (failure.kind !== 'unreachable') {
-      return problem(`agenthub: ${inline(failure.message, 300)}. Edits in this checkout are blocked until this is fixed; tell your human.`);
+      return problem(`agenthub: ${inline(failure.message, 300)}. Edits in this checkout are blocked until this is fixed; tell your human.${also}`);
     }
     const mode = cfg.failClosed ? 'Edits will be blocked until it is back.' : 'Edits are not being coordinated until it is back.';
-    return problem(`agenthub: the team hub is unavailable (${inline(failure.message, 200)}). ${mode}`);
+    return problem(`agenthub: the team hub is unavailable (${inline(failure.message, 200)}). ${mode}${also}`);
   }
 }

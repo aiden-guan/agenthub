@@ -52,7 +52,8 @@ export interface HubConfig {
  * `hub init` recorded in the repository's git config), then the local
  * `<worktree>/.hub.json`, then environment variables HUB_URL, HUB_AGENT,
  * HUB_PROJECT, HUB_TOKEN, HUB_FAIL_CLOSED, HUB_TIMEOUT_MS. A token in the
- * committed file is ignored. Throws on a value it can't read exactly (a
+ * committed file is ignored, and a token from elsewhere goes only to the hub it
+ * was set up for (see tokenFor). Throws on a value it can't read exactly (a
  * malformed file, a wrong type, an unrecognised HUB_FAIL_CLOSED, an
  * out-of-range HUB_TIMEOUT_MS): the hooks and guard block on that instead of
  * running with a setting nobody asked for.
@@ -83,6 +84,17 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
   const url = (env.HUB_URL || file.url || DEFAULT_URL).replace(/\/+$/, '');
   if (!/^https?:\/\/[^/]/.test(url) || !URL.canParse(url)) throw new Error(`hub URL ${JSON.stringify(url)} is invalid; use http://host:port`);
   const warnings: string[] = [];
+  const local = root ? files[2] : null;
+  const token = tokenFor(
+    url,
+    [
+      { token: env.HUB_TOKEN, url: env.HUB_URL, from: 'HUB_TOKEN' },
+      { token: local?.token, url: local?.url, from: root ? sources[2][0] : '' },
+      { token: files[0].token, url: files[0].url, from: sources[0][0] },
+    ],
+    root && team?.url && !env.HUB_URL && !local?.url ? { file: sources[1][0], root, globalUrl: files[0].url } : null,
+    warnings,
+  );
   const localFile = root ? sources[2] : null;
   const localAgent = localFile?.[1]?.agent;
   if (env.HUB_AGENT && localAgent && env.HUB_AGENT !== localAgent) {
@@ -102,7 +114,7 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
     url,
     agent,
     project: chosen || derived || 'default',
-    token: env.HUB_TOKEN || file.token || null,
+    token,
     failClosed: parseBool('HUB_FAIL_CLOSED', env.HUB_FAIL_CLOSED) ?? file.failClosed ?? false,
     timeoutMs: parseTimeout(env.HUB_TIMEOUT_MS),
     root,
@@ -110,6 +122,44 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
     projectSource,
     warnings,
   };
+}
+
+/**
+ * The token that may go to `url`, or null with a warning saying why. `tokens`
+ * come highest precedence first, each with the url set beside it (in the same
+ * file; HUB_URL for HUB_TOKEN), and a token set with a url is for that hub
+ * alone. One set on its own is for a hub this machine chose: any url but one
+ * that only the committed agenthub.json names (`teamOnly`), unless it is also
+ * the global file's url, the default, or the one `hub init` recorded for the
+ * repository. A checked-out branch can change agenthub.json; it must not be
+ * able to send this machine's token to a host of its choosing.
+ */
+function tokenFor(
+  url: string,
+  tokens: Array<{ token?: string; url?: string; from: string }>,
+  teamOnly: { file: string; root: string; globalUrl?: string } | null,
+  warnings: string[],
+): string | null {
+  const set = tokens.filter((t) => t.token);
+  if (set.length === 0) return null;
+  const chosenHere = !teamOnly || [teamOnly.globalUrl, DEFAULT_URL].some((u) => sameHub(u, url)) || sameHub(recordedSettings(teamOnly.root).url, url);
+  const usable = set.find((t) => (t.url ? sameHub(t.url, url) : chosenHere));
+  if (usable) return usable.token!;
+  const first = set[0];
+  warnings.push(
+    first.url
+      ? `the hub token in ${first.from} is for ${first.url}, so it is not sent to ${url}. ` +
+          `If ${url} is your team's hub, set its token in .hub.json or HUB_TOKEN${teamOnly ? ` and run \`hub init --url ${url}\` here` : ''}.`
+      : `the hub token from ${first.from} is not sent to ${url}: only the committed ${teamOnly!.file} names that hub, and nothing on this machine chose it. ` +
+          `If it is your team's hub, run \`hub init --url ${url}\` here.`,
+  );
+  return null;
+}
+
+/** Whether two hub URLs name the same hub, however they are spelled (case, default port, trailing slash). */
+function sameHub(a: string | undefined, b: string): boolean {
+  const norm = (u: string) => (URL.canParse(u) ? new URL(u).href : u).replace(/\/+$/, '');
+  return !!a && norm(a) === norm(b);
 }
 
 /** Whether `hub init` set this checkout up: agenthub.json or .hub.json in it, or settings recorded in its repository's git config. */
@@ -138,7 +188,9 @@ export function readConfigFile(file: string): ConfigFile | null {
 export function parseConfigFile(text: string, file: string): ConfigFile {
   let value: Record<string, unknown>;
   try {
-    value = JSON.parse(text);
+    // An own "__proto__" key would become the prototype of the merged config in
+    // loadConfig and supply settings (an agent, a token) from behind its checks.
+    value = JSON.parse(text, (key, v) => (key === '__proto__' ? undefined : v));
   } catch {
     throw new Error(`${file} is not valid JSON`);
   }
