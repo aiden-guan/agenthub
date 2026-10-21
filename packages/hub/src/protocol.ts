@@ -275,9 +275,32 @@ export interface HubEvent {
   targets: string[] | null;
 }
 
+/** GET /events. */
+export interface EventsResult {
+  /** Events after `since` the caller may see, oldest first: at most 500. */
+  events: HubEvent[];
+  /** The latest event seq. */
+  seq: number;
+  /**
+   * The `since` to pass next time: after the last event returned, or, when
+   * fewer than 500 came back, after every event read, including those the
+   * caller can't see or didn't ask for. A `since` past the latest seq is from
+   * another database (see `epoch`) and reads on from the latest seq.
+   */
+  next_since: number;
+  /** Made once per database; a new value means seqs started over. */
+  epoch: string;
+}
+
 /** Frames sent by the hub over the WebSocket feed. */
 export type FeedServerFrame =
-  | { type: 'hello'; project: string; agent: string | null; seq: number; now: number; heartbeat_interval_ms: number }
+  /**
+   * `seq` is the latest seq when the feed opened. With `since`, every event
+   * after it up to `seq` that this agent may see follows at once (a `since`
+   * past `seq` is from another database and replays nothing). `epoch` is made
+   * once per database; a new value means seqs started over.
+   */
+  | { type: 'hello'; project: string; agent: string | null; seq: number; epoch: string; now: number; heartbeat_interval_ms: number }
   | { type: 'event'; event: HubEvent }
   | { type: 'heartbeat.ack'; renewed: number; next_heartbeat_ms: number; now: number }
   | { type: 'pong'; now: number }

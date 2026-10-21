@@ -1,8 +1,14 @@
+import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { PATH_FORBIDDEN_RE, type Claim, type ClaimStatus, type Decision, type HubEvent, type Landing, type Message, type Task } from './protocol.js';
 import type { AgentRow, AgentTouch, ClaimFilter, ClaimPatch, Store } from './store.js';
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   created_at INTEGER NOT NULL
@@ -231,6 +237,20 @@ function toMessage(r: MessageRowDb): Message {
   return { id: r.id, project: r.project, from: r.from_agent, to: r.to_agent, channel: r.channel, body: r.body, created_at: r.created_at };
 }
 
+interface EventRowDb {
+  seq: number;
+  project: string;
+  type: HubEvent['type'];
+  actor: string | null;
+  at: number;
+  data: string;
+  targets: string | null;
+}
+
+function toEvent(r: EventRowDb): HubEvent {
+  return { seq: r.seq, project: r.project, type: r.type, actor: r.actor, at: r.at, data: eventData(r.data), targets: r.targets ? JSON.parse(r.targets) : null };
+}
+
 /** Claim and decision events list their paths in `files`. */
 function eventData(json: string): Record<string, unknown> {
   const data = JSON.parse(json) as Record<string, unknown>;
@@ -264,6 +284,7 @@ class StatementCache {
 export class SqliteStore implements Store {
   readonly db: Database.Database;
   private readonly statements: StatementCache;
+  private readonly epochId: string;
 
   constructor(filename = ':memory:') {
     this.db = new Database(filename);
@@ -273,6 +294,9 @@ export class SqliteStore implements Store {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.exec(SCHEMA);
+    // The first process to open a new file makes its epoch; every later one reads it.
+    this.db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('epoch', ?)").run(randomUUID());
+    this.epochId = this.db.prepare("SELECT value FROM meta WHERE key = 'epoch'").pluck().get() as string;
     this.indexLiveClaimsAsNfc();
   }
 
@@ -303,6 +327,10 @@ export class SqliteStore implements Store {
 
   close(): void {
     this.db.close();
+  }
+
+  epoch(): string {
+    return this.epochId;
   }
 
   ensureProject(project: string, now: number): void {
@@ -565,30 +593,22 @@ export class SqliteStore implements Store {
   }
 
   eventsSince(project: string, afterSeq: number, limit: number): HubEvent[] {
-    const rows = this.statements
-      .prepare('SELECT * FROM events WHERE project = ? AND seq > ? ORDER BY seq LIMIT ?')
-      .all(project, afterSeq, limit) as Array<{
-      seq: number;
-      project: string;
-      type: HubEvent['type'];
-      actor: string | null;
-      at: number;
-      data: string;
-      targets: string | null;
-    }>;
-    return rows.map((r) => ({
-      seq: r.seq,
-      project: r.project,
-      type: r.type,
-      actor: r.actor,
-      at: r.at,
-      data: eventData(r.data),
-      targets: r.targets ? JSON.parse(r.targets) : null,
-    }));
+    const rows = this.statements.prepare('SELECT * FROM events WHERE project = ? AND seq > ? ORDER BY seq LIMIT ?').all(project, afterSeq, limit) as EventRowDb[];
+    return rows.map(toEvent);
   }
 
   latestSeq(project: string): number {
     const v = this.statements.prepare('SELECT MAX(seq) FROM events WHERE project = ?').pluck().get(project);
+    return (v as number | null) ?? 0;
+  }
+
+  allEventsSince(afterSeq: number, limit: number): HubEvent[] {
+    const rows = this.statements.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?').all(afterSeq, limit) as EventRowDb[];
+    return rows.map(toEvent);
+  }
+
+  lastSeq(): number {
+    const v = this.statements.prepare('SELECT MAX(seq) FROM events').pluck().get();
     return (v as number | null) ?? 0;
   }
 }

@@ -1205,4 +1205,38 @@ describe('status and events', () => {
     expect(s.unread).toBe(1);
     expect(s.claims).toHaveLength(0); // A's claim expired before its heartbeat came back
   });
+
+  it('publishes the events another hub on the same database file committed, each once and in seq order', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'agenthub-'));
+    try {
+      const open = () => {
+        const store = new SqliteStore(path.join(dir, 'hub.db'));
+        const hub = new Hub({ store });
+        const seen: string[] = [];
+        hub.subscribe((e) => seen.push(`${e.project} #${e.seq} ${e.type}`));
+        return { store, hub, seen };
+      };
+      const one = open();
+      const two = open();
+      expect(two.hub.epoch).toBe(one.hub.epoch);
+      two.hub.claim(P, A, { files: ['a.ts'] });
+      two.hub.post('other', B, { to: '#general', body: 'hi' });
+      expect(one.seen).toEqual([]);
+      one.hub.catchUp();
+      expect(one.seen).toEqual(two.seen);
+      one.hub.catchUp();
+      expect(one.seen).toEqual(two.seen);
+
+      // A commit of its own publishes what the other hub committed before it first.
+      two.hub.release(P, A, { files: ['a.ts'] });
+      one.hub.decide(P, B, { summary: 'use argon2id' });
+      expect(one.seen.slice(two.seen.length - 1)).toEqual([two.seen.at(-1), `${P} #6 decision.recorded`]);
+      two.hub.catchUp();
+      expect(two.seen).toEqual(one.seen);
+      one.store.close();
+      two.store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

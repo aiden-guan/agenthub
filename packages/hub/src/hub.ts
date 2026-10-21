@@ -68,6 +68,8 @@ const MAX_LEASE_TTL_MS = 24 * 60 * 60 * 1000;
 const MIN_HEARTBEAT_MS = 25;
 /** Past this many events since a wait graph was built, building a new one is cheaper than checking them. */
 const MAX_EVENTS_TO_REUSE = 100;
+/** Events read from the store at a time. */
+const EVENT_PAGE = 500;
 
 /** At most this many claims are named in a landing note. */
 const MAX_NOTE_CLAIMS = 10;
@@ -84,8 +86,12 @@ export class Hub {
   readonly leaseTtlMs: number;
   readonly heartbeatIntervalMs: number;
   readonly presenceTtlMs: number;
+  /** The store's epoch: made once per database, so clients can tell a recreated one apart. */
+  readonly epoch: string;
   private readonly clock: () => number;
   private readonly listeners = new Set<(event: HubEvent) => void>();
+  /** Every committed event up to this seq has been published to the listeners (see publish). */
+  private publishedSeq: number;
   private pending: HubEvent[] | null = null;
   private txNow = 0;
   /** Each project's last wait graph, with the event seq it was built at (see waitGraph). */
@@ -98,16 +104,32 @@ export class Hub {
     this.leaseTtlMs = lease.leaseTtlMs;
     this.heartbeatIntervalMs = lease.heartbeatIntervalMs;
     this.presenceTtlMs = lease.presenceTtlMs;
+    this.epoch = this.store.epoch();
+    this.publishedSeq = this.store.lastSeq();
   }
 
   now(): number {
     return this.clock();
   }
 
-  /** Receive every committed event (all projects). Returns an unsubscribe function. */
+  /**
+   * Receive every committed event (all projects), in seq order, including those
+   * other hub processes on the same store commit (see catchUp). Returns an
+   * unsubscribe function.
+   */
   subscribe(listener: (event: HubEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Publishes the events other hub processes on the same store committed since
+   * the last event published here. The server calls this on every sweep, so
+   * its feeds and long-polls hear of those events within a tick. This hub's
+   * own commits publish them first anyway, keeping subscribers in seq order.
+   */
+  catchUp(): void {
+    this.publish([]);
   }
 
   // ---------------------------------------------------------------- claims
@@ -573,10 +595,33 @@ export class Hub {
     });
   }
 
-  /** Committed events after `since` that `agent` may see. */
+  /** Committed events after `since` that `agent` may see, at most `limit`. */
   events(project: string, agent: string | null, since: number, limit = 500): HubEvent[] {
+    return this.readEvents(project, agent, since, { limit }).events;
+  }
+
+  /**
+   * Committed events after `since` that `agent` may see, oldest first: at most
+   * `limit`, and only those of `types` if given. `next_since` is where to read
+   * on: after the last event returned, or, short of `limit`, after every event
+   * read, seen or not, so a run of other agents' direct messages can't hold a
+   * reader back. A `since` past the latest seq comes from another database
+   * (see epoch), so reading starts at the latest seq.
+   */
+  readEvents(project: string, agent: string | null, since: number, opts: { limit?: number; types?: readonly string[] } = {}): { events: HubEvent[]; next_since: number } {
     assertProject(project);
-    return this.store.eventsSince(project, since, limit).filter((e) => isVisibleTo(e, agent));
+    const limit = opts.limit ?? 500;
+    const events: HubEvent[] = [];
+    let cursor = Math.min(since, this.store.latestSeq(project));
+    for (;;) {
+      const page = this.store.eventsSince(project, cursor, EVENT_PAGE);
+      for (const e of page) {
+        cursor = e.seq;
+        if (!isVisibleTo(e, agent) || (opts.types && !opts.types.includes(e.type))) continue;
+        if (events.push(e) >= limit) return { events, next_since: cursor };
+      }
+      if (page.length < EVENT_PAGE) return { events, next_since: cursor };
+    }
   }
 
   latestSeq(project: string): number {
@@ -613,7 +658,29 @@ export class Hub {
     } finally {
       this.pending = null;
     }
-    for (const event of pending) {
+    if (pending.length > 0) this.publish(pending);
+    return result;
+  }
+
+  /**
+   * Publishes committed events to the listeners, each once and in seq order:
+   * first those other processes on the store committed since the last one
+   * published here, then `own`, which this hub has just committed. Seq order is
+   * commit order, so every event before `own` was committed before it.
+   */
+  private publish(own: HubEvent[]): void {
+    const before = own.length > 0 ? own[0].seq : Infinity;
+    const events: HubEvent[] = [];
+    for (let cursor = this.publishedSeq; cursor < before - 1; ) {
+      const page = this.store.allEventsSince(cursor, EVENT_PAGE);
+      events.push(...page.filter((e) => e.seq < before));
+      if (page.length < EVENT_PAGE || page[page.length - 1].seq >= before) break;
+      cursor = page[page.length - 1].seq;
+    }
+    events.push(...own);
+    if (events.length === 0) return;
+    this.publishedSeq = Math.max(this.publishedSeq, events[events.length - 1].seq);
+    for (const event of events) {
       for (const listener of this.listeners) {
         try {
           listener(event);
@@ -622,7 +689,6 @@ export class Hub {
         }
       }
     }
-    return result;
   }
 
   /** Reads go through `write` only when a lease is overdue, so they never see a dead claim. */

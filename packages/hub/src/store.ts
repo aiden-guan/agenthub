@@ -13,6 +13,8 @@ export interface Store {
   /** Run `fn` atomically. Writes made inside commit together or not at all. */
   transaction<T>(fn: () => T): T;
   close(): void;
+  /** An id made once when the database is created, so clients can tell a recreated one (whose seqs start over) apart. */
+  epoch(): string;
 
   ensureProject(project: string, now: number): void;
   listProjects(): string[];
@@ -56,10 +58,15 @@ export interface Store {
   insertLanding(landing: Landing): void;
   listLandings(project: string, limit: number): Landing[];
 
-  // Event log (backs the push feed and replay after reconnect)
+  // Event log (backs the push feed and replay after reconnect). Seqs are unique
+  // across projects and increase in commit order.
   appendEvent(event: Omit<HubEvent, 'seq'>): number;
   eventsSince(project: string, afterSeq: number, limit: number): HubEvent[];
   latestSeq(project: string): number;
+  /** Events of every project after `afterSeq`, for publishing what other processes on the database committed. */
+  allEventsSince(afterSeq: number, limit: number): HubEvent[];
+  /** The latest seq of any project. */
+  lastSeq(): number;
 }
 
 export interface AgentTouch {

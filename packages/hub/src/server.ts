@@ -3,7 +3,7 @@ import { isIP, type AddressInfo } from 'node:net';
 import { timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { Hub, HubError, assertAgent, isVisibleTo } from './hub.js';
-import type { FeedClientFrame, FeedServerFrame, HubEvent, TaskStatus } from './protocol.js';
+import type { EventsResult, FeedClientFrame, FeedServerFrame, HubEvent, TaskStatus } from './protocol.js';
 
 export interface ServerOptions {
   hub: Hub;
@@ -202,17 +202,20 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(frame));
     };
     // Subscribe before replaying so nothing committed in between is lost; the
-    // client de-duplicates by seq.
-    let lastSent = since ?? hub.latestSeq(project);
+    // client de-duplicates by seq. A since past the latest seq is from another
+    // database (the client sees a new epoch in hello), so the feed starts now.
+    const latest = hub.latestSeq(project);
+    let lastSent = Math.min(since ?? latest, latest);
     const deliver = (event: HubEvent) => {
       if (event.project !== project || event.seq <= lastSent || !isVisibleTo(event, agent)) return;
       lastSent = event.seq;
       send({ type: 'event', event });
     };
     const unsubscribe = hub.subscribe(deliver);
-    send({ type: 'hello', project, agent, seq: hub.latestSeq(project), now: hub.now(), heartbeat_interval_ms: hub.heartbeatIntervalMs });
+    send({ type: 'hello', project, agent, seq: latest, epoch: hub.epoch, now: hub.now(), heartbeat_interval_ms: hub.heartbeatIntervalMs });
     if (since !== null) {
-      for (const event of hub.events(project, agent, since)) deliver(event);
+      // Everything missed, however much, past any number of events this agent can't see.
+      for (const event of hub.readEvents(project, agent, lastSent, { limit: Infinity }).events) deliver(event);
     }
     if (agent) {
       try {
@@ -257,10 +260,12 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     });
   }
 
-  // ---- lease sweeper: expires claims whose heartbeats stopped and pushes the events
+  // ---- lease sweeper: expires claims whose heartbeats stopped and pushes the
+  // events, along with those other hub processes on the same database committed
   const sweeper = setInterval(() => {
     try {
       hub.sweep();
+      hub.catchUp();
     } catch (err) {
       console.error('[hub] sweep failed:', err);
     }
@@ -337,14 +342,14 @@ function buildRoutes(hub: Hub, maxWaitMs: number): Route[] {
 }
 
 /** Returns visible events after `since`; if none, waits up to `wait_ms` for one. */
-function longPollEvents(hub: Hub, c: RequestContext, maxWaitMs: number): Promise<unknown> | unknown {
+function longPollEvents(hub: Hub, c: RequestContext, maxWaitMs: number): Promise<EventsResult> | EventsResult {
   const since = Number(c.query.get('since') ?? hub.latestSeq(c.project));
   if (!Number.isFinite(since)) throw new HubError('bad_request', 'since must be a number');
   const waitMs = Math.min(maxWaitMs, Math.max(0, Number(c.query.get('wait_ms') ?? 0) || 0));
   const types = c.query.get('types')?.split(',').filter(Boolean);
-  const pick = () => hub.events(c.project, c.agent, since).filter((e) => !types || types.includes(e.type));
-  const now = pick();
-  if (now.length > 0 || waitMs === 0) return { events: now, seq: hub.latestSeq(c.project) };
+  const read = (from: number): EventsResult => ({ ...hub.readEvents(c.project, c.agent, from, { types }), seq: hub.latestSeq(c.project), epoch: hub.epoch });
+  const now = read(since);
+  if (now.events.length > 0 || waitMs === 0) return now;
 
   return new Promise((resolve) => {
     let done = false;
@@ -353,10 +358,11 @@ function longPollEvents(hub: Hub, c: RequestContext, maxWaitMs: number): Promise
       done = true;
       clearTimeout(timer);
       unsubscribe();
-      resolve({ events: pick(), seq: hub.latestSeq(c.project) });
+      // On from where the first read stopped, past what it already passed over.
+      resolve(read(now.next_since));
     };
     const unsubscribe = hub.subscribe((e) => {
-      if (e.project === c.project && isVisibleTo(e, c.agent) && (!types || types.includes(e.type))) finish();
+      if (e.project === c.project && e.seq > now.next_since && isVisibleTo(e, c.agent) && (!types || types.includes(e.type))) finish();
     });
     const timer = setTimeout(finish, waitMs);
     // The response closes when the client goes away; stop waiting then.

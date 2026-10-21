@@ -18,7 +18,7 @@ const servers: RunningServer[] = [];
 const cleanups: (() => void)[] = [];
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => s.close()));
-  for (const c of cleanups.splice(0)) c();
+  for (const c of cleanups.splice(0).reverse()) c(); // last in, first out: a database closes before its directory goes
 });
 
 async function start(opts: { leaseTtlMs?: number; heartbeatIntervalMs?: number; sweepIntervalMs?: number; token?: string; allowOrigins?: string[]; allowHosts?: string[]; host?: string } = {}) {
@@ -28,10 +28,26 @@ async function start(opts: { leaseTtlMs?: number; heartbeatIntervalMs?: number; 
   return server;
 }
 
-/** Runs the real `hub-server` CLI (built dist) on a random port with a temporary database. */
-async function startCli(args: string[] = []): Promise<{ url: string; port: number; child: ChildProcess; output: () => string }> {
+/** A temporary directory, removed after the test. */
+function tempDir(): string {
+  const dir = mkdtempSync(path.join(tmpdir(), 'agenthub-db-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+/** A server with its own connection to the SQLite file `db`, as another hub process on that file would have. */
+async function startOn(db: string, opts: { sweepIntervalMs?: number } = {}) {
+  const store = new SqliteStore(db);
+  const server = await startServer({ hub: new Hub({ store }), port: 0, sweepIntervalMs: opts.sweepIntervalMs });
+  servers.push(server);
+  cleanups.push(() => store.close());
+  return server;
+}
+
+/** Runs the real `hub-server` CLI (built dist) on a random port with a temporary database, or with `db`. */
+async function startCli(args: string[] = [], db?: string): Promise<{ url: string; port: number; child: ChildProcess; output: () => string }> {
   const dir = mkdtempSync(path.join(tmpdir(), 'agenthub-cli-'));
-  const child = spawn(process.execPath, [path.join(here, '..', 'bin', 'hub-server.js'), '--port', '0', '--db', path.join(dir, 'hub.db'), ...args]);
+  const child = spawn(process.execPath, [path.join(here, '..', 'bin', 'hub-server.js'), '--port', '0', '--db', db ?? path.join(dir, 'hub.db'), ...args]);
   cleanups.push(() => {
     child.kill('SIGKILL');
     rmSync(dir, { recursive: true, force: true });
@@ -239,6 +255,83 @@ describe('push feed', () => {
     await f2.waitFor(f2.isEvent('decision.recorded'));
     expect(f2.events().map((e) => e.type)).toEqual(['claim.released', 'decision.recorded']);
     f2.ws.close();
+  });
+
+  it('replays every missed event after a reconnect, however many there are', async () => {
+    const s = await start();
+    s.hub.claim('demo', A, { files: ['src/x.ts'] });
+    const since = s.hub.latestSeq('demo');
+    for (let i = 0; i < 260; i++) {
+      s.hub.claim('demo', A, { files: [`f${i}.ts`] });
+      s.hub.release('demo', A, { files: [`f${i}.ts`] });
+    }
+    s.hub.release('demo', A, { files: ['src/x.ts'] });
+    const latest = s.hub.latestSeq('demo');
+    expect(latest - since).toBeGreaterThan(500);
+
+    const f = feed(s.url, B, since);
+    await f.waitFor(f.isEvent('claim.released', (e) => e.seq === latest));
+    const replayed = f.events().filter((e) => e.seq <= latest);
+    expect(replayed.map((e) => e.seq)).toEqual(Array.from({ length: latest - since }, (_, i) => since + 1 + i));
+    f.ws.close();
+  });
+
+  it('replays an event missed behind 500 direct messages between other agents', async () => {
+    const s = await start();
+    const C = 'lee/codex-1';
+    s.hub.claim('demo', A, { files: ['src/x.ts'] });
+    const since = s.hub.latestSeq('demo');
+    for (let i = 0; i < 600; i++) s.hub.post('demo', A, { to: C, body: `dm ${i}` });
+    s.hub.release('demo', A, { files: ['src/x.ts'] });
+
+    const f = feed(s.url, B, since);
+    const released = await f.waitFor(f.isEvent('claim.released'));
+    expect(released.type === 'event' && released.event.data).toMatchObject({ holder: A, files: ['src/x.ts'] });
+    expect(f.events().filter((e) => e.type === 'message.posted')).toEqual([]);
+    f.ws.close();
+  });
+
+  it('names the database in hello, and pushes events to a feed that resumes from a seq of a database since recreated', async () => {
+    const before = await start();
+    for (let i = 0; i < 30; i++) before.hub.post('demo', A, { to: B, body: `m${i}` });
+    const old = feed(before.url, B);
+    const oldHello = await old.waitFor((f) => f.type === 'hello');
+    const lastSeq = before.hub.latestSeq('demo');
+    old.ws.close();
+
+    // The hub comes back on a fresh database, so its seqs start again below the client's.
+    const after = await start();
+    const f = feed(after.url, B, lastSeq);
+    const hello = await f.waitFor((fr) => fr.type === 'hello');
+    expect(hello).toMatchObject({ epoch: expect.stringMatching(/^\S{8,}$/) });
+    expect(hello.type === 'hello' && hello.epoch).not.toBe(oldHello.type === 'hello' && oldHello.epoch);
+    expect(hello.type === 'hello' && hello.seq).toBeLessThan(lastSeq);
+    await api(after.url, 'POST', '/claims', { files: ['src/auth.ts'] }, A);
+    const granted = await f.waitFor(f.isEvent('claim.granted'));
+    expect(granted.type === 'event' && granted.event.seq).toBeLessThan(lastSeq);
+    f.ws.close();
+
+    // A long-poll from the old seq waits from the latest one and returns the next event.
+    const poll = api(after.url, 'GET', `/events?since=${lastSeq}&wait_ms=5000`, undefined, B);
+    setTimeout(() => void api(after.url, 'POST', '/claims/release', { files: ['src/auth.ts'] }, A), 150);
+    const { json } = await poll;
+    expect(json).toMatchObject({ events: [{ type: 'claim.released' }], epoch: hello.type === 'hello' && hello.epoch });
+    expect(json.next_since).toBeLessThan(lastSeq);
+  });
+
+  it('keeps one epoch per database file: the same for every connection to it, another for a new file', async () => {
+    const dir = tempDir();
+    const one = await startOn(path.join(dir, 'hub.db'));
+    const f = feed(one.url, B);
+    const hello = await f.waitFor((fr) => fr.type === 'hello');
+    f.ws.close();
+    const epoch = (await api(one.url, 'GET', '/events?since=0', undefined, B)).json.epoch;
+    expect(epoch).toMatch(/^\S{8,}$/);
+    expect(hello).toMatchObject({ epoch });
+    const again = await startOn(path.join(dir, 'hub.db'));
+    expect((await api(again.url, 'GET', '/events?since=0', undefined, B)).json.epoch).toBe(epoch);
+    const other = await startOn(path.join(dir, 'other.db'));
+    expect((await api(other.url, 'GET', '/events?since=0', undefined, B)).json.epoch).not.toBe(epoch);
   });
 
   it('sends direct-message events only to the recipient', async () => {
@@ -606,6 +699,57 @@ describe('HTTP API', () => {
     expect(json.events.map((e: HubEvent) => e.type)).toContain('claim.granted');
   });
 
+  it('moves the /events cursor past 500 direct messages the caller cannot see, and wakes a long-poll behind them', async () => {
+    const s = await start();
+    const C = 'lee/codex-1';
+    s.hub.claim('demo', A, { files: ['src/auth.ts'] });
+    s.hub.heartbeat('demo', C);
+    const since = s.hub.latestSeq('demo');
+    // One agent messaging itself is enough to fill the log with events nobody else sees.
+    for (let i = 0; i < 600; i++) s.hub.post('demo', C, { to: C, body: `note ${i}` });
+    const now = await api(s.url, 'GET', `/events?since=${since}`, undefined, B);
+    expect(now.json).toMatchObject({ events: [], next_since: s.hub.latestSeq('demo'), epoch: expect.any(String) });
+
+    const t0 = Date.now();
+    const poll = api(s.url, 'GET', `/events?since=${since}&wait_ms=5000`, undefined, B);
+    setTimeout(() => s.hub.release('demo', A, { files: ['src/auth.ts'] }), 150);
+    const { json } = await poll;
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(json.events.map((e: HubEvent) => e.type)).toEqual(['claim.released']);
+    expect(json.next_since).toBe(json.events[0].seq);
+  });
+
+  it('filters /events by type over the whole log, not over its first 500 events', async () => {
+    const s = await start();
+    s.hub.claim('demo', A, { files: ['a.ts'] });
+    const since = s.hub.latestSeq('demo');
+    for (let i = 0; i < 600; i++) s.hub.post('demo', B, { to: '#general', body: `m${i}` });
+    s.hub.release('demo', A, { files: ['a.ts'] });
+    const released = await api(s.url, 'GET', `/events?since=${since}&types=claim.released`, undefined, B);
+    expect(released.json.events.map((e: HubEvent) => e.type)).toEqual(['claim.released']);
+    expect(released.json.next_since).toBe(s.hub.latestSeq('demo'));
+
+    const t0 = Date.now();
+    const poll = api(s.url, 'GET', `/events?since=${since}&types=claim.granted&wait_ms=5000`, undefined, B);
+    setTimeout(() => s.hub.claim('demo', A, { files: ['b.ts'] }), 150);
+    const { json } = await poll;
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(json.events).toMatchObject([{ type: 'claim.granted', data: { files: ['b.ts'] } }]);
+  });
+
+  it('returns /events in pages of 500, with next_since continuing after the last one returned', async () => {
+    const s = await start();
+    const since = s.hub.latestSeq('demo');
+    for (let i = 0; i < 600; i++) s.hub.post('demo', A, { to: '#general', body: `m${i}` });
+    const first = (await api(s.url, 'GET', `/events?since=${since}`, undefined, B)).json;
+    expect(first.events).toHaveLength(500);
+    expect(first.next_since).toBe(first.events[499].seq);
+    const rest = (await api(s.url, 'GET', `/events?since=${first.next_since}`, undefined, B)).json;
+    expect(rest.events).toHaveLength(101); // 601 in all: A's agent.online, then the posts
+    expect(rest.events.at(-1).seq).toBe(s.hub.latestSeq('demo'));
+    expect(rest).toMatchObject({ next_since: s.hub.latestSeq('demo'), seq: s.hub.latestSeq('demo'), epoch: first.epoch });
+  });
+
   it('requires the bearer token when one is configured', async () => {
     const s = await start({ token: 's3cret' });
     expect((await api(s.url, 'GET', '/status', undefined, A)).status).toBe(401);
@@ -759,5 +903,47 @@ describe('HTTP API', () => {
     expect(r.status).toBe(200);
     expect(r.json.conflicts).toEqual([expect.objectContaining({ holder: A, files: ['src/auth.ts'] })]);
     expect((await api(s.url, 'POST', '/claims', { files: ['a:b.md'] }, B)).json.status).toBe('granted');
+  });
+});
+
+describe('several hub processes on one database', () => {
+  it("pushes the events another process committed before this process's own, in seq order", async () => {
+    const db = path.join(tempDir(), 'hub.db');
+    // No sweeps, so only this process's own commits can publish the other's events.
+    const one = await startOn(db, { sweepIntervalMs: 600_000 });
+    const two = await startOn(db, { sweepIntervalMs: 600_000 });
+    await api(one.url, 'POST', '/claims', { files: ['a.ts'] }, A);
+    const queued = (await api(one.url, 'POST', '/claims', { files: ['a.ts'], queue: true }, B)).json;
+    expect(queued.status).toBe('queued');
+    const f = feed(one.url, B, queued.seq);
+    await f.waitFor((fr) => fr.type === 'hello');
+
+    await api(two.url, 'POST', '/claims/release', { files: ['a.ts'] }, A);
+    await api(two.url, 'POST', '/messages', { to: B, body: 'a.ts is yours' }, A);
+    await api(one.url, 'POST', '/decisions', { summary: 'use argon2id' }, A);
+    await f.waitFor(f.isEvent('decision.recorded'));
+    expect(f.events().map((e) => e.type)).toEqual(['claim.released', 'claim.granted', 'message.posted', 'decision.recorded']);
+    expect(f.events().map((e) => e.seq)).toEqual([queued.seq + 1, queued.seq + 2, queued.seq + 3, queued.seq + 4]);
+    f.ws.close();
+  });
+
+  it('wakes feeds and long-polls on one hub-server process for a release and grant committed through another', async () => {
+    const db = path.join(tempDir(), 'hub.db');
+    new SqliteStore(db).close(); // create the schema up front
+    const [one, two] = await Promise.all([startCli([], db), startCli([], db)]);
+    expect((await api(two.url, 'POST', '/claims', { files: ['src/auth.ts'] }, A)).json.status).toBe('granted');
+    const queued = (await api(one.url, 'POST', '/claims', { files: ['src/auth.ts'], queue: true }, B)).json;
+    expect(queued.status).toBe('queued');
+    const f = feed(one.url, B);
+    await f.waitFor((fr) => fr.type === 'hello');
+
+    const t0 = Date.now();
+    const poll = api(one.url, 'GET', `/events?since=${queued.seq}&wait_ms=8000`, undefined, B);
+    setTimeout(() => void api(two.url, 'POST', '/claims/release', { files: ['src/auth.ts'] }, A), 200);
+    await f.waitFor(f.isEvent('claim.granted', (e) => e.data.claim_id === queued.claim.id), 4000);
+    const { json } = await poll;
+    expect(Date.now() - t0).toBeLessThan(4000);
+    expect(json.events.map((e: HubEvent) => e.type)).toEqual(['claim.released', 'claim.granted']);
+    f.ws.close();
   });
 });
