@@ -73,6 +73,20 @@ describe('claims', () => {
     expect(hub.claim(P, A, { files: ['src/x.ts'], mode: 'auto' }).status).toBe('denied');
   });
 
+  it('caps the intent it makes up from long file names like an intent the request gives', () => {
+    const { hub, events } = setup();
+    const long = (c: string) => `src/${c.repeat(3998)}.ts`;
+    const made = hub.claim(P, A, { files: ['a', 'b', 'c', 'd'].map(long) });
+    expect(made.claim!.intent).toHaveLength(300);
+    expect(made.claim!.intent).toMatch(/^edit src\/aaa.*…$/);
+    expect(events.at(-1)!.data.intent).toBe(made.claim!.intent);
+    expect(hub.claim(P, B, { files: ['x.ts'], intent: 'y'.repeat(1000) }).claim!.intent).toHaveLength(300);
+    // Never cut between the halves of a surrogate pair, which would store a character that isn't text.
+    const emoji = hub.claim(P, C, { files: [`docs/${'😀'.repeat(200)}.md`] }).claim!.intent;
+    expect(emoji.length).toBeLessThanOrEqual(300);
+    expect(emoji).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+  });
+
   it('is file-level in Phase 1: different symbols in one file still conflict', () => {
     const { hub } = setup();
     hub.claim(P, A, { scope: [{ file: 'src/session.ts', symbol: 'refreshToken' }] });
@@ -652,6 +666,21 @@ describe('queueing and release', () => {
     expect(hub.release(P, 'holder3/a', { all: true }).promoted.map((c) => c.holder)).toEqual(['w0/a']);
     expect(reads).toBeLessThan(10);
   });
+
+  it('a release with a thousand agents in line for one file hands it on without holding up the hub', () => {
+    const { hub } = setup({ leaseTtlMs: 600_000 });
+    hub.claim(P, 'holder/a', { files: ['hot.ts'] });
+    for (let i = 0; i < 1000; i++) expect(hub.claim(P, `w${i}/a`, { files: ['hot.ts'], queue: true }).status).toBe('queued');
+    // Hub.write runs synchronously: every project waits while one release decides the line.
+    // The wait graph used to cost about the cube of the line's length (2.5 s here).
+    const started = performance.now();
+    const r = hub.release(P, 'holder/a', { all: true });
+    const ms = performance.now() - started;
+    expect(r.promoted.map((c) => c.holder)).toEqual(['w0/a']);
+    expect(ms).toBeLessThan(1000);
+    // The line still moves in order.
+    expect(hub.release(P, 'w0/a', { all: true }).promoted.map((c) => c.holder)).toEqual(['w1/a']);
+  }, 60_000);
 
   it('an edit reads only the claims on its own files while nothing changed for the waiters, however long the queue is', () => {
     const { hub, store } = setup();

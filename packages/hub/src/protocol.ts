@@ -292,15 +292,20 @@ export interface HubEvent {
 
 /** GET /events. */
 export interface EventsResult {
-  /** Events after `since` the caller may see, oldest first: at most 500. */
+  /**
+   * Events after `since` the caller may see, oldest first: at most 500, from at
+   * most 5000 read. Fewer, or none, can come back while more follow: the read
+   * stopped short of `seq`, and a long-poll then answers at once.
+   */
   events: HubEvent[];
   /** The latest event seq. */
   seq: number;
   /**
    * The `since` to pass next time: after the last event returned, or, when
    * fewer than 500 came back, after every event read, including those the
-   * caller can't see or didn't ask for. A `since` past the latest seq is from
-   * another database (see `epoch`) and reads on from the latest seq.
+   * caller can't see or didn't ask for. Below `seq`, more may follow. A `since`
+   * past the latest seq is from another database (see `epoch`) and reads on
+   * from the latest seq.
    */
   next_since: number;
   /** Made once per database; a new value means seqs started over. */
@@ -317,6 +322,12 @@ export type FeedServerFrame =
    */
   | { type: 'hello'; project: string; agent: string | null; seq: number; epoch: string; now: number; heartbeat_interval_ms: number }
   | { type: 'event'; event: HubEvent }
+  /**
+   * After the events a `since` replays: `next_since` is the `since` to reconnect
+   * with, past every event the replay read, those this agent can't see included.
+   * Hubs older than it don't send it.
+   */
+  | { type: 'replayed'; next_since: number }
   | { type: 'heartbeat.ack'; renewed: number; next_heartbeat_ms: number; now: number }
   | { type: 'pong'; now: number }
   | { type: 'error'; code: string; message: string };

@@ -5,6 +5,7 @@ import { request as httpRequest } from 'node:http';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
@@ -237,6 +238,40 @@ describe('claim races over HTTP', () => {
   });
 });
 
+/**
+ * Appends `n` events to the hub's store in one transaction, as another hub
+ * process on the database would, and publishes them (to no one yet).
+ */
+function seedEvents(hub: Hub, n: number, event: (i: number) => Pick<HubEvent, 'type' | 'actor' | 'data' | 'targets'>): void {
+  const at = hub.now();
+  hub.store.transaction(() => {
+    hub.store.ensureProject('demo', at);
+    for (let i = 0; i < n; i++) hub.store.appendEvent({ project: 'demo', at, ...event(i) });
+  });
+  hub.catchUp();
+}
+
+/** A feed client that only counts what it receives, for replays too long to keep. */
+function countingFeed(base: string, agent: string, since: number) {
+  const ws = new WebSocket(`${base.replace('http', 'ws')}/v1/p/demo/feed?agent=${agent}&since=${since}`);
+  let events = 0;
+  let lastSeq = since;
+  let inOrder = true;
+  const replayed = new Promise<{ events: number; lastSeq: number; inOrder: boolean; next_since: number }>((resolve, reject) => {
+    ws.on('message', (raw) => {
+      const f = JSON.parse(String(raw)) as FeedServerFrame;
+      if (f.type === 'event') {
+        events++;
+        if (f.event.seq <= lastSeq) inOrder = false;
+        lastSeq = f.event.seq;
+      } else if (f.type === 'replayed') resolve({ events, lastSeq, inOrder, next_since: f.next_since });
+    });
+    ws.on('error', reject);
+    ws.on('close', () => reject(new Error(`closed after ${events} events, before the replay ended`)));
+  });
+  return { ws, replayed };
+}
+
 describe('push feed', () => {
   it('pushes events over the WebSocket and replays missed ones after a reconnect', async () => {
     const s = await start();
@@ -290,6 +325,31 @@ describe('push feed', () => {
     expect(f.events().filter((e) => e.type === 'message.posted')).toEqual([]);
     f.ws.close();
   });
+
+  it('replays a long missed history a part at a time, so the hub keeps answering, and then says where to resume', async () => {
+    const s = await start();
+    const C = 'lee/codex-1';
+    const n = 120_000;
+    seedEvents(s.hub, n, (i) => ({ type: 'message.posted', actor: C, data: { message_id: i + 1, from: C, to: null, channel: '#general' }, targets: null }));
+    seedEvents(s.hub, 3000, (i) => ({ type: 'message.posted', actor: C, data: { message_id: n + i + 1, from: C, to: A, channel: null }, targets: [C, A] }));
+    const latest = s.hub.latestSeq('demo');
+    // The feeds run in this process, so a hub that stops to replay everything at once stops the clock here too.
+    const lag = monitorEventLoopDelay({ resolution: 10 });
+    lag.enable();
+    const feeds = [countingFeed(s.url, B, 0), countingFeed(s.url, B, 0)];
+    const claim = api(s.url, 'POST', '/claims', { files: ['x.ts'] }, A);
+    const done = await Promise.all(feeds.map((f) => f.replayed));
+    lag.disable();
+    expect((await claim).json.status).toBe('granted');
+    for (const d of done) {
+      expect(d.inOrder).toBe(true);
+      expect(d.events).toBeGreaterThanOrEqual(n);
+      // Past the direct messages B can't see, so a reconnect doesn't read them again.
+      expect(d.next_since).toBeGreaterThanOrEqual(latest);
+    }
+    expect(lag.max / 1e6).toBeLessThan(500);
+    for (const f of feeds) f.ws.close();
+  }, 60_000);
 
   it('names the database in hello, and pushes events to a feed that resumes from a seq of a database since recreated', async () => {
     const before = await start();
@@ -702,6 +762,16 @@ describe('hub-server settings', () => {
     expect(refused([], { HUB_PORT: ' ' })).toBe('hub-server: HUB_PORT must be a port number from 0 to 65535, got " "');
   });
 
+  it("refuses a port Node's fetch won't connect to, which the adapter would take for a hub that is down", async () => {
+    for (const port of ['6667', '10080', '9']) {
+      expect(refused(['--port', port])).toBe(
+        `hub-server: --port ${port} is a port Node's fetch (like browsers) refuses to connect to, so no adapter could reach the hub; pick another port, such as the default 7077`,
+      );
+    }
+    expect(refused([], { HUB_PORT: '6667' })).toMatch(/^hub-server: HUB_PORT 6667 is a port Node's fetch/);
+    await expect(fetch('http://127.0.0.1:6667/healthz')).rejects.toMatchObject({ cause: { message: 'bad port' } });
+  });
+
   it('starts with settings in range and reports what it runs with', async () => {
     const s = await startCli(['--lease-ttl-ms', '3000', '--heartbeat-ms', '1000']);
     expect(s.output()).toContain('lease ttl 3000 ms, heartbeat every 1000 ms');
@@ -743,6 +813,32 @@ describe('HTTP API', () => {
     expect(Date.now() - t0).toBeLessThan(3000);
     expect(json.events.map((e: HubEvent) => e.type)).toEqual(['claim.released']);
     expect(json.next_since).toBe(json.events[0].seq);
+  });
+
+  it('reads /events past a long run of events the caller cannot see a part at a time, each answered at once, and next_since leads on to the event behind them', async () => {
+    const s = await start();
+    const C = 'lee/codex-1';
+    s.hub.claim('demo', A, { files: ['src/auth.ts'] });
+    const since = s.hub.latestSeq('demo');
+    seedEvents(s.hub, 20_000, (i) => ({ type: 'message.posted', actor: C, data: { message_id: i + 1, from: C, to: A, channel: null }, targets: [C, A] }));
+    s.hub.release('demo', A, { files: ['src/auth.ts'] });
+    let cursor = since;
+    let reads = 0;
+    let events: HubEvent[] = [];
+    while (events.length === 0 && reads < 20) {
+      const t0 = Date.now();
+      const { json } = await api(s.url, 'GET', `/events?since=${cursor}&wait_ms=5000`, undefined, B);
+      reads++;
+      // A long-poll whose read stopped short of the latest event doesn't wait.
+      expect(Date.now() - t0).toBeLessThan(2500);
+      expect(json.next_since).toBeGreaterThan(cursor);
+      expect(json.next_since - cursor).toBeLessThanOrEqual(5000);
+      cursor = json.next_since;
+      events = json.events;
+    }
+    expect(reads).toBeGreaterThan(1);
+    expect(events.map((e) => e.type)).toEqual(['claim.released']);
+    expect(cursor).toBe(s.hub.latestSeq('demo'));
   });
 
   it('filters /events by type over the whole log, not over its first 500 events', async () => {

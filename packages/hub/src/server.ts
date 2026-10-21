@@ -42,6 +42,12 @@ export interface RunningServer {
 }
 
 const MAX_BODY_BYTES = 1_000_000;
+/** A feed replays missed events this many at a time, letting other requests run in between. */
+const REPLAY_PAGE = 500;
+/** ...and waits while more than this much of the replay is still waiting to be sent to the client. */
+const MAX_REPLAY_BUFFERED = 1_000_000;
+/** New events a feed holds back while it replays; a client that falls this far behind is dropped. */
+const MAX_HELD_EVENTS = 10_000;
 
 type Handler = (ctx: RequestContext) => unknown | Promise<unknown>;
 
@@ -210,16 +216,48 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     // database (the client sees a new epoch in hello), so the feed starts now.
     const latest = hub.latestSeq(project);
     let lastSent = Math.min(since ?? latest, latest);
+    // While the missed events are replayed, new ones wait here, so they go out in seq order after them.
+    let held: HubEvent[] | null = since !== null ? [] : null;
     const deliver = (event: HubEvent) => {
       if (event.project !== project || event.seq <= lastSent || !isVisibleTo(event, agent)) return;
+      if (held) {
+        // A client that reads nothing while a long replay runs is dropped; it reconnects with its since.
+        if (held.length >= MAX_HELD_EVENTS) return ws.terminate();
+        held.push(event);
+        return;
+      }
       lastSent = event.seq;
       send({ type: 'event', event });
     };
     const unsubscribe = hub.subscribe(deliver);
     send({ type: 'hello', project, agent, seq: latest, epoch: hub.epoch, now: hub.now(), heartbeat_interval_ms: hub.heartbeatIntervalMs });
     if (since !== null) {
-      // Everything missed, however much, past any number of events this agent can't see.
-      for (const event of hub.readEvents(project, agent, lastSent, { limit: Infinity }).events) deliver(event);
+      // Everything missed, however much, past any number of events this agent can't
+      // see: a bounded read at a time, letting other requests run in between and the
+      // socket drain, so a long replay holds up neither the hub nor its memory.
+      void (async () => {
+        let cursor = lastSent;
+        for (;;) {
+          if (ws.readyState !== ws.OPEN) return;
+          const page = hub.readEvents(project, agent, cursor, { limit: REPLAY_PAGE });
+          for (const event of page.events) {
+            lastSent = event.seq;
+            send({ type: 'event', event });
+          }
+          cursor = page.next_since;
+          if (page.end) break;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          while (ws.readyState === ws.OPEN && ws.bufferedAmount > MAX_REPLAY_BUFFERED) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        }
+        const waiting = held ?? [];
+        held = null;
+        for (const event of waiting) deliver(event);
+        // The cursor to reconnect from: past every event read, those this agent can't see included.
+        send({ type: 'replayed', next_since: Math.max(lastSent, cursor) });
+      })().catch((err) => {
+        console.error('[hub] feed replay failed:', err);
+        ws.terminate();
+      });
     }
     if (agent) {
       try {
@@ -351,9 +389,15 @@ function longPollEvents(hub: Hub, c: RequestContext, maxWaitMs: number): Promise
   if (!Number.isFinite(since)) throw new HubError('bad_request', 'since must be a number');
   const waitMs = Math.min(maxWaitMs, Math.max(0, Number(c.query.get('wait_ms') ?? 0) || 0));
   const types = c.query.get('types')?.split(',').filter(Boolean);
-  const read = (from: number): EventsResult => ({ ...hub.readEvents(c.project, c.agent, from, { types }), seq: hub.latestSeq(c.project), epoch: hub.epoch });
+  let end = true;
+  const read = (from: number): EventsResult => {
+    const r = hub.readEvents(c.project, c.agent, from, { types });
+    end = r.end;
+    return { events: r.events, seq: hub.latestSeq(c.project), next_since: r.next_since, epoch: hub.epoch };
+  };
   const now = read(since);
-  if (now.events.length > 0 || waitMs === 0) return now;
+  // A read that stopped short of the latest event answers at once: the caller reads on from next_since.
+  if (now.events.length > 0 || waitMs === 0 || !end) return now;
 
   return new Promise((resolve) => {
     let done = false;

@@ -28,6 +28,16 @@ TTL (by default a quarter of it, at most 30000). Settings out of range are refus
 Environment: HUB_PORT, HUB_HOST, HUB_DB, HUB_LEASE_TTL_MS, HUB_HEARTBEAT_MS, HUB_TOKEN
 `;
 
+/**
+ * The ports the Fetch standard blocks ("bad ports"): Node's fetch, which the
+ * adapter uses, refuses them before connecting, as browsers do.
+ */
+const FETCH_BLOCKED_PORTS = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123,
+  135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995,
+  1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
+]);
+
 const OPTIONS = {
   port: { type: 'string' },
   host: { type: 'string' },
@@ -53,6 +63,9 @@ const env = process.env;
 const port = wholeNumber('port', 'HUB_PORT', 'a port number from 0 to 65535', 65_535);
 const leaseTtl = wholeNumber('lease-ttl-ms', 'HUB_LEASE_TTL_MS', 'a whole number of milliseconds');
 const heartbeat = wholeNumber('heartbeat-ms', 'HUB_HEARTBEAT_MS', 'a whole number of milliseconds');
+if (port.value !== undefined && FETCH_BLOCKED_PORTS.has(port.value)) {
+  fail(`${port.name} ${port.value} is a port Node's fetch (like browsers) refuses to connect to, so no adapter could reach the hub; pick another port, such as the default 7077`);
+}
 const lease = orFail(() => leaseSettings({ leaseTtlMs: leaseTtl.value, heartbeatIntervalMs: heartbeat.value }, { leaseTtlMs: leaseTtl.name, heartbeatIntervalMs: heartbeat.name }));
 const dbPath = resolve(values.db ?? env.HUB_DB ?? 'hub.db');
 mkdirSync(dirname(dbPath), { recursive: true });

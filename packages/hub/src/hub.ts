@@ -71,6 +71,13 @@ const MIN_HEARTBEAT_MS = 25;
 const MAX_EVENTS_TO_REUSE = 100;
 /** Events read from the store at a time. */
 const EVENT_PAGE = 500;
+/**
+ * At most this many events are read from the store for one readEvents call (a
+ * GET /events, one step of a feed's replay), so a reader far behind, or behind
+ * a long run of events it can't see, can't hold up the hub: it reads on from
+ * `next_since`.
+ */
+const MAX_EVENTS_SCANNED = 5000;
 
 /** At most this many claims are named in a landing note. */
 const MAX_NOTE_CLAIMS = 10;
@@ -238,7 +245,8 @@ export class Hub {
           // one come to wait for it.)
           if (waitedFor) this.promoteQueued(project, now);
         }
-        const ahead = waiters.filter((q) => q.id !== claim.id && (claimOrderBefore(q, claim) || blockers.includes(q))).length;
+        const inTheWay = new Set(blockers);
+        const ahead = waiters.filter((q) => q.id !== claim.id && (claimOrderBefore(q, claim) || inTheWay.has(q))).length;
         return {
           status: 'queued',
           claim,
@@ -643,25 +651,36 @@ export class Hub {
 
   /**
    * Committed events after `since` that `agent` may see, oldest first: at most
-   * `limit`, and only those of `types` if given. `next_since` is where to read
-   * on: after the last event returned, or, short of `limit`, after every event
-   * read, seen or not, so a run of other agents' direct messages can't hold a
-   * reader back. A `since` past the latest seq comes from another database
-   * (see epoch), so reading starts at the latest seq.
+   * `limit`, and only those of `types` if given, from at most `maxScan` events
+   * read (default MAX_EVENTS_SCANNED). `next_since` is where to read on: after
+   * the last event returned, or, short of `limit`, after every event read, seen
+   * or not, so a run of other agents' direct messages can't hold a reader back.
+   * `end`: every event up to the latest seq was read. A `since` past the latest
+   * seq comes from another database (see epoch), so reading starts at the latest seq.
    */
-  readEvents(project: string, agent: string | null, since: number, opts: { limit?: number; types?: readonly string[] } = {}): { events: HubEvent[]; next_since: number } {
+  readEvents(
+    project: string,
+    agent: string | null,
+    since: number,
+    opts: { limit?: number; types?: readonly string[]; maxScan?: number } = {},
+  ): { events: HubEvent[]; next_since: number; end: boolean } {
     assertProject(project);
     const limit = opts.limit ?? 500;
+    const maxScan = Math.max(1, opts.maxScan ?? MAX_EVENTS_SCANNED);
     const events: HubEvent[] = [];
     let cursor = Math.min(since, this.store.latestSeq(project));
+    let scanned = 0;
     for (;;) {
-      const page = this.store.eventsSince(project, cursor, EVENT_PAGE);
+      const want = Math.min(EVENT_PAGE, maxScan - scanned);
+      const page = this.store.eventsSince(project, cursor, want);
+      scanned += page.length;
       for (const e of page) {
         cursor = e.seq;
         if (!isVisibleTo(e, agent) || (opts.types && !opts.types.includes(e.type))) continue;
-        if (events.push(e) >= limit) return { events, next_since: cursor };
+        if (events.push(e) >= limit) return { events, next_since: cursor, end: cursor >= this.store.latestSeq(project) };
       }
-      if (page.length < EVENT_PAGE) return { events, next_since: cursor };
+      if (page.length < want) return { events, next_since: cursor, end: true };
+      if (scanned >= maxScan) return { events, next_since: cursor, end: false };
     }
   }
 
@@ -902,10 +921,11 @@ export class Hub {
     return mine.length === 1 ? mine[0].id : null;
   }
 
+  /** The task's title, else the files (some of them), capped like an intent the request gives. */
   private defaultIntent(project: string, taskId: string | null, files: string[]): string {
     const task = taskId ? this.store.getTask(project, taskId) : null;
-    if (task) return task.title;
-    return `edit ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` and ${files.length - 3} more` : ''}`;
+    if (task) return capText(task.title, MAX_INTENT);
+    return capText(`edit ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` and ${files.length - 3} more` : ''}`, MAX_INTENT);
   }
 
   private blockedBy(project: string, task: Pick<Task, 'deps'>): string[] {
@@ -1025,8 +1045,15 @@ export function cleanText(value: unknown, max: number, multiline = false): strin
   if (typeof value !== 'string') throw new HubError('bad_request', 'expected a string');
   let s = value.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000B-\u001F\u007F​-‏‪-‮⁦-⁩]/g, '');
   s = multiline ? s.replace(/\n{3,}/g, '\n\n') : s.replace(/\s+/g, ' ');
-  s = s.trim();
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  return capText(s.trim(), max);
+}
+
+/** `s`, cut to at most `max` characters with a trailing ellipsis, never between the halves of a surrogate pair. */
+function capText(s: string, max: number): string {
+  if (s.length <= max) return s;
+  let end = max - 1;
+  if (/[\uD800-\uDBFF]/.test(s[end - 1] ?? '')) end--;
+  return `${s.slice(0, end)}…`;
 }
 
 /**
@@ -1110,9 +1137,17 @@ function byFile(claims: Claim[]): Map<string, Claim[]> {
 
 /** The claims in `index` that name any of `q`'s files, each once. */
 function near(index: Map<string, Claim[]>, q: Claim): Claim[] {
+  const files = claimFiles(q);
+  if (files.length === 1) return index.get(files[0]) ?? [];
   const found = new Map<string, Claim>();
-  for (const f of claimFiles(q)) for (const c of index.get(f) ?? []) found.set(c.id, c);
+  for (const f of files) for (const c of index.get(f) ?? []) found.set(c.id, c);
   return [...found.values()];
+}
+
+/** The queue positions in `line` (per file, in queue order) of the claims that name any of `files`, each once, in queue order. */
+function inLine(line: Map<string, number[]>, files: string[]): number[] {
+  if (files.length === 1) return line.get(files[0]) ?? [];
+  return [...new Set(files.flatMap((f) => line.get(f) ?? []))].sort((a, b) => a - b);
 }
 
 /** `waiter` (a queued claim, or null for the request being decided) waits for `blocker`. */
@@ -1139,31 +1174,92 @@ interface Waits {
 
 /** See Hub.waitGraph: `queue` in queue order, `files` the files it names, `active` the active claims on them. */
 function buildWaits(queue: Claim[], files: Set<string>, active: Claim[]): Waits {
-  const waits: Waits = {
-    queue,
-    ids: new Set(queue.map((q) => q.id)),
-    files,
-    blocked: new Set(),
-    held: new Map(),
-    all: new Map(),
-    reach: new Reach([...queue, ...active].map((c) => c.holder)),
+  const reach = new Reach([...queue, ...active].map((c) => c.holder));
+  const waits: Waits = { queue, ids: new Set(queue.map((q) => q.id)), files, blocked: new Set(), held: new Map(), all: new Map(), reach };
+  const who = queue.map((q) => reach.at(q.holder));
+  // A wait the others already imply (its agent waits for that one through someone
+  // else) changes nothing about who waits for whom, so `all` and `reach` skip it:
+  // a line of n waiters for one file then takes about n links, not n²/2.
+  const wait = (waiter: Claim, w: number, blocker: Claim, b: number) => {
+    if (!reach.hasAt(w, b) && link(waits.all, waiter, blocker)) reach.add(w, b);
   };
-  const add = (waiter: Claim, blocker: Claim, held: boolean) => {
-    waits.blocked.add(waiter.id);
-    if (held) link(waits.held, waiter, blocker);
-    if (link(waits.all, waiter, blocker)) waits.reach.add(waiter.holder, blocker.holder);
-  };
+
   const activeByFile = byFile(active);
-  for (const q of queue) for (const a of near(activeByFile, q)) if (clash(a, q)) add(q, a, true);
-  const earlier = new Map<string, Claim[]>();
-  for (const q of queue) {
-    const ahead = near(earlier, q).filter((e) => clash(e, q));
-    // Each decided against the waits before this claim's own are added.
-    const goesBehind = ahead.map((e) => waits.reach.has(e.holder, q.holder));
-    ahead.forEach((e, i) => (goesBehind[i] ? add(e, q, false) : add(q, e, false)));
-    for (const f of claimFiles(q)) (earlier.get(f) ?? earlier.set(f, []).get(f)!).push(q);
-  }
+  const held: HeldWait[] = [];
+  queue.forEach((q, i) => {
+    for (const a of near(activeByFile, q)) {
+      if (!clash(a, q)) continue;
+      waits.blocked.add(q.id);
+      link(waits.held, q, a);
+      held.push({ waiter: q, w: who[i], blocker: a, b: reach.at(a.holder) });
+    }
+  });
+  // Agents that wait for nobody first, then those that wait only for them, and so
+  // on: nobody waits for an agent yet when its waits are added, so each extends
+  // just its own row (Reach.extend). Agents in a cycle, which claim() never lets
+  // form, come last and go the long way.
+  const { ordered, acyclic } = sinksFirst(held, reach.size);
+  ordered.forEach((h, k) => {
+    if (k >= acyclic) wait(h.waiter, h.w, h.blocker, h.b);
+    else if (!reach.hasAt(h.w, h.b) && link(waits.all, h.waiter, h.blocker)) reach.extend(h.w, h.b);
+  });
+
+  const earlier = new Map<string, number[]>(); // per file, the queue positions of the claims so far
+  queue.forEach((q, i) => {
+    const qFiles = claimFiles(q);
+    const line = inLine(earlier, qFiles);
+    const w = who[i];
+    // Each decided against the waits before this claim's own are added. Nobody can go
+    // behind a claim whose agent nobody waits for yet. Nearest first: waiting for the
+    // claim just ahead implies waiting for those it waits for.
+    const goesBehind = reach.waitedFor(w) ? new Set(line.filter((j) => clash(queue[j], q) && reach.hasAt(who[j], w))) : null;
+    let inLineWait = false;
+    for (let k = line.length - 1; k >= 0; k--) {
+      const j = line[k];
+      if (!clash(queue[j], q)) continue;
+      if (goesBehind?.has(j)) {
+        waits.blocked.add(queue[j].id);
+        wait(queue[j], who[j], q, w);
+      } else {
+        inLineWait = true;
+        wait(q, w, queue[j], who[j]);
+      }
+    }
+    if (inLineWait) waits.blocked.add(q.id);
+    for (const f of qFiles) (earlier.get(f) ?? earlier.set(f, []).get(f)!).push(i);
+  });
   return waits;
+}
+
+/** A queued claim (agent `w`) that waits for an active one (agent `b`). */
+type HeldWait = { waiter: Claim; w: number; blocker: Claim; b: number };
+
+/**
+ * `held` ordered so that an agent's waits come after those of every agent it
+ * waits for: the first `acyclic` of them; the waits of agents in a cycle follow.
+ */
+function sinksFirst(held: HeldWait[], agents: number): { ordered: HeldWait[]; acyclic: number } {
+  const out = new Array<number>(agents).fill(0);
+  const into = new Map<number, HeldWait[]>();
+  const from = new Map<number, HeldWait[]>();
+  for (const h of held) {
+    out[h.w]++;
+    (into.get(h.b) ?? into.set(h.b, []).get(h.b)!).push(h);
+    (from.get(h.w) ?? from.set(h.w, []).get(h.w)!).push(h);
+  }
+  const ordered: HeldWait[] = [];
+  const done = new Set<number>();
+  const ready: number[] = [];
+  for (let a = 0; a < agents; a++) if (out[a] === 0) ready.push(a);
+  while (ready.length) {
+    const a = ready.pop()!;
+    done.add(a);
+    for (const h of from.get(a) ?? []) ordered.push(h);
+    for (const h of into.get(a) ?? []) if (--out[h.w] === 0) ready.push(h.w);
+  }
+  const acyclic = ordered.length;
+  for (const h of held) if (!done.has(h.w)) ordered.push(h);
+  return { ordered, acyclic };
 }
 
 /** Record that `waiter`'s agent waits for `blocker`'s; false if `graph` already had them waiting directly. */
@@ -1178,10 +1274,23 @@ function link(graph: WaitGraph, waiter: Claim, blocker: Claim): boolean {
 class Reach {
   private readonly index = new Map<string, number>();
   private readonly rows: Uint32Array[] = [];
+  /** The agents anyone waits for. */
+  private readonly any: Uint32Array;
 
   constructor(agents: string[]) {
     for (const a of agents) if (!this.index.has(a)) this.index.set(a, this.index.size);
-    for (let i = 0; i < this.index.size; i++) this.rows.push(new Uint32Array((this.index.size + 31) >>> 5));
+    const words = (this.index.size + 31) >>> 5;
+    for (let i = 0; i < this.index.size; i++) this.rows.push(new Uint32Array(words));
+    this.any = new Uint32Array(words);
+  }
+
+  get size(): number {
+    return this.rows.length;
+  }
+
+  /** The number of one of the agents given to the constructor. */
+  at(agent: string): number {
+    return this.index.get(agent)!;
   }
 
   /** Whether `waiter` waits, directly or through others, for `blocker`. */
@@ -1191,10 +1300,17 @@ class Reach {
     return w !== undefined && b !== undefined && bit(this.rows[w], b);
   }
 
-  /** `waiter` now waits for `blocker` directly: so whoever waits for `waiter` waits for `blocker`, and for everyone it waits for. */
-  add(waiter: string, blocker: string): void {
-    const w = this.index.get(waiter)!;
-    const b = this.index.get(blocker)!;
+  hasAt(w: number, b: number): boolean {
+    return bit(this.rows[w], b);
+  }
+
+  /** Whether anyone waits, directly or through others, for agent `b`. */
+  waitedFor(b: number): boolean {
+    return bit(this.any, b);
+  }
+
+  /** `w` now waits for `b` directly: so whoever waits for `w` waits for `b`, and for everyone it waits for. */
+  add(w: number, b: number): void {
     if (bit(this.rows[w], b)) return;
     const beyond = this.rows[b];
     for (let s = 0; s < this.rows.length; s++) {
@@ -1203,6 +1319,20 @@ class Reach {
       if ((s !== w && !bit(row, w)) || bit(row, b)) continue;
       row[b >>> 5] |= 1 << (b & 31);
       for (let k = 0; k < row.length; k++) row[k] |= beyond[k];
+    }
+    this.any[b >>> 5] |= 1 << (b & 31);
+    for (let k = 0; k < beyond.length; k++) this.any[k] |= beyond[k];
+  }
+
+  /** As add, when nobody waits for `w` yet: only its own row changes. */
+  extend(w: number, b: number): void {
+    const row = this.rows[w];
+    const beyond = this.rows[b];
+    row[b >>> 5] |= 1 << (b & 31);
+    this.any[b >>> 5] |= 1 << (b & 31);
+    for (let k = 0; k < row.length; k++) {
+      row[k] |= beyond[k];
+      this.any[k] |= beyond[k];
     }
   }
 }
