@@ -32,8 +32,8 @@ const HOOK_REQUEST_TIMEOUT_MS = 10_000;
  * user (systemMessage) and to Claude (additionalContext), with no
  * permissionDecision so the normal permission flow still applies.
  */
-function allowWithWarning(msg: string): HookOutcome {
-  const text = `agenthub: ${inline(msg, 300)}`;
+function allowWithWarning(msg: string, max = 300): HookOutcome {
+  const text = `agenthub: ${inline(msg, max)}`;
   return {
     stdout: JSON.stringify({ systemMessage: text, hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: text } }),
     stderr: `hub: ${msg}\n`,
@@ -199,8 +199,10 @@ export async function preEditHook(io: HookIO): Promise<HookOutcome> {
   }
   if (!cfg.agent) {
     const why = 'no agent identity for this checkout (run `hub init --agent human/agent` in it, or set HUB_AGENT)';
-    if (cfg.failClosed) return deny(`Edit blocked: ${why}. This project requires a hub claim before editing (HUB_FAIL_CLOSED).`);
-    return allowWithWarning(`${why}; edit not coordinated`);
+    // Such as a .hub.json that git tracks, whose agent doesn't count.
+    const also = cfg.warnings.map((w) => ` ${inline(w, 400)}`).join('');
+    if (cfg.failClosed) return deny(`Edit blocked: ${why}. This project requires a hub claim before editing (HUB_FAIL_CLOSED).${also}`);
+    return allowWithWarning(`${why}; edit not coordinated.${also}`, 300 + also.length);
   }
 
   try {
@@ -329,7 +331,8 @@ export async function settleHook(io: HookIO): Promise<HookOutcome> {
  * a short team summary as `additionalContext`: active claims by others,
  * recent decisions, open tasks and the unread count (never message bodies).
  * Configuration warnings (HUB_AGENT overriding this checkout's identity, a
- * token withheld from the hub) go to the user as well, also when the hub fails.
+ * token withheld from the hub, a .hub.json in git) go to the user as well,
+ * also when the hub fails or there is no identity.
  */
 export async function digestHook(io: HookIO): Promise<HookOutcome> {
   const input = parseInput(io.stdin) ?? {};
@@ -351,14 +354,14 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
   } catch (err) {
     return problem(`agenthub: configuration error (${inline((err as Error).message, 200)}). Edits in this checkout are blocked until it is fixed.`);
   }
+  const warning = cfg.warnings.map((w) => `agenthub: ${inline(w, 400)}`).join('\n');
+  const also = warning ? `\n${warning}` : '';
   if (!cfg.agent) {
     return problem(
-      'agenthub: this checkout has no agent identity, so your edits are not coordinated with the team. Ask your human to run `hub init --agent <human>/<agent>` here.',
+      `agenthub: this checkout has no agent identity, so your edits are not coordinated with the team. Ask your human to run \`hub init --agent <human>/<agent>\` here.${also}`,
     );
   }
   const client = hookClient(cfg);
-  const warning = cfg.warnings.map((w) => `agenthub: ${inline(w, 400)}`).join('\n');
-  const also = warning ? `\n${warning}` : '';
   try {
     await client.heartbeat({ client: 'claude-code', branch: cfg.root ? (currentBranch(cfg.root) ?? undefined) : undefined, worktree: cfg.root ?? undefined });
     const status = await client.status();

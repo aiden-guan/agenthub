@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { AGENT_ID_RE, CONFIG_FILE_NAME, TEAM_CONFIG_FILE_NAME, parseConfigFile, readConfigFile, type ConfigFile } from './config.js';
+import { AGENT_ID_RE, CONFIG_FILE_NAME, DEFAULT_URL, TEAM_CONFIG_FILE_NAME, parseConfigFile, readConfigFile, sameHub, type ConfigFile } from './config.js';
 import { deriveProject, git, gitRaw, recordedSettings } from './git.js';
 
 export interface InitOptions {
@@ -86,7 +86,16 @@ export function init(opts: InitOptions): string[] {
   // checkout recorded is only replaced on purpose (--project, --url).
   const record: Array<[key: 'project' | 'url', value: string]> = [];
   if (team.project && (!recorded.project || (opts.project && recorded.project !== team.project))) record.push(['project', team.project]);
-  if (team.url && (!recorded.url || (opts.url && recorded.url !== team.url))) record.push(['url', team.url]);
+  // A recorded url gets this machine's hub token (see loadConfig). A branch can change agenthub.json,
+  // so without --url one is recorded only if the team's own copy names the same hub.
+  const disputed = team.url && !recorded.url && !opts.url ? otherTeamHub(root, team.url) : null;
+  if (team.url && !disputed && (!recorded.url || (opts.url && recorded.url !== team.url))) record.push(['url', team.url]);
+  if (disputed) {
+    notes.push(
+      `note: this checkout's ${TEAM_CONFIG_FILE_NAME} names hub ${team.url}, but ${disputed.where} names ${disputed.url}, so ${team.url} was not recorded as the repository's hub ` +
+        `and this machine's hub token is not sent to it. If it is your team's hub, run \`hub init --url ${team.url}\`.`,
+    );
+  }
   const written = record.filter(([key, value]) => git(root, ['config', '--local', `agenthub.${key}`, value]) !== null);
   if (written.length) report.push(`recorded ${written.map(([k, v]) => `${k} ${v}`).join(', ')} in the repository's git config, for worktrees whose branch has no ${TEAM_CONFIG_FILE_NAME} yet`);
   if (recorded.project && team.project && recorded.project !== team.project && !opts.project) {
@@ -167,21 +176,28 @@ export function init(opts: InitOptions): string[] {
   return [...(report.length ? report : ['already set up; nothing to change']), ...notes];
 }
 
-/** The project (and hub URL) the other worktrees' agenthub.json files agree on; throws if they don't. */
-function siblingTeamConfig(root: string): ConfigFile | null {
+/** The agenthub.json files (with a project) of the repository's other worktrees. */
+function siblingTeamConfigs(root: string): Array<{ file: string; config: ConfigFile }> {
   const out = git(root, ['worktree', 'list', '--porcelain']) ?? '';
-  const found: ConfigFile[] = [];
+  const found: Array<{ file: string; config: ConfigFile }> = [];
   for (const line of out.split('\n')) {
     if (!line.startsWith('worktree ')) continue;
     const dir = line.slice('worktree '.length);
     if (path.resolve(dir) === path.resolve(root)) continue;
+    const file = path.join(dir, TEAM_CONFIG_FILE_NAME);
     try {
-      const f = readConfigFile(path.join(dir, TEAM_CONFIG_FILE_NAME));
-      if (f?.project) found.push(f);
+      const f = readConfigFile(file);
+      if (f?.project) found.push({ file, config: f });
     } catch {
       // unreadable there: that checkout will report it itself
     }
   }
+  return found;
+}
+
+/** The project (and hub URL) the other worktrees' agenthub.json files agree on; throws if they don't. */
+function siblingTeamConfig(root: string): ConfigFile | null {
+  const found = siblingTeamConfigs(root).map((s) => s.config);
   const projects = [...new Set(found.map((f) => f.project))];
   if (projects.length > 1) throw new Error(`the worktrees' ${TEAM_CONFIG_FILE_NAME} files name different projects (${projects.join(', ')}); run hub init --project ID`);
   return found.find((f) => f.url) ?? found[0] ?? null;
@@ -202,6 +218,23 @@ function upstreamTeamConfig(root: string): ConfigFile | null {
     } catch {
       // unreadable there: keep looking, then derive (and say so)
     }
+  }
+  return null;
+}
+
+/**
+ * Where the team's own agenthub.json names a hub other than `url`: the one on
+ * origin's default branch, or, in a repository without one, any of the other
+ * worktrees'. Null when they agree, or when there is nothing to compare with.
+ */
+function otherTeamHub(root: string, url: string): { where: string; url: string } | null {
+  const upstream = upstreamTeamConfig(root);
+  const copies = upstream
+    ? [{ where: `the ${TEAM_CONFIG_FILE_NAME} on origin's default branch`, config: upstream }]
+    : siblingTeamConfigs(root).map((s) => ({ where: s.file, config: s.config }));
+  for (const { where, config } of copies) {
+    const hub = config.url ?? DEFAULT_URL;
+    if (!sameHub(hub, url)) return { where, url: hub };
   }
   return null;
 }

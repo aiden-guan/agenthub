@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { deriveProject, findRepoRoot, recordedSettings } from './git.js';
+import { deriveProject, findRepoRoot, isTracked, recordedSettings } from './git.js';
 
 export const DEFAULT_URL = 'http://127.0.0.1:7077';
 /** Per-worktree, never committed: agent identity, token, local overrides. */
@@ -51,12 +51,12 @@ export interface HubConfig {
  * checkout whose branch doesn't have that file yet, the project and URL
  * `hub init` recorded in the repository's git config), then the local
  * `<worktree>/.hub.json`, then environment variables HUB_URL, HUB_AGENT,
- * HUB_PROJECT, HUB_TOKEN, HUB_FAIL_CLOSED, HUB_TIMEOUT_MS. A token in the
- * committed file is ignored, and a token from elsewhere goes only to the hub it
- * was set up for (see tokenFor). Throws on a value it can't read exactly (a
- * malformed file, a wrong type, an unrecognised HUB_FAIL_CLOSED, an
- * out-of-range HUB_TIMEOUT_MS): the hooks and guard block on that instead of
- * running with a setting nobody asked for.
+ * HUB_PROJECT, HUB_TOKEN, HUB_FAIL_CLOSED, HUB_TIMEOUT_MS. An agent or token in
+ * the committed file (or in a .hub.json that git tracks) is ignored, and a
+ * token from elsewhere goes only to the hub it was set up for (see tokenFor).
+ * Throws on a value it can't read exactly (a malformed file, a wrong type, an
+ * unrecognised HUB_FAIL_CLOSED, an out-of-range HUB_TIMEOUT_MS): the hooks and
+ * guard block on that instead of running with a setting nobody asked for.
  */
 export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): HubConfig {
   const env = opts.env ?? process.env;
@@ -66,10 +66,13 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
   if (root) sources.push([path.join(root, TEAM_CONFIG_FILE_NAME), null], [path.join(root, CONFIG_FILE_NAME), null]);
   for (const entry of sources) entry[1] = readConfigFile(entry[0]);
   // The committed file is shared by everyone: identity and secrets never come from it.
+  // Nor from a .hub.json a branch committed: checking it out replaced this worktree's own.
   const team = root ? sources[1][1] : null;
-  if (team) {
-    delete team.agent;
-    delete team.token;
+  const committedLocal = root && sources[2][1] && isTracked(root, CONFIG_FILE_NAME) ? sources[2][1] : null;
+  for (const f of [team, committedLocal]) {
+    if (!f) continue;
+    delete f.agent;
+    delete f.token;
   }
   // A branch made before agenthub.json was committed has no copy of it, but the
   // pre-commit guard runs there too: use what `hub init` recorded for every worktree.
@@ -84,7 +87,15 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
   const url = (env.HUB_URL || file.url || DEFAULT_URL).replace(/\/+$/, '');
   if (!/^https?:\/\/[^/]/.test(url) || !URL.canParse(url)) throw new Error(`hub URL ${JSON.stringify(url)} is invalid; use http://host:port`);
   const warnings: string[] = [];
-  const local = root ? files[2] : null;
+  if (committedLocal) {
+    warnings.push(
+      `${sources[2][0]} is tracked by git, so it is shared like ${TEAM_CONFIG_FILE_NAME}, not this worktree's own: an agent or token in it is ignored. ` +
+        `${CONFIG_FILE_NAME} must stay out of git: on a branch of yours, run \`git rm --cached ${CONFIG_FILE_NAME}\`, check what is in it, and run \`hub init --agent <human>/<agent>\`.`,
+    );
+  }
+  const local = root && !committedLocal ? files[2] : null;
+  // The committed file the url comes from, unless something on this machine overrides it.
+  const urlFrom = committedLocal?.url ? sources[2][0] : team?.url ? sources[1][0] : null;
   const token = tokenFor(
     url,
     [
@@ -92,7 +103,7 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
       { token: local?.token, url: local?.url, from: root ? sources[2][0] : '' },
       { token: files[0].token, url: files[0].url, from: sources[0][0] },
     ],
-    root && team?.url && !env.HUB_URL && !local?.url ? { file: sources[1][0], root, globalUrl: files[0].url } : null,
+    root && urlFrom && !env.HUB_URL && !local?.url ? { file: urlFrom, root, globalUrl: files[0].url } : null,
     warnings,
   );
   const localFile = root ? sources[2] : null;
@@ -129,10 +140,11 @@ export function loadConfig(opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {})
  * come highest precedence first, each with the url set beside it (in the same
  * file; HUB_URL for HUB_TOKEN), and a token set with a url is for that hub
  * alone. One set on its own is for a hub this machine chose: any url but one
- * that only the committed agenthub.json names (`teamOnly`), unless it is also
- * the global file's url, the default, or the one `hub init` recorded for the
- * repository. A checked-out branch can change agenthub.json; it must not be
- * able to send this machine's token to a host of its choosing.
+ * that only a committed file (agenthub.json, or a .hub.json in git) names
+ * (`teamOnly`), unless it is also the global file's url, the default, or the
+ * one `hub init` recorded for the repository. A checked-out branch can change
+ * those files; it must not be able to send this machine's token to a host of
+ * its choosing.
  */
 function tokenFor(
   url: string,
@@ -157,7 +169,7 @@ function tokenFor(
 }
 
 /** Whether two hub URLs name the same hub, however they are spelled (case, default port, trailing slash). */
-function sameHub(a: string | undefined, b: string): boolean {
+export function sameHub(a: string | undefined, b: string): boolean {
   const norm = (u: string) => (URL.canParse(u) ? new URL(u).href : u).replace(/\/+$/, '');
   return !!a && norm(a) === norm(b);
 }

@@ -1,7 +1,7 @@
 import { parseArgs } from 'node:util';
 import type { TaskStatus } from '@agenthub/hub/protocol';
-import { HubClient } from './client.js';
-import { loadConfig } from './config.js';
+import { HubApiError, HubClient } from './client.js';
+import { loadConfig, type HubConfig } from './config.js';
 import { claimFiles, formatDecision, formatMessage, formatTask, statusText, UNTRUSTED_NOTE } from './format.js';
 import { currentBranch, headCommit, toRepoPath } from './git.js';
 import { adoptClaims } from './pending.js';
@@ -13,6 +13,18 @@ const fail = (stderr: string, exitCode = 1): HookOutcome => ({ stdout: '', stder
 /** Commands people run by hand (`hub status`, `hub task add ...`). Same API as the MCP tools. */
 export async function human(cmd: string, argv: string[]): Promise<HookOutcome> {
   const cfg = loadConfig();
+  try {
+    return await command(cfg, cmd, argv);
+  } catch (err) {
+    // A token the config withheld from this hub comes back as an auth error: say why.
+    if (err instanceof HubApiError && (err.status === 401 || err.status === 403) && cfg.warnings.length) {
+      return fail([`hub: ${err.message}`, ...cfg.warnings.map((w) => `hub: warning: ${w}`)].join('\n'));
+    }
+    throw err;
+  }
+}
+
+async function command(cfg: HubConfig, cmd: string, argv: string[]): Promise<HookOutcome> {
   const client = new HubClient(cfg);
   const need = () => {
     if (!cfg.agent) throw new Error('no agent identity: set HUB_AGENT=human/agent or run `hub init --agent human/agent`');

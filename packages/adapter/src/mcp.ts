@@ -46,7 +46,11 @@ type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: bo
 function errorText(err: unknown, cfg: HubConfig): string {
   if (err instanceof ToolError) return err.message;
   if (err instanceof HubUnavailableError) return `${err.message}. Coordination is unavailable right now; tell your human if this persists.`;
-  if (err instanceof HubApiError) return `hub refused: ${err.message} (${err.code})`;
+  if (err instanceof HubApiError) {
+    // A token the config withheld from this hub comes back as an auth error: say why.
+    const why = err.status === 401 || err.status === 403 ? cfg.warnings.map((w) => ` ${w}`).join('') : '';
+    return `hub refused: ${err.message} (${err.code})${why}`;
+  }
   return `unexpected error talking to the hub at ${cfg.url}: ${(err as Error).message}`;
 }
 

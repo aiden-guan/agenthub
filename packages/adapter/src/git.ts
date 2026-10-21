@@ -93,6 +93,11 @@ export function isIgnored(file: string, root: string): boolean {
   return false;
 }
 
+/** Whether `repoPath` (relative to `root`) is in the index: committed, or staged to be. */
+export function isTracked(root: string, repoPath: string): boolean {
+  return git(root, ['ls-files', '--', repoPath]) === repoPath;
+}
+
 function checkIgnore(root: string, repoPath: string): boolean {
   try {
     execFileSync('git', ['check-ignore', '-q', '--', repoPath], { cwd: root, stdio: 'ignore', timeout: 3000 });

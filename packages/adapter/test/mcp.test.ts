@@ -7,7 +7,7 @@ import { HubClient } from '../src/client.js';
 import type { HubConfig } from '../src/config.js';
 import { Feed } from '../src/feed.js';
 import { createMcpServer } from '../src/mcp.js';
-import { A, B, PROJECT, hubCli, makeRepo, preToolUseInput, sessionEventInput, sleep, startHub, testEnv, type SampleRepo } from './helpers.js';
+import { A, B, PROJECT, failingHub, hubCli, makeRepo, preToolUseInput, sessionEventInput, sleep, startHub, testEnv, type SampleRepo } from './helpers.js';
 
 const TOOLS = ['claim', 'decide', 'hub_post', 'hub_status', 'hub_wait', 'inbox', 'land', 'release', 'task_create', 'task_list', 'task_take'];
 
@@ -131,6 +131,24 @@ describe('hub mcp', () => {
     await a.call('decide', { summary: 'Use argon2id for password hashing', rationale: 'OWASP', files: ['src/auth.ts'] });
     const status = await a.call('hub_status');
     expect(status.text).toMatch(/D-\d+ · maya\/claude-1 · just now: "Use argon2id for password hashing" \[src\/auth\.ts\]/);
+  });
+
+  it('says why the hub rejected its credentials when the config withheld the token', async () => {
+    const hub = await failingHub(401, 'unauthorized', 'missing or wrong bearer token');
+    const warning = 'the hub token from HUB_TOKEN is not sent to http://127.0.0.1:1: only the committed agenthub.json names that hub.';
+    const cfg: HubConfig = { url: hub.url, agent: A, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root: repo.wtA, configFiles: [], projectSource: 'file', warnings: [warning] };
+    const server = createMcpServer({ cfg, client: new HubClient(cfg), feed: null, cwd: repo.wtA });
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const mcp = new Client({ name: 'test', version: '0' });
+    await mcp.connect(clientSide);
+    cleanups.push(async () => {
+      await mcp.close();
+      await hub.close();
+    });
+    const res = (await mcp.callTool({ name: 'hub_status', arguments: {} })) as { content: Array<{ text: string }>; isError?: boolean };
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toBe(`hub refused: missing or wrong bearer token (unauthorized) ${warning}`);
   });
 
   it('refuses to act without an agent identity', async () => {

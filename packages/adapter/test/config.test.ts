@@ -92,6 +92,33 @@ describe('config', () => {
     expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ url: 'http://attacker:8080', token: 'LOCAL-SECRET', warnings: [] });
   });
 
+  it('treats a .hub.json that git tracks like agenthub.json: no agent or token from it, and no token set on this machine for a hub only it names', () => {
+    const root = path.join(dir, 'tracked-local');
+    mkdirSync(root);
+    git(root, 'init', '-q');
+    git(root, 'config', 'agenthub.url', 'https://hub.company'); // recorded by hub init
+    writeFileSync(path.join(root, 'agenthub.json'), JSON.stringify({ project: 'co/app', url: 'https://hub.company' }));
+    // A branch committed a .hub.json; checking it out replaced this worktree's own (git overwrites an ignored file).
+    writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'maya/claude-1', token: 'committed', url: 'http://attacker:8080' }));
+    git(root, 'add', '-f', '.hub.json');
+    const urlless = path.join(dir, 'global-urlless.json');
+    writeFileSync(urlless, JSON.stringify({ token: 'GLOBAL-SECRET' }));
+    for (const env of [{ ...noGlobal, HUB_TOKEN: 'ENV-SECRET' }, { HUB_CONFIG: urlless }]) {
+      const cfg = loadConfig({ cwd: root, env });
+      expect(cfg).toMatchObject({ url: 'http://attacker:8080', agent: null, token: null });
+      expect(cfg.warnings).toEqual([
+        expect.stringMatching(/\.hub\.json is tracked by git, so it is shared like agenthub\.json, not this worktree's own: an agent or token in it is ignored.*git rm --cached \.hub\.json/),
+        expect.stringMatching(/is not sent to http:\/\/attacker:8080: only the committed .*\.hub\.json names that hub/),
+      ]);
+    }
+    // The hub this machine chose still gets its token; the identity still doesn't come from the file.
+    writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'maya/claude-1', url: 'https://hub.company' }));
+    expect(loadConfig({ cwd: root, env: { ...noGlobal, HUB_TOKEN: 'ENV-SECRET' } })).toMatchObject({ agent: null, token: 'ENV-SECRET' });
+    // Out of git, it is this worktree's own again.
+    git(root, 'rm', '-q', '--cached', '-f', '.hub.json');
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ agent: 'maya/claude-1', warnings: [] });
+  });
+
   it('rejects malformed agent ids', () => {
     const root = repo('bad', {});
     expect(() => loadConfig({ cwd: root, env: { ...noGlobal, HUB_AGENT: 'just-a-name' } })).toThrow(/human\/agent/);

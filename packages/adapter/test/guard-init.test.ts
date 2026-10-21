@@ -2,6 +2,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync }
 import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { loadConfig } from '../src/config.js';
 import { stagedPaths } from '../src/git.js';
 import { PRE_EDIT_MATCHER as EDIT_MATCHER, guardScript, init, splitCommand } from '../src/init.js';
 import {
@@ -380,6 +381,85 @@ describe('the hub token goes only to a hub this machine set up, whatever a check
     expect(denied.permissionDecisionReason).toMatch(warning);
     expect(JSON.parse(digest.stdout).systemMessage).toMatch(warning);
     expect(status.code).not.toBe(0);
+    expect(status.stderr).toMatch(/missing or wrong bearer token/);
+    expect(status.stderr).toMatch(warning);
+  });
+
+  it('withholds it from a hub that only a .hub.json committed on a branch names, and takes no identity from that file', async () => {
+    const x = makeRepo();
+    try {
+      init({ cwd: x.wtB, agent: B, project: PROJECT, url: company.url, command: CLI_COMMAND, hooks: false, mcp: false });
+      // A pull request's branch commits a .hub.json naming another hub, and someone else's identity.
+      writeFileSync(path.join(x.wtA, '.hub.json'), JSON.stringify({ agent: A, url: other.url }));
+      git(x.wtA, 'add', '-f', '.hub.json');
+      git(x.wtA, 'commit', '-q', '-m', 'pr: add .hub.json');
+      // Checking it out replaces sam's own .hub.json, which git ignores, without a word.
+      git(x.wtB, 'checkout', '-q', '--detach', 'agent-a');
+      expect(JSON.parse(readFileSync(path.join(x.wtB, '.hub.json'), 'utf8'))).toEqual({ agent: A, url: other.url });
+
+      const tokenEnv = env({ HUB_TOKEN: 's3cret' });
+      writeFileSync(path.join(x.wtB, 'src', 'auth.ts'), 'export const login = () => "b";\n');
+      git(x.wtB, 'add', 'src/auth.ts');
+      seen.length = 0;
+      const guarded = await run('git', ['commit', '-q', '-m', 'auth'], { cwd: x.wtB, env: tokenEnv });
+      const edit = await hubCli(['hook', 'pre-edit'], { cwd: x.wtB, env: tokenEnv, input: preToolUseInput(x.wtB, path.join(x.wtB, 'src', 'users.ts')) });
+      const digest = await hubCli(['hook', 'digest'], { cwd: x.wtB, env: tokenEnv, input: JSON.stringify({ cwd: x.wtB, hook_event_name: 'SessionStart' }) });
+      const status = await hubCli(['status'], { cwd: x.wtB, env: tokenEnv });
+      expect(seen.length).toBeGreaterThanOrEqual(2); // the guard's check and hub status
+      expect(seen.filter((auth) => auth !== null)).toEqual([]);
+
+      const tracked = /\.hub\.json is tracked by git, so it is shared like agenthub\.json, not this worktree's own: an agent or token in it is ignored/;
+      expect(guarded.code).not.toBe(0);
+      expect(guarded.stderr).toMatch(/rejected this agent's credentials/);
+      expect(guarded.stderr).toMatch(tracked);
+      expect(JSON.parse(edit.stdout).systemMessage).toMatch(tracked);
+      expect(JSON.parse(digest.stdout).systemMessage).toMatch(/no agent identity[\s\S]*tracked by git/);
+      expect(status.stderr).toMatch(/hub token from HUB_TOKEN is not sent to http:\/\/127\.0\.0\.1:\d+: only the committed .*\.hub\.json names that hub/);
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it("makes a plain hub init record a hub url only when the team's own agenthub.json names the same hub", () => {
+    const x = makeRepo();
+    const companyUrl = 'https://hub.company.invalid';
+    const otherUrl = 'http://attacker.invalid:8080';
+    const recordedUrl = (cwd: string) => git(cwd, 'config', '--local', '--default', '(none)', 'agenthub.url').trim();
+    const opts = { command: CLI_COMMAND, hooks: false, mcp: false, guard: false, env: {} };
+    try {
+      // Set up by an older hub init, which recorded nothing in the git config; a pull request points agenthub.json elsewhere.
+      writeFileSync(path.join(x.main, 'agenthub.json'), JSON.stringify({ project: PROJECT, url: companyUrl }));
+      git(x.main, 'add', 'agenthub.json');
+      git(x.main, 'commit', '-q', '-m', 'agenthub setup');
+      git(x.main, 'checkout', '-q', '-b', 'pr-7');
+      writeFileSync(path.join(x.main, 'agenthub.json'), JSON.stringify({ project: PROJECT, url: otherUrl }));
+      git(x.main, 'commit', '-q', '-am', 'pr: point at another hub');
+      git(x.main, 'checkout', '-q', 'main');
+      const pr = path.join(x.dir, 'pr-7');
+      git(x.main, 'worktree', 'add', '-q', pr, 'pr-7');
+
+      // The README's per-worktree step, run in the pull request's worktree.
+      const report = init({ cwd: pr, agent: 'sam/claude-2', ...opts }).join('\n');
+      expect(report).toMatch(/note: this checkout's agenthub\.json names hub http:\/\/attacker\.invalid:8080, but .*sample\/agenthub\.json names https:\/\/hub\.company\.invalid, so .* was not recorded/);
+      expect(report).toMatch(/hub init --url http:\/\/attacker\.invalid:8080/);
+      expect(recordedUrl(x.main)).toBe('(none)');
+      expect(loadConfig({ cwd: pr, env: { HUB_CONFIG: '/nonexistent.json', HUB_TOKEN: 'ENV-SECRET' } })).toMatchObject({ url: otherUrl, token: null });
+      // Chosen on purpose, it is recorded.
+      init({ cwd: x.main, url: companyUrl, ...opts });
+      expect(recordedUrl(x.main)).toBe(companyUrl);
+
+      // A fresh clone has nothing recorded: origin's default branch says which hub is the team's.
+      const clone = path.join(x.dir, 'lee');
+      git(x.dir, 'clone', '-q', x.main, clone);
+      expect(init({ cwd: clone, agent: 'lee/claude-1', ...opts }).join('\n')).not.toMatch(/not recorded/);
+      expect(recordedUrl(clone)).toBe(companyUrl);
+      const prClone = path.join(x.dir, 'lee-pr');
+      git(x.dir, 'clone', '-q', '-b', 'pr-7', x.main, prClone);
+      expect(init({ cwd: prClone, agent: 'lee/claude-2', ...opts }).join('\n')).toMatch(/but the agenthub\.json on origin's default branch names https:\/\/hub\.company\.invalid/);
+      expect(recordedUrl(prClone)).toBe('(none)');
+    } finally {
+      x.cleanup();
+    }
   });
 
   it('sends it there once someone chooses that hub on this machine (hub init --url)', async () => {
