@@ -4,18 +4,19 @@
 //
 // S1: MAPPER_VERSION, languageFor and outline (TypeScript, TSX, JavaScript).
 // S2: outline for Python, Go, Rust and Java.
-// The rest is implemented by steps S3–S4 and throws until then.
+// S3: applyEdit (and applyEdits for MultiEdit) and changedSymbols.
+// The rest is implemented by step S4 and throws until then.
 
+import { changedSymbolsWith } from './diff.js';
+import { applyEdit as applyTextEdit, applyEdits } from './edit.js';
 import { languageFor as languageOf } from './languages/index.js';
 import { outlineWith } from './outline.js';
-import { defaultRuntime, MANIFEST_SHA256 } from './runtime.js';
+import { defaultRuntime, MAPPER_VERSION } from './runtime.js';
 import type { Symbols } from './types.js';
 
 export type * from './types.js';
 export { SymbolsError } from './errors.js';
-
-/** Rule version, grammar and runtime package versions, and the grammar manifest's hash: bumps with any rule or grammar change. */
-export const MAPPER_VERSION = `sym1;vtsw0.3.1;wts0.27.0;${MANIFEST_SHA256.slice(0, 8)}`;
+export { MAPPER_VERSION, applyEdits };
 
 function notImplemented(): never {
   throw new Error('not implemented');
@@ -23,8 +24,8 @@ function notImplemented(): never {
 
 export const languageFor: Symbols['languageFor'] = languageOf;
 export const outline: Symbols['outline'] = (source, language) => outlineWith(defaultRuntime, source, language);
-export const applyEdit: Symbols['applyEdit'] = notImplemented;
-export const changedSymbols: Symbols['changedSymbols'] = notImplemented;
+export const applyEdit: Symbols['applyEdit'] = applyTextEdit;
+export const changedSymbols: Symbols['changedSymbols'] = (path, before, after, o) => changedSymbolsWith(defaultRuntime, path, before, after, o);
 export const referencesIn: Symbols['referencesIn'] = notImplemented;
 export const identifierIndex: Symbols['identifierIndex'] = notImplemented;
 export const freeKeys: Symbols['freeKeys'] = notImplemented;

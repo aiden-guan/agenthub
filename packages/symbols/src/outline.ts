@@ -35,8 +35,20 @@ import { blankLineBetween, lineStarts, sameLine, trimEnd } from './text.js';
 import type { GrammarRuntime } from './runtime.js';
 import type { Item, LanguageId, Outline } from './types.js';
 
-/** Outline `source` with the grammars of `runtime`. Rejects with SymbolsError('grammar_unverified') when the grammar failed its integrity check. */
-export async function outlineWith(runtime: GrammarRuntime, source: string, language: LanguageId): Promise<Outline> {
+/** What the diff needs to know about an item beyond `Item` (kept out of the frozen type). */
+export interface ItemDetail {
+  /** Built from a declaration with members (a class, namespace, impl, trait, Java type, Python class): its `text` is a shell. */
+  container: boolean;
+  /** The declaration's body (UTF-16 offsets), for rename detection; null when it has none. */
+  body: [number, number] | null;
+}
+
+/**
+ * Outline `source` with the grammars of `runtime`. Rejects with
+ * SymbolsError('grammar_unverified') when the grammar failed its integrity
+ * check. With `details`, records an ItemDetail for every item it builds.
+ */
+export async function outlineWith(runtime: GrammarRuntime, source: string, language: LanguageId, details?: Map<Item, ItemDetail>): Promise<Outline> {
   const spec = SPECS[language];
   if (!spec) throw new Error(`@agenthub/symbols: no outline table for language ${String(language)}`);
   const grammar = await runtime.load(language);
@@ -44,7 +56,7 @@ export async function outlineWith(runtime: GrammarRuntime, source: string, langu
   const tree = grammar.parser.parse(source);
   if (!tree) throw new Error(`@agenthub/symbols: the ${language} parser returned no tree`);
   try {
-    return extract(tree.rootNode, source, spec);
+    return extract(tree.rootNode, source, spec, details);
   } finally {
     tree.delete();
   }
@@ -58,6 +70,7 @@ interface Ctx {
   bodies: Map<number, string>;
   /** Node id → the key whose body its children from `from` on are (`Decl.region`). */
   regions: Map<number, { from: number; key: string }>;
+  details: Map<Item, ItemDetail> | undefined;
 }
 
 /** One stretch of a scope: a declaration's item, an import group, or other content. */
@@ -71,8 +84,8 @@ interface Element {
   delimiter?: boolean;
 }
 
-export function extract(root: Node, src: string, spec: LanguageSpec): Outline {
-  const ctx: Ctx = { src, spec, lines: lineStarts(src), bodies: new Map(), regions: new Map() };
+export function extract(root: Node, src: string, spec: LanguageSpec, details?: Map<Item, ItemDetail>): Outline {
+  const ctx: Ctx = { src, spec, lines: lineStarts(src), bodies: new Map(), regions: new Map(), details };
   const items: Item[] = [];
   for (const el of scanScope(root, 'top', null, ctx)) {
     if (el.kind === 'item') {
@@ -198,7 +211,7 @@ function buildItem(el: Element, ctx: Ctx): Item {
   }
   if (d.body) ctx.bodies.set(d.body.id, key);
   if (d.region) ctx.regions.set(d.region.node.id, { from: d.region.from, key });
-  return {
+  const item: Item = {
     key,
     kind: d.kind,
     start: el.start,
@@ -209,6 +222,11 @@ function buildItem(el: Element, ctx: Ctx): Item {
     signature: d.signature ? signatureText(ctx.src, d.signature, ctx.spec) : null,
     members,
   };
+  if (ctx.details) {
+    const body: [number, number] | null = d.body ? [d.body.startIndex, d.body.endIndex] : d.region ? [d.region.from, d.region.node.endIndex] : null;
+    ctx.details.set(item, { container: Boolean(d.members), body });
+  }
+  return item;
 }
 
 /**

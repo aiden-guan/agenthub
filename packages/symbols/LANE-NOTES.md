@@ -169,3 +169,93 @@ Measured here (Node 22, warm `outline` of a ~2000-line file): Python 25 ms,
 Go 18 ms, Rust 25 ms, Java 29 ms, TypeScript 25 ms. Random-edit fuzzing of all
 seven fixtures (28,000 edits, scratch script, not committed) found no outline
 that breaks the structural guarantees `expectWellFormed` checks.
+
+## S3: edit mapping (applyEdit, changedSymbols)
+
+Files: `src/edit.ts` (`applyEdit`, and `applyEdits` for MultiEdit), `src/diff.ts`
+(`changedSymbols`), with small additions to `src/outline.ts` (an optional
+`ItemDetail` map: which items are containers, and each declaration's body
+span), `src/runtime.ts` (`MAPPER_VERSION` now lives here so `diff.ts` can use
+it; `index.ts` re-exports it, unchanged), `src/signatures.ts` (`truncate`
+exported) and `src/index.ts`. No contract amendments and no dependency
+requests.
+
+For lane A (pre-edit, post-edit, guard) and lane L (admission, landed changes):
+
+- **`applyEdit`** mirrors the Edit tool: old_string must occur, counted left to
+  right without overlaps (the tool splits on it); exactly one occurrence
+  without `replace_all`, every one with it; `old_string === new_string` fails;
+  an empty old_string only fills an empty or blank file; new_string is
+  literal (no `$&`). One quirk of the tool is mirrored too: deleting text that
+  doesn't end with a newline (empty new_string), when the file holds it
+  followed by one, deletes that newline as well. Not mirrored: the tool's
+  curly-quote and line-ending tolerance. Such an edit returns null here, so the
+  hook claims the file (`edit_not_applicable`), and post-edit re-reads and maps
+  what was actually written.
+- **`applyEdits(before, edits)`** (MultiEdit) is a named export of the package,
+  not part of the frozen `Symbols` interface: the edits in order, each on the
+  result of the one before, null if any fails.
+- **Fallback order:** `unsupported_language`, `excluded` (contract
+  `matchesAny(path, exclude)`, the path as given: repo-relative, forward
+  slashes), then the null sides (`new_file`, `deleted_file`), `too_large` (over
+  1 MiB in UTF-8 bytes on either side), `binary` (a NUL among the first 8192
+  characters of either side), `grammar_unverified`, `parse_error`.
+  `disabled`, `whole_file_write` and `notebook` are the callers' to return.
+  Identical sides, both null included, give an empty symbol-level diff.
+  Errors other than `SymbolsError` (a parser failure) propagate: treat a throw
+  as file level.
+- **Changed keys** are the union of the design's rules, with moves detected at
+  *every* level, not only the top. Inside a pair of matched containers the
+  member keys are aligned by LCS too, otherwise reordering two methods would
+  claim nothing but `@toplevel` while their text moved. Each run of a
+  container's own text between two members (a computed member, a stray
+  statement) takes part in that alignment as an element of the container's.
+  Every matched pair is compared by its exact span text, and a container by
+  its shell. Shells are compared as S1 builds them.
+- **A key whose container is also claimed is dropped** (`Session` covers
+  `Session.refresh`, by `entryCovers`, and conflicts with every claim on it).
+  So a class rename is 2 keys (`Session`, `Store`), not 2 × (1 + members).
+- **`errorKeys` of both sides are claimed**, a pre-existing contained error
+  included (§2.4 step 4).
+- **`@toplevel`** is returned for a whitespace-only change even when neither
+  side has a `@toplevel` item.
+- **`maxSymbols`** defaults to 12; `Infinity` disables the limit. Keys are listed
+  in source order: `before`'s, then those only `after` has.
+- **The LCS** matches the common prefix and suffix directly, then aligns the
+  middle by dynamic programming up to 4M cells. Beyond that (thousands of items
+  between two far-apart edits in a huge file), the middle counts as moved: all
+  claimed, so in practice `too_many_symbols`.
+- **`signatureChanges`.** A key's signature is its items' signatures joined with
+  `\n` (TS overloads; a Rust struct and its impls, which share the key). The
+  joined texts are compared whole, and each reported text is cut to 500
+  characters (an ellipsis last), as the hub's `SymbolChangeInput` requires.
+  `renamed` compares the declaration *body* (the table's body node: a function
+  body, an initializer, a class body, a Python definition after its `:`),
+  whitespace collapsed. So a rename that also changes the parameters is still a
+  rename, with the new signature as `after`. A key with no body is never a
+  rename candidate. The members of a renamed class are reported as renamed too
+  (`Session.refresh` → `Store.refresh`) when their bodies are unique.
+- **The property test** (`test/mapping-property.test.ts`) checks the §1.10
+  invariant in an alignment-free form: on each side, blank out the returned
+  keys' spans (a container's covering its members) and the gap whitespace
+  (between top-level items, and between a container's members); the remaining
+  text must be identical. A fixed alignment (common prefix and suffix) would
+  blame a declaration the edit merely shifted. The generator inserts, deletes
+  and replaces lines (from the fixture and per-language snippets), moves runs
+  of lines and whole declarations (top level or members), and edits a few
+  characters, starting from the fixture or from an already edited version. It
+  runs 500 seeded edits per fixture in CI (about 10 s). It also passed at 5,000
+  per fixture (35,000 edits, about half of them symbol-level), and it fails when
+  move detection, the member recursion or the `@toplevel` rule is disabled.
+  The own-text runs are covered by a unit test in `diff.test.ts`, since random
+  edits rarely produce that shape. `SYMBOLS_PROPERTY_SEED=<n>` replays a case,
+  and `SYMBOLS_PROPERTY_EDITS=<n>` changes the count.
+- **Performance, measured here** (Node 22, a generated 2000-line TS file, one
+  body edit): a cold first `changedSymbols` (import, init, grammar, two
+  outlines) takes about 390 ms, and a warm one 75 ms median (90 ms p95). Of
+  the warm time, the diff itself (`diffSides`) is about 2 ms. The rest is two
+  full outlines (parse about 10–25 ms each, plus extraction, mostly
+  signatures). S4's budgets (< 150 ms p95 cold, < 20 ms warm) need what S1's
+  notes propose: an incremental reparse of `after` from `before`'s tree, and
+  signatures computed only for the keys that changed. `diffSides(b, a, max)`
+  takes already-outlined sides, so S4 can feed it whatever outlines it caches.

@@ -135,7 +135,8 @@ function spaceBefore(tokens: Token[], i: number, binaryOps: ReadonlySet<string>)
   return false;
 }
 
-function truncate(s: string): string {
+/** `s` cut to MAX_SIGNATURE characters (the last one an ellipsis), never inside a surrogate pair. */
+export function truncate(s: string): string {
   if (s.length <= MAX_SIGNATURE) return s;
   let cut = s.slice(0, MAX_SIGNATURE - 1);
   const last = cut.charCodeAt(cut.length - 1);

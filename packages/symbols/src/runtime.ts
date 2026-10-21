@@ -38,6 +38,9 @@ export const MANIFEST: GrammarManifest = JSON.parse(MANIFEST_TEXT) as GrammarMan
 /** sha256 of the manifest's canonical JSON (its parsed value, re-serialized), so line endings or indentation don't change it. */
 export const MANIFEST_SHA256 = sha256(JSON.stringify(MANIFEST));
 
+/** Rule version, grammar and runtime package versions, and the grammar manifest's hash: bumps with any rule or grammar change. */
+export const MAPPER_VERSION = `sym1;vtsw0.3.1;wts0.27.0;${MANIFEST_SHA256.slice(0, 8)}`;
+
 export type GrammarStatus = 'unloaded' | 'ready' | 'unverified';
 
 export interface Grammar {
