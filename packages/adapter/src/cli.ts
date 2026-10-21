@@ -7,7 +7,7 @@ const HELP = `hub — agenthub adapter
 
 Agent integration
   hub mcp                    Run the MCP stdio server (tools: hub_status, task_list, task_take, task_create,
-                             claim, release, hub_wait, hub_post, inbox, decide, land)
+                             claim, release, hub_wait, hub_post, inbox, decide, land, landing_status, land_cancel)
   hub hook pre-edit          Claude Code PreToolUse hook (Edit|Write|MultiEdit|NotebookEdit): claim the file or deny the edit
   hub hook post-edit         Claude Code PostToolUse hook: confirm the claim of an edit that ran
   hub hook settle            Claude Code Stop/SubagentStop/UserPromptSubmit/SessionEnd hook: release claims of edits that never ran
@@ -26,7 +26,20 @@ For humans
   hub post TO BODY           TO is human/agent or #channel
   hub inbox [--peek]
   hub decide SUMMARY [--why TEXT] [--file F]...
-  hub land [--task T-1] [--summary TEXT]   Phase 1: record it, mark the task done, release its claims
+
+Landing queue (with a "land" section in trunk's agenthub.json; without one, land records it as in Phase 1)
+  hub land [--task T-1] [--summary TEXT] [--allow-untracked] [--wait]
+                             Check the worktree, push HEAD to its land ref and queue it for the lander
+  hub landings [--all] [--watch] [--stats [--days 7]]
+                             The queue, the lander and recent landings; --stats: median land→trunk, first-try rate
+  hub landing L-7 [--log]    One landing in detail, with what to fix if it came back
+  hub cancel L-7 [--reason TEXT]
+  hub approve L-7 [--note TEXT] | hub reject L-7 --reason TEXT
+                             Humans only, in a terminal: shows what you approve, then asks you to type L-7.
+                             Credentials: ~/.config/agenthub/approver.json (chmod 600) or HUB_APPROVER + HUB_APPROVER_TOKEN
+  hub lander | hub lander resume [--accept-trunk SHA]
+                             The lander lease, standbys and pause flag; resume needs approver credentials and a terminal
+  hub doctor                 Check the config (strictly), the hub, push access to land refs and git features
 
 Configuration (env wins over files): HUB_URL (default http://127.0.0.1:7077), HUB_AGENT, HUB_PROJECT,
 HUB_TOKEN, HUB_FAIL_CLOSED, HUB_TIMEOUT_MS; files: <worktree>/.hub.json, ~/.config/agenthub/config.json

@@ -2,7 +2,7 @@ import path from 'node:path';
 import type { ClaimResult } from '@agenthub/hub/protocol';
 import { claimRoot, lendIdentity, recordLending } from './checkout.js';
 import { HubClient, classifyFailure, type HubFailure } from './client.js';
-import { hasOwnSettings, loadConfig, sameHub, type HubConfig } from './config.js';
+import { hasOwnSettings, loadConfig, sameHub, teamSections, type HubConfig } from './config.js';
 import { denyReason, digestText, inline, showNames } from './format.js';
 import { currentBranch, headCommit, isIgnored, toRepoPath, unclaimableReason } from './git.js';
 import { commitGuardOff } from './guard-status.js';
@@ -347,6 +347,10 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
   // A commit guard a hook manager took out (husky rewrites .husky/_ on install) goes unnoticed otherwise.
   const guardOff = cfg.root && hasOwnSettings(cfg.root) ? commitGuardOff(cfg.root) : null;
   if (guardOff) cfg.warnings.push(guardOff);
+  // The land, sync and symbols sections, read leniently: a bad value is a warning here (its default
+  // applies), never a blocked edit. The lander and `land` read them strictly and refuse instead.
+  const team = cfg.root ? teamSections(cfg.root, { strict: false }) : null;
+  if (team?.problems.length) cfg.warnings.push(...team.problems.map((p) => `${p} (the default applies here; the lander and land refuse it until it is fixed)`));
   const warning = warningOf(cfg.warnings);
   const also = warning ? `\n${warning}` : '';
   if (!cfg.agent) {
@@ -358,7 +362,9 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
   try {
     await client.heartbeat({ client: 'claude-code', branch: cfg.root ? (currentBranch(cfg.root) ?? undefined) : undefined, worktree: cfg.root ?? undefined });
     const status = await client.status();
-    const text = digestText(status, cfg.agent, cfg.url);
+    // The queue's median land→trunk time, when there is a queue to speak of.
+    const stats = status.lander && (status.queue?.length ?? 0) > 0 ? await client.landingStats().catch(() => null) : null;
+    const text = digestText(status, cfg.agent, cfg.url, { stats, trunk: team?.sections.land?.trunk });
     if (!warning) return context(text);
     return {
       stdout: JSON.stringify({ systemMessage: warning, hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `${warning}\n\n${text}` } }),

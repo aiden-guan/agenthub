@@ -31,6 +31,39 @@ export function headCommit(root: string): string | null {
   return git(root, ['rev-parse', '--short=12', 'HEAD']) || null;
 }
 
+/** The full sha of HEAD (headCommit stays short for Phase 1 uses), or null on an unborn branch or outside git. */
+export function fullHead(root: string): string | null {
+  const sha = git(root, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
+  return sha && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha) ? sha : null;
+}
+
+/**
+ * The per-worktree git directory (a linked worktree's `.git/worktrees/<name>`,
+ * else `.git`), read from the `.git` file's `gitdir:` line without starting
+ * git: sync markers and the in-progress checks live there.
+ */
+export function gitDir(root: string): string | null {
+  return ownGitDir(root);
+}
+
+/** What each per-worktree marker of a git operation in progress means. */
+const OPERATIONS: Array<[string, string]> = [
+  ['rebase-merge', 'rebase'],
+  ['rebase-apply', 'rebase (or git am)'],
+  ['MERGE_HEAD', 'merge'],
+  ['CHERRY_PICK_HEAD', 'cherry-pick'],
+  ['REVERT_HEAD', 'revert'],
+  ['BISECT_LOG', 'bisect'],
+];
+
+/** The git operation in progress in this worktree (rebase, merge, cherry-pick, revert, am, bisect), or null. */
+export function gitOperation(root: string): string | null {
+  const dir = gitDir(root);
+  if (!dir) return null;
+  for (const [marker, what] of OPERATIONS) if (existsSync(path.join(dir, marker))) return what;
+  return null;
+}
+
 export function currentBranch(root: string): string | null {
   const b = git(root, ['rev-parse', '--abbrev-ref', 'HEAD']);
   return b && b !== 'HEAD' ? b : null;
