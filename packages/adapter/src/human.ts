@@ -1,9 +1,10 @@
 import { parseArgs } from 'node:util';
 import type { TaskStatus } from '@agenthub/hub/protocol';
-import { HubClient } from './client.js';
-import { loadConfig } from './config.js';
+import { HubApiError, HubClient } from './client.js';
+import { loadConfig, type HubConfig } from './config.js';
 import { claimFiles, formatDecision, formatMessage, formatTask, statusText, UNTRUSTED_NOTE } from './format.js';
 import { currentBranch, headCommit, toRepoPath } from './git.js';
+import { adoptClaims } from './pending.js';
 import type { HookOutcome } from './hooks.js';
 
 const ok = (stdout: string): HookOutcome => ({ stdout, stderr: '', exitCode: 0 });
@@ -12,13 +13,25 @@ const fail = (stderr: string, exitCode = 1): HookOutcome => ({ stdout: '', stder
 /** Commands people run by hand (`hub status`, `hub task add ...`). Same API as the MCP tools. */
 export async function human(cmd: string, argv: string[]): Promise<HookOutcome> {
   const cfg = loadConfig();
+  try {
+    return await command(cfg, cmd, argv);
+  } catch (err) {
+    // A token the config withheld from this hub comes back as an auth error: say why.
+    if (err instanceof HubApiError && (err.status === 401 || err.status === 403) && cfg.warnings.length) {
+      return fail([`hub: ${err.message}`, ...cfg.warnings.map((w) => `hub: warning: ${w}`)].join('\n'));
+    }
+    throw err;
+  }
+}
+
+async function command(cfg: HubConfig, cmd: string, argv: string[]): Promise<HookOutcome> {
   const client = new HubClient(cfg);
   const need = () => {
     if (!cfg.agent) throw new Error('no agent identity: set HUB_AGENT=human/agent or run `hub init --agent human/agent`');
   };
   const files = (paths: string[]) =>
     paths.map((f) => {
-      const p = cfg.root ? toRepoPath(f, cfg.root, process.cwd()) : f;
+      const p = cfg.root ? toRepoPath(f, cfg.root, process.cwd()) : f.normalize('NFC');
       if (!p) throw new Error(`${f} is outside the repository`);
       return p;
     });
@@ -73,6 +86,7 @@ export async function human(cmd: string, argv: string[]): Promise<HookOutcome> {
         queue: values.queue ?? false,
         base_commit: cfg.root ? (headCommit(cfg.root) ?? undefined) : undefined,
       });
+      adoptClaims(cfg.root, res.claims);
       if (res.status === 'denied') {
         return fail(`denied: ${res.conflicts.map((c) => `${c.files.join(', ')} held by ${c.holder} (${c.claim_id})`).join('; ')}`);
       }

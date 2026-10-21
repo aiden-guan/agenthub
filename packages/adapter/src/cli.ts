@@ -8,9 +8,12 @@ const HELP = `hub — agenthub adapter
 Agent integration
   hub mcp                    Run the MCP stdio server (tools: hub_status, task_list, task_take, task_create,
                              claim, release, hub_wait, hub_post, inbox, decide, land)
-  hub hook pre-edit          Claude Code PreToolUse hook (Edit|Write|MultiEdit): claim the file or deny the edit
+  hub hook pre-edit          Claude Code PreToolUse hook (Edit|Write|MultiEdit|NotebookEdit): claim the file or deny the edit
+  hub hook post-edit         Claude Code PostToolUse hook: confirm the claim of an edit that ran
+  hub hook settle            Claude Code Stop/SubagentStop/UserPromptSubmit/SessionEnd hook: release claims of edits that never ran
   hub hook digest            Claude Code SessionStart hook: team state as additionalContext
-  hub guard                  git pre-commit hook: reject commits touching files others hold exclusively
+  hub guard                  git pre-commit hook (also prepare-commit-msg for revert/cherry-pick/rebase, pre-merge-commit for merges, pre-applypatch for am):
+                             reject commits touching files others hold exclusively
   hub init [--agent human/agent] [--project ID] [--url URL] [--command CMD] [--no-hooks] [--no-mcp] [--no-guard]
                              Write .hub.json, .claude/settings.json hooks, .mcp.json and the pre-commit guard
 
@@ -58,12 +61,14 @@ async function main(argv: string[]): Promise<void> {
       const io = { stdin: await readStdin(), cwd: process.cwd(), env: process.env };
       const hooks = await import('./hooks.js');
       if (rest[0] === 'pre-edit') return finish(await hooks.preEditHook(io));
+      if (rest[0] === 'post-edit') return finish(await hooks.postEditHook(io));
+      if (rest[0] === 'settle') return finish(await hooks.settleHook(io));
       if (rest[0] === 'digest') return finish(await hooks.digestHook(io));
-      return finish({ stderr: 'usage: hub hook pre-edit | hub hook digest\n', exitCode: 2 });
+      return finish({ stderr: 'usage: hub hook pre-edit | post-edit | settle | digest\n', exitCode: 2 });
     }
     case 'guard': {
       const { guard } = await import('./guard.js');
-      return finish(await guard({ cwd: process.cwd(), env: process.env }));
+      return finish(await guard({ cwd: process.cwd(), env: process.env, sequencer: rest.includes('--sequencer'), merge: rest.includes('--merge') }));
     }
     case 'init': {
       const { values } = parseArgs({
@@ -88,6 +93,7 @@ async function main(argv: string[]): Promise<void> {
         hooks: !values['no-hooks'],
         mcp: !values['no-mcp'],
         guard: !values['no-guard'],
+        env: process.env,
       });
       return finish({ stdout: report.map((l) => `hub init: ${l}`).join('\n'), exitCode: 0 });
     }

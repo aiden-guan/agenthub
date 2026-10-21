@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 /** Nearest ancestor of `start` (inclusive) containing `.git` (a directory, or a file in a worktree). */
@@ -61,31 +61,168 @@ export function realish(p: string): string {
 /**
  * Map a file path to the repo-relative POSIX path the hub uses as a claim key,
  * so the same file matches across worktrees. Returns null for files outside
- * the repository or inside `.git`.
+ * the repository or inside `.git`. Keys are NFC: realpath returns a name the
+ * way it is stored on disk (decomposed, on macOS, for files Finder or a Cocoa
+ * app created), while git and other worktrees use the composed form.
  */
 export function toRepoPath(file: string, root: string, cwd: string): string | null {
   const abs = realish(path.resolve(cwd, file));
   const rel = path.relative(realish(root), abs);
-  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
-  const posix = rel.split(path.sep).join('/');
+  // Only a whole '..' segment leaves the root: '..env' and '..data/x' are files in it.
+  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
+  const posix = rel.split(path.sep).join('/').normalize('NFC');
   if (posix === '.git' || posix.startsWith('.git/')) return null;
   return posix;
 }
 
-/** Paths in the index that differ from HEAD, including both sides of renames and deleted files. */
-export function stagedPaths(root: string): string[] {
-  const out = gitRaw(root, ['diff', '--cached', '--name-status', '-z', '-M']);
-  if (!out) return [];
-  const parts = out.split('\0').filter((s) => s.length > 0);
-  const files = new Set<string>();
-  for (let i = 0; i < parts.length; ) {
-    const status = parts[i++];
-    // Renames and copies list the old path and then the new one.
-    const count = status.startsWith('R') || status.startsWith('C') ? 2 : 1;
-    for (const p of parts.slice(i, i + count)) files.add(p);
-    i += count;
+/**
+ * Whether git ignores this untracked file (`.env`, `node_modules/…`), asked of
+ * the repository that holds it and of each one around it up to `root`: a
+ * submodule's .gitignore is its own (git in the worktree refuses to look
+ * inside a submodule), and a directory the worktree ignores is local to each
+ * worktree, a clone in it included. A tracked file never counts as ignored.
+ */
+export function isIgnored(file: string, root: string): boolean {
+  const top = realish(root);
+  let repo = findRepoRoot(path.dirname(file));
+  while (repo && (repo === top || repo.startsWith(top + path.sep))) {
+    const rel = toRepoPath(file, repo, repo);
+    if (rel !== null && checkIgnore(repo, rel)) return true;
+    repo = repo === top ? null : findRepoRoot(path.dirname(repo));
   }
-  return [...files];
+  return false;
+}
+
+/**
+ * Whether the file `name` directly in `root` is in the index (committed, or
+ * staged to be), under that name or another one that opens the same file: where
+ * the file system ignores case (macOS, Windows), checking out a branch that
+ * commits `.Hub.json` replaces `.hub.json`, and git's own lookup goes by the exact name.
+ */
+export function isTracked(root: string, name: string): boolean {
+  const tracked = gitRaw(root, ['ls-files', '-z', '--', ':(glob)*'])?.split('\0') ?? [];
+  if (tracked.includes(name)) return true;
+  const stat = (p: string) => {
+    try {
+      return statSync(path.join(root, p), { throwIfNoEntry: false });
+    } catch {
+      return undefined;
+    }
+  };
+  const file = stat(name);
+  return !!file && tracked.some((t) => {
+    const s = t && stat(t);
+    return !!s && s.ino === file.ino && s.dev === file.dev;
+  });
+}
+
+function checkIgnore(root: string, repoPath: string): boolean {
+  try {
+    execFileSync('git', ['check-ignore', '-q', '--', repoPath], { cwd: root, stdio: 'ignore', timeout: 3000 });
+    return true;
+  } catch {
+    return false; // exit 1 (not ignored) or a git failure: coordinate the file
+  }
+}
+
+/**
+ * The git directory every worktree of this repository shares, read the way git
+ * finds it (`.git` itself, or the `gitdir:` a worktree's `.git` file points to
+ * and its `commondir`) without starting git: the edit hook runs before every edit.
+ */
+export function gitCommonDir(root: string): string | null {
+  const dotGit = path.join(root, '.git');
+  try {
+    if (statSync(dotGit).isDirectory()) return dotGit;
+    const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, 'utf8'));
+    if (!m) return null;
+    const gitDir = path.resolve(root, m[1].trim());
+    try {
+      return path.resolve(gitDir, readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim());
+    } catch {
+      return gitDir; // a submodule: its git dir is its own
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Paths in the index that differ from HEAD, including deleted files and both
+ * sides of renames (without rename detection a rename is a deletion plus an
+ * addition, and skipping it keeps big move-and-edit commits fast). Throws when
+ * git fails, so a failure never reads as "nothing staged".
+ *
+ * In a merge (`merging`: the commits it brings in, see mergeHeads), only the
+ * paths the merge commit itself changes: where the index differs from the
+ * version the merge brings in, which is a merged commit's where that commit
+ * changed the path since the merge base, else HEAD's. A change merged in as it
+ * was committed on the other branch is that branch's, not this commit's; a
+ * conflict resolved against it, both sides' changes combined, or an edit is.
+ */
+export function stagedPaths(root: string, merging: string[] = []): string[] {
+  const staged = diffNames(root, ['diff', '--cached', '--name-only', '-z', '--no-renames'], 'git diff --cached');
+  const fromHere = new Set(staged);
+  let touched: string[] | null = null;
+  for (const head of merging) {
+    const base = git(root, ['merge-base', 'HEAD', head]);
+    const changedThere = new Set(
+      base
+        ? diffNames(root, ['diff', '--name-only', '-z', '--no-renames', base, head], 'git diff')
+        : diffNames(root, ['ls-tree', '-r', '-z', '--name-only', head], 'git ls-tree'), // unrelated histories: all of it is new there
+    );
+    const fromThere = new Set(diffNames(root, ['diff', '--cached', '--name-only', '-z', '--no-renames', head], 'git diff --cached'));
+    const changed = new Set([...staged, ...fromThere].filter((p) => (changedThere.has(p) ? fromThere.has(p) : fromHere.has(p))));
+    // An octopus merge changes what it changes against every one of them.
+    touched = touched ? touched.filter((p) => changed.has(p)) : [...changed];
+  }
+  return touched ?? staged;
+}
+
+function diffNames(root: string, args: string[], what: string): string[] {
+  let out: string;
+  try {
+    out = execFileSync('git', args, {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 256 * 1024 * 1024,
+      timeout: 120_000,
+    });
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { stderr?: string };
+    const reason = e.code === 'ETIMEDOUT' ? 'no answer within 120 s' : String(e.stderr ?? '').trim().split('\n')[0] || e.message;
+    throw new Error(`${what} failed: ${reason}`);
+  }
+  return [...new Set(out.split('\0').filter((s) => s.length > 0).map((s) => s.normalize('NFC')))];
+}
+
+/**
+ * The commits a merge in progress brings in: MERGE_HEAD, or, in pre-merge-commit,
+ * which git merge runs before it writes that, the GITHEAD_<id> variables it sets
+ * for each one. Empty outside a merge.
+ */
+export function mergeHeads(root: string, env: NodeJS.ProcessEnv): string[] {
+  const file = git(root, ['rev-parse', '--path-format=absolute', '--git-path', 'MERGE_HEAD']);
+  let heads: string[] = [];
+  try {
+    if (file) heads = readFileSync(file, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+  } catch {
+    // no merge in progress
+  }
+  if (heads.length === 0) heads = Object.keys(env).flatMap((k) => /^GITHEAD_([0-9a-f]{40}|[0-9a-f]{64})$/.exec(k)?.[1] ?? []);
+  return heads;
+}
+
+/** Settings `hub init` records in the repository's shared git config (`agenthub.project`, `agenthub.url`). */
+export function recordedSettings(root: string): { project?: string; url?: string } {
+  const out = git(root, ['config', '--local', '--get-regexp', '^agenthub\\.(project|url)$']);
+  const found: { project?: string; url?: string } = {};
+  for (const line of out?.split('\n') ?? []) {
+    const m = /^agenthub\.(project|url) (.+)$/.exec(line.trim());
+    if (m) found[m[1] as 'project' | 'url'] = m[2];
+  }
+  return found;
 }
 
 /** A stable project id shared by every worktree: `owner/repo` from origin, else the main checkout's folder name. */

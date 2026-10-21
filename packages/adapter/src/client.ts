@@ -1,6 +1,7 @@
 import type {
   CheckResult,
   Claim,
+  ClaimConflict,
   ClaimRequest,
   ClaimResult,
   Decision,
@@ -21,7 +22,7 @@ import type {
 } from '@agenthub/hub/protocol';
 import type { HubConfig } from './config.js';
 
-/** The hub could not be reached (network error or timeout). */
+/** The hub could not be reached: no HTTP response at all (network error, refused connection, timeout). */
 export class HubUnavailableError extends Error {
   constructor(message: string) {
     super(message);
@@ -41,6 +42,42 @@ export class HubApiError extends Error {
   }
 }
 
+/**
+ * What a failed hub call means for the hooks and the guard:
+ * - `unreachable`: no HTTP response, or the hub is broken (HTTP 5xx, or an
+ *   answer that isn't the hub's JSON). The only kind that may fail open, with a
+ *   visible warning, and only when fail-closed isn't configured.
+ * - `auth` (HTTP 401/403) and `refused` (any other 4xx): the hub is up and said no.
+ * - `error`: anything else, such as a bug in the adapter.
+ * All but `unreachable` always block.
+ */
+export interface HubFailure {
+  kind: 'unreachable' | 'auth' | 'refused' | 'error';
+  message: string;
+}
+
+/**
+ * An auth error with `cfg.tokenWithheld` set starts with that: the token is
+ * set, just not for this hub, so "set the token" would be the wrong advice.
+ */
+export function classifyFailure(err: unknown, cfg: Pick<HubConfig, 'url' | 'tokenWithheld'>): HubFailure {
+  const { url } = cfg;
+  if (err instanceof HubUnavailableError) return { kind: 'unreachable', message: err.message };
+  if (err instanceof HubApiError) {
+    const detail = `HTTP ${err.status} ${err.code}: ${err.message}`;
+    if (err.status === 401 || err.status === 403) {
+      if (cfg.tokenWithheld) return { kind: 'auth', message: `${cfg.tokenWithheld} The hub rejected the request without it (${detail})` };
+      return { kind: 'auth', message: `hub at ${url} rejected this agent's credentials (${detail}); set HUB_TOKEN (or "token" in .hub.json) to the hub's token` };
+    }
+    if (err.status >= 400 && err.status < 500) return { kind: 'refused', message: `hub at ${url} refused the request (${detail})` };
+    return { kind: 'unreachable', message: `hub at ${url} is failing (${detail})` };
+  }
+  return { kind: 'error', message: err instanceof Error ? err.message : String(err) };
+}
+
+/** The hub rejects request bodies over 1,000,000 bytes; the guard's file list is sent in parts well below that. */
+const CHECK_BATCH_BYTES = 256 * 1024;
+
 export type ClientConfig = Pick<HubConfig, 'url' | 'project' | 'agent' | 'token' | 'timeoutMs'>;
 
 export class HubClient {
@@ -57,20 +94,32 @@ export class HubClient {
     return h;
   }
 
-  async request<T>(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = this.cfg.timeoutMs): Promise<T> {
+  async request<T>(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = this.cfg.timeoutMs, abort?: AbortSignal): Promise<T> {
+    // Built outside the try: a local mistake (a bad timeout) must not read as "hub unreachable".
+    const signal = abort ? AbortSignal.any([AbortSignal.timeout(timeoutMs), abort]) : AbortSignal.timeout(timeoutMs);
+    const unreachable = (err: unknown) => {
+      const reason = (err as Error).name === 'TimeoutError' ? `no answer within ${timeoutMs} ms` : ((err as Error).cause as Error)?.message ?? (err as Error).message;
+      return new HubUnavailableError(`hub at ${this.cfg.url} is unreachable (${reason})`);
+    };
     let res: Response;
     try {
       res = await fetch(`${this.base}${path}`, {
         method,
         headers: { ...this.headers(), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal,
       });
     } catch (err) {
-      const reason = (err as Error).name === 'TimeoutError' ? `no answer within ${timeoutMs} ms` : ((err as Error).cause as Error)?.message ?? (err as Error).message;
-      throw new HubUnavailableError(`hub at ${this.cfg.url} is unreachable (${reason})`);
+      throw unreachable(err);
     }
-    const text = await res.text();
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (err) {
+      // The connection dropped mid-answer. A 4xx status is still a refusal.
+      if (res.status >= 400 && res.status < 500) throw new HubApiError(res.status, 'http_error', `HTTP ${res.status}`);
+      throw unreachable(err);
+    }
     let data: any = {};
     try {
       data = text ? JSON.parse(text) : {};
@@ -93,8 +142,30 @@ export class HubClient {
   release(req: ReleaseRequest): Promise<ReleaseResult> {
     return this.request('POST', '/claims/release', req);
   }
-  check(files: string[]): Promise<CheckResult> {
-    return this.request('POST', '/claims/check', { files });
+  /** Exclusive claims by others on `files`, asked in batches small enough for the hub's body limit. */
+  async check(files: string[]): Promise<CheckResult> {
+    const batches: string[][] = [[]];
+    let size = 0;
+    for (const f of files) {
+      const bytes = Buffer.byteLength(JSON.stringify(f)) + 1;
+      if (size + bytes > CHECK_BATCH_BYTES && batches[batches.length - 1].length > 0) {
+        batches.push([]);
+        size = 0;
+      }
+      batches[batches.length - 1].push(f);
+      size += bytes;
+    }
+    let result: CheckResult | null = null;
+    const byClaim = new Map<string, ClaimConflict>();
+    for (const batch of batches) {
+      result = await this.request<CheckResult>('POST', '/claims/check', { files: batch });
+      for (const c of result.conflicts) {
+        const seen = byClaim.get(c.claim_id);
+        if (seen) seen.files = [...new Set([...seen.files, ...c.files])];
+        else byClaim.set(c.claim_id, { ...c, files: [...c.files] });
+      }
+    }
+    return { ...result!, conflicts: [...byClaim.values()] };
   }
   async getClaim(id: string): Promise<Claim> {
     return (await this.request<{ claim: Claim }>('GET', `/claims/${encodeURIComponent(id)}`)).claim;
@@ -129,9 +200,15 @@ export class HubClient {
   land(req: LandRequest): Promise<LandResult> {
     return this.request('POST', '/land', req);
   }
-  /** Long-poll: events after `since`, waiting up to `waitMs` for the first one. */
-  events(since: number, waitMs = 0): Promise<{ events: HubEvent[]; seq: number }> {
-    return this.request('GET', `/events?since=${since}&wait_ms=${waitMs}`, undefined, waitMs + this.cfg.timeoutMs + 5000);
+  /**
+   * Long-poll: events after `since` (after the hub's latest without it),
+   * waiting up to `waitMs` for the first one. Newer hubs add `epoch` (their
+   * database's id) and `next_since` (the cursor for the next call, past events
+   * this agent can't see). `abort` ends the wait early.
+   */
+  events(since: number | undefined, waitMs = 0, abort?: AbortSignal): Promise<{ events: HubEvent[]; seq: number; epoch?: string; next_since?: number }> {
+    const from = since === undefined ? '' : `since=${since}&`;
+    return this.request('GET', `/events?${from}wait_ms=${waitMs}`, undefined, waitMs + this.cfg.timeoutMs + 5000, abort);
   }
 
   feedUrl(since?: number): string {

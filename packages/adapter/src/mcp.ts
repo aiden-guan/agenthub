@@ -18,6 +18,7 @@ import {
   statusText,
 } from './format.js';
 import { currentBranch, headCommit, toRepoPath } from './git.js';
+import { adoptClaims } from './pending.js';
 
 export const VERSION = '0.1.0';
 
@@ -45,7 +46,11 @@ type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: bo
 function errorText(err: unknown, cfg: HubConfig): string {
   if (err instanceof ToolError) return err.message;
   if (err instanceof HubUnavailableError) return `${err.message}. Coordination is unavailable right now; tell your human if this persists.`;
-  if (err instanceof HubApiError) return `hub refused: ${err.message} (${err.code})`;
+  if (err instanceof HubApiError) {
+    // A token the config withheld from this hub comes back as an auth error: say why.
+    const why = err.status === 401 || err.status === 403 ? cfg.warnings.map((w) => ` ${w}`).join('') : '';
+    return `hub refused: ${err.message} (${err.code})${why}`;
+  }
   return `unexpected error talking to the hub at ${cfg.url}: ${(err as Error).message}`;
 }
 
@@ -65,11 +70,16 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
       return p;
     });
   };
+  // What the feed learned about this agent's claims (a lease that ran out, a hub that lost them) rides on the next tool result.
+  const noted = (text: string): string => {
+    const notices = feed?.takeNotices() ?? [];
+    return notices.length ? `${text}\n\n${notices.map((n) => `Note: ${n}`).join('\n')}` : text;
+  };
   const tool = <A>(fn: (args: A) => Promise<string>) => async (args: A): Promise<ToolResult> => {
     try {
-      return { content: [{ type: 'text', text: await fn(args) }] };
+      return { content: [{ type: 'text', text: noted(await fn(args)) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: errorText(err, cfg) }], isError: true };
+      return { content: [{ type: 'text', text: noted(errorText(err, cfg)) }], isError: true };
     }
   };
 
@@ -162,6 +172,8 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         queue: args.queue ?? true,
         base_commit: cfg.root ? (headCommit(cfg.root) ?? undefined) : undefined,
       });
+      adoptClaims(cfg.root, res.claims);
+      feed?.noteClaims(res.claim ? [res.claim, ...res.claims] : res.claims);
       return describeClaimResult(res);
     }),
   );
@@ -206,13 +218,15 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
       const agent = me();
       const files = args.files ? repoFiles(args.files) : [];
       const timeoutS = args.timeout_s ?? 120;
-      const status = await client.status();
+      const deadline = Date.now() + timeoutS * 1000;
+      const waiter = feed ?? new Feed(client);
 
       const blockersOf = (claims: Claim[]) =>
         claims.filter((c) => c.status === 'active' && c.holder !== agent && c.mode === 'exclusive' && c.scope.some((s) => files.includes(s.file)));
       const ready = async (): Promise<string | null> => {
         if (args.claim_id) {
           const c = await client.getClaim(args.claim_id);
+          if (c.holder !== agent) return `${c.id} is ${c.holder}'s claim, not yours; wait on the id of a claim you queued.`;
           if (c.status === 'active') return `${c.id} is granted: you now hold ${claimFiles(c).join(', ')}.`;
           if (c.status !== 'queued') return `${c.id} is ${c.status}${c.end_reason ? ` (${c.end_reason})` : ''}; claim again if you still need it.`;
         }
@@ -223,15 +237,11 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         return null;
       };
 
-      const immediate = await ready();
-      if (immediate) return immediate;
-      if (!files.length && !args.claim_id && status.unread > 0) return `You have ${status.unread} unread message(s); read them with inbox.`;
-
       const relevant = (e: HubEvent): boolean => {
         const d = e.data as Record<string, any>;
         if (e.type === 'message.posted') return d.from !== agent;
         if (e.type === 'task.unblocked') return true;
-        if (args.claim_id && d.claim_id === args.claim_id) return true;
+        if (args.claim_id && d.claim_id === args.claim_id && d.holder === agent) return true;
         if (files.length && (e.type === 'claim.released' || e.type === 'claim.expired')) {
           return d.holder !== agent && Array.isArray(d.files) && d.files.some((f: string) => files.includes(f));
         }
@@ -239,9 +249,25 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         return false;
       };
 
-      const waiter = feed ?? new Feed(client);
-      const events = await waiter.waitFor(status.seq, relevant, timeoutS * 1000);
+      // A hub back on a different database ends the wait: the claims it waited on are gone with the old one.
       const lines: string[] = [];
+      let events: HubEvent[];
+      for (;;) {
+        const restarts = waiter.restarts;
+        const status = await client.status();
+        const immediate = await ready();
+        if (immediate) return [...lines, immediate].join('\n');
+        if (!files.length && !args.claim_id && status.unread > 0) return [...lines, `You have ${status.unread} unread message(s); read them with inbox.`].join('\n');
+        const res = await waiter.waitFor(status.seq, relevant, Math.max(0, deadline - Date.now()), restarts);
+        events = res.events;
+        if (!res.restarted) break;
+        // Its claim ids mean nothing on the new database (another agent's claim may have the same one).
+        if (args.claim_id) {
+          return `The hub came back with a different database while you waited, so your queued claim ${args.claim_id} is gone. Claim again if you still need it.`;
+        }
+        lines.splice(0, 1, 'The hub came back with a different database while you waited; the claims it had are gone.');
+      }
+      const said = lines.length;
       if (events.length) lines.push(`Woke up after: ${events.map(formatEvent).join('; ')}.`);
       const after = await ready();
       if (after) lines.push(after);
@@ -249,7 +275,7 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         const fresh = await client.status();
         lines.push(`Still claimed: ${blockersOf(fresh.claims).map((c) => formatClaim(c, fresh.now, agent)).join('; ')}`);
       }
-      if (!events.length) lines.unshift(`Nothing relevant happened in ${timeoutS}s.`);
+      if (!events.length) lines.splice(said, 0, `Nothing relevant happened in ${timeoutS}s.`);
       if (lines.some((l) => l.includes('"'))) lines.push(UNTRUSTED_NOTE);
       return lines.join('\n');
     }),

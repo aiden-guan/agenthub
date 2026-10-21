@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { RunningServer } from '@agenthub/hub';
@@ -6,7 +7,7 @@ import { HubClient } from '../src/client.js';
 import type { HubConfig } from '../src/config.js';
 import { Feed } from '../src/feed.js';
 import { createMcpServer } from '../src/mcp.js';
-import { A, B, PROJECT, makeRepo, sleep, startHub, type SampleRepo } from './helpers.js';
+import { A, B, PROJECT, failingHub, hubCli, makeRepo, preToolUseInput, sessionEventInput, sleep, startHub, testEnv, type SampleRepo } from './helpers.js';
 
 const TOOLS = ['claim', 'decide', 'hub_post', 'hub_status', 'hub_wait', 'inbox', 'land', 'release', 'task_create', 'task_list', 'task_take'];
 
@@ -28,7 +29,7 @@ afterAll(async () => {
 
 /** An MCP client connected to a fresh `hub mcp` server for `agent`, with a live feed. */
 async function connect(agent: string, root: string) {
-  const cfg: HubConfig = { url: srv.url, agent, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root, configFiles: [] };
+  const cfg: HubConfig = { url: srv.url, agent, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root, configFiles: [], projectSource: 'env', warnings: [] };
   const hubClient = new HubClient(cfg);
   const feed = new Feed(hubClient, { heartbeatMs: 1000 });
   feed.start();
@@ -87,6 +88,16 @@ describe('hub mcp', () => {
     expect(res.text).toContain('src/users.ts is free of other agents\' claims now.');
   });
 
+  it("hub_wait on another agent's claim id says so instead of reporting it as granted to you", async () => {
+    const a = await connect(A, repo.wtA);
+    const b = await connect(B, repo.wtB);
+    const id = /^Granted (C-\d+)/.exec((await a.call('claim', { files: ['src/theirs.ts'], intent: 'mine' })).text)![1];
+    const res = await b.call('hub_wait', { claim_id: id, timeout_s: 1 });
+    expect(res.text).not.toContain('is granted');
+    expect(res.text).toBe(`${id} is maya/claude-1's claim, not yours; wait on the id of a claim you queued.`);
+    await a.call('release', { all: true });
+  });
+
   it("labels other agents' messages as untrusted and keeps them from escaping the label", async () => {
     const a = await connect(A, repo.wtA);
     const b = await connect(B, repo.wtB);
@@ -132,8 +143,26 @@ describe('hub mcp', () => {
     expect(status.text).toMatch(/D-\d+ · maya\/claude-1 · just now: "Use argon2id for password hashing" \[src\/auth\.ts\]/);
   });
 
+  it('says why the hub rejected its credentials when the config withheld the token', async () => {
+    const hub = await failingHub(401, 'unauthorized', 'missing or wrong bearer token');
+    const warning = 'the hub token from HUB_TOKEN is not sent to http://127.0.0.1:1: only the committed agenthub.json names that hub.';
+    const cfg: HubConfig = { url: hub.url, agent: A, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root: repo.wtA, configFiles: [], projectSource: 'file', warnings: [warning] };
+    const server = createMcpServer({ cfg, client: new HubClient(cfg), feed: null, cwd: repo.wtA });
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const mcp = new Client({ name: 'test', version: '0' });
+    await mcp.connect(clientSide);
+    cleanups.push(async () => {
+      await mcp.close();
+      await hub.close();
+    });
+    const res = (await mcp.callTool({ name: 'hub_status', arguments: {} })) as { content: Array<{ text: string }>; isError?: boolean };
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toBe(`hub refused: missing or wrong bearer token (unauthorized) ${warning}`);
+  });
+
   it('refuses to act without an agent identity', async () => {
-    const cfg: HubConfig = { url: srv.url, agent: null, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root: repo.wtA, configFiles: [] };
+    const cfg: HubConfig = { url: srv.url, agent: null, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root: repo.wtA, configFiles: [], projectSource: 'env', warnings: [] };
     const server = createMcpServer({ cfg, client: new HubClient(cfg), feed: null, cwd: repo.wtA });
     const [c, s] = InMemoryTransport.createLinkedPair();
     await server.connect(s);
@@ -143,6 +172,19 @@ describe('hub mcp', () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/no agent identity/);
     await mcp.close();
+  });
+
+  it('keeps a claim the edit hook took for an edit that never ran once the agent claims the file with claim', async () => {
+    const env = testEnv({ HUB_URL: srv.url, HUB_PROJECT: PROJECT, HUB_AGENT: A });
+    const file = path.join(repo.wtA, 'docs', 'adopted.md');
+    const ids = { session: 'sess-mcp', toolUseId: 'toolu_mcp_1' };
+    expect((await hubCli(['hook', 'pre-edit'], { cwd: repo.wtA, env, input: preToolUseInput(repo.wtA, file, 'Write', ids) })).stdout).toBe('');
+    const a = await connect(A, repo.wtA);
+    expect((await a.call('claim', { files: ['docs/adopted.md'], intent: 'write the docs' })).text).toMatch(/^You already hold C-\d+ \(docs\/adopted\.md\)/);
+    await hubCli(['hook', 'settle'], { cwd: repo.wtA, env, input: sessionEventInput(repo.wtA, 'Stop', 'sess-mcp') });
+    const held = (await new HubClient({ url: srv.url, project: PROJECT, agent: A, token: null, timeoutMs: 3000 }).status()).claims;
+    expect(held.filter((c) => c.scope.some((s) => s.file === 'docs/adopted.md')).map((c) => c.holder)).toEqual([A]);
+    await a.call('release', { files: ['docs/adopted.md'] });
   });
 });
 
