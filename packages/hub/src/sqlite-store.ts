@@ -594,9 +594,15 @@ export class SqliteStore implements Store {
 
   listLandings(project: string, limit: number): Landing[] {
     const rows = this.statements.prepare('SELECT * FROM landings WHERE project = ? ORDER BY seq DESC LIMIT ?').all(project, limit) as Array<
-      Omit<Phase1LandingRow, 'commit'> & { commit_sha: string | null }
+      Omit<Phase1LandingRow, 'commit'> & { commit_sha: string | null; seq: number }
     >;
-    return rows.map(({ commit_sha, ...rest }) => phase1Landing({ ...rest, commit: commit_sha }));
+    // Phase 1 sent the whole row (commit_sha as `commit`), so each landing also
+    // carries the row's undeclared `seq`; the row's keys come first, as they did,
+    // and the Phase 2 and 3 fields follow at their neutral values.
+    return rows.map(({ commit_sha, ...rest }) => {
+      const row = { ...rest, commit: commit_sha };
+      return { ...row, ...phase1Landing(row) };
+    });
   }
 
   appendEvent(e: Omit<HubEvent, 'seq'>): number {
