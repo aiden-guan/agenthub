@@ -406,6 +406,8 @@ describe('feed after the hub comes back with a fresh database', () => {
     await sleep(300);
     await srv.close();
     const srv2 = await hubAt({ port: srv.port });
+    // Let fetch notice that the old hub closed its keep-alive sockets; reusing one fails as "other side closed".
+    await sleep(100);
     const b = client(srv2.url, B);
     for (let i = 0; i < Number(id.slice(2)); i++) await b.claim({ files: [`other/b${i}.ts`], intent: "B's own work" });
     expect((await b.getClaim(id)).holder).toBe(B);
