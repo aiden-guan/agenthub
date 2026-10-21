@@ -5,7 +5,7 @@
     "commit": "3f2a9c1e5b7d4a6c8e0f1a2b3c4d5e6f7a8b9c0d",
     "summary": "login() takes an options object; the remember flag becomes opts.sessionDays, stored by the new migration.",
     "queue_seq": 5,
-    "position": null,
+    "position": 1,
     "eta_ms": 540000,
     "phase": null,
     "phase_at": null,
@@ -174,7 +174,7 @@
   ],
   "superseded": [],
   "replayed": false,
-  "position": null,
+  "position": 1,
   "eta_ms": 540000,
   "lander": {
     "holder": "lander/build1-48213-9f3c",

@@ -98,7 +98,7 @@
       "commit": "e7d6c5b4a3928170f6e5d4c3b2a1908f7e6d5c4b",
       "summary": "POST /logout-all revokes every session of the user.",
       "queue_seq": 7,
-      "position": null,
+      "position": 2,
       "eta_ms": 780000,
       "phase": null,
       "phase_at": null,

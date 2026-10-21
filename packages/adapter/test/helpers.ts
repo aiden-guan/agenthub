@@ -50,6 +50,11 @@ export function run(cmd: string, args: string[], opts: { cwd: string; env: NodeJ
     child.stderr.on('data', (d) => (stderr += d));
     child.on('error', reject);
     child.on('close', (code) => resolve({ code, stdout, stderr }));
+    // A child that exits without reading its stdin makes the write fail with EPIPE;
+    // its exit code and output are the result, so that is not an error here.
+    child.stdin.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code !== 'EPIPE') reject(err);
+    });
     child.stdin.end(opts.input ?? '');
   });
 }

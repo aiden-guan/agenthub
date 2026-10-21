@@ -55,6 +55,8 @@ export interface MergeResult {
   tree: string;
   clean: boolean;
   conflicts: ConflictEntry[];
+  /** (Amended at CP1a.) Paths stage 1 left conflicted whose stage-2 (structural driver) blob was spliced in, sorted; [] without drivers. */
+  structural: string[];
 }
 
 export interface StructuralDriver {

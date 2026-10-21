@@ -9,6 +9,7 @@ Every function of the frozen `GitOps` interface (`src/types.ts`) is implemented 
 None required. One optional, additive request for the integrator:
 
 - `MergeResult` (`packages/gitops/src/types.ts`) could gain `structural: string[]`: the paths whose stage-2 (structural driver) blob was spliced in. `mergeTrees` already returns it (`MergeTreesResult extends MergeResult`, exported from `@agenthub/gitops`), and the lander needs it for `resolved_by: structural` and the per-file `via`. Until then, L3 reads it through the named export's wider type; a fake `GitPort` can return it too.
+  - **Integrator, CP1a: APPLIED** as a required field, `structural: string[]`, on the frozen `MergeResult`. `GitOps.mergeTrees` callers see it through the frozen interface; fakes must return it (`[]` without drivers). `MergeTreesResult` still compiles unchanged and can be dropped by lane L at leisure.
 
 ### Additive exports (not in the frozen interface)
 

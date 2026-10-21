@@ -276,7 +276,7 @@ export interface LandResult {
   superseded: string[];
   /** Queue mode: the same live landing already existed; nothing new was created. */
   replayed: boolean;
-  /** Queue mode: 1 = next (a running landing counts as ahead); null while submitted or needs_approval. */
+  /** Queue mode: 1 = next among submitted and queued landings (a running landing counts as ahead; design §2.1 step 7); null otherwise (needs_approval, running, terminal). */
   position: number | null;
   /** Queue mode: estimated milliseconds until it is on trunk; null without a lander. */
   eta_ms: number | null;
@@ -615,7 +615,7 @@ export interface Landing {
   updated_at: number;
   /** Queue order: lower runs first. Kept on requeue; inherited along a retry chain (keepPlaceRetries) and by a superseding landing. */
   queue_seq: number | null;
-  /** Computed on read: 1 = next among queued landings (a running one counts as ahead). */
+  /** Computed on read: 1 = next among submitted and queued landings (a running one counts as ahead); null in every other status. */
   position: number | null;
   /** Computed on read from recent attempt durations; null without a lander. */
   eta_ms: number | null;
@@ -744,6 +744,14 @@ export interface LandingAdmitRequest {
   required: ApprovalRequirement[];
   waits_for: string | null;
   warnings: string[];
+  /**
+   * T3 (amended at CP1a): set to fail the landing at admission instead of admitting it
+   * (not_pushed, nothing_to_land, too_large, contains_unlanded). The hub then applies the
+   * failure effects; `base_sha` may be omitted when the land ref was never fetched.
+   * `advance {to: 'failed', attempt: 0, code, report}` on a submitted landing does the same.
+   */
+  code?: LandingFailureCode;
+  report?: LandingReport;
 }
 
 export interface LandingAdmitResult {
@@ -769,7 +777,16 @@ export type LandingAdvanceRequest =
       required: ApprovalRequirement[];
     }
   | { lease: LanderAuth; attempt: number; to: 'queued'; reason: RequeueReason }
-  | { lease: LanderAuth; attempt: number; to: 'needs_approval'; required: ApprovalRequirement[]; report: LandingReport }
+  | {
+      lease: LanderAuth;
+      attempt: number;
+      to: 'needs_approval';
+      required: ApprovalRequirement[];
+      report: LandingReport;
+      /** (Amended at CP1a.) The candidate the checks passed on, staged at candidate_ref (§2.2.5 P8), for the approved fast path (P6). */
+      candidate?: string;
+      candidate_ref?: string;
+    }
   | {
       lease: LanderAuth;
       attempt: number;

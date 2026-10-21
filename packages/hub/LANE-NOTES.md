@@ -2,6 +2,11 @@
 
 No dependency requests so far. Contract-amendment requests: one comment (H2), two additive fields (H3). All are worked around, so nothing waits on them.
 
+**Integrator, CP1a: all three requests APPLIED.**
+- H2 position: the `LandResult.position` and `Landing.position` comments in `protocol.ts` now say submitted and queued landings get a position (design §2.1 step 7). The fixtures now show a number for every submitted landing: `land.queue.response.json` (`landing.position` and `position`: 1), `events.landing.json` (`landing.created` seq 416: 1), `landings.list.response.json` and `status.response.json` (L-8, submitted behind queued L-7: 2). H4's shape checks can require `number` there.
+- H3 admit failure: `LandingAdmitRequest` gained `code?: LandingFailureCode; report?: LandingReport`.
+- H3 parked candidate: the `needs_approval` variant of `LandingAdvanceRequest` gained `candidate?: string; candidate_ref?: string`.
+
 ## H1: storage and migration
 
 Decisions later steps build on:

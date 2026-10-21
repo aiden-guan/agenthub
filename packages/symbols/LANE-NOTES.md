@@ -4,6 +4,14 @@ No contract amendments and no dependency requests so far. One optional
 amendment is described under S1 (unkeyable top-level names); nothing depends
 on it.
 
+**Integrator, CP1a: the optional `unkeyable_name` amendment is NOT applied.**
+No code would return the new reason, and the `@toplevel` mapping keeps the
+§1.10 mapping invariant (the region is claimed, and it conflicts with every
+whole-file and `@toplevel` claim). It still departs from §1.10's literal
+"the whole file at top level"; that is to be settled at CP3a, when S1-S3 are
+the gate. If the whole-file reading is wanted then, the reason gets added and
+S3 returns it in the same change.
+
 ## S1: runtime, grammar integrity, TS/TSX/JS outlines
 
 Files: `src/runtime.ts`, `src/outline.ts`, `src/spec.ts`, `src/signatures.ts`,
