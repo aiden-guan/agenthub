@@ -2,7 +2,7 @@ import { HOLD_EXPIRES, LANDER_LEASE_KEY } from '@agenthub/contract';
 import { describe, expect, it } from 'vitest';
 import { startServer } from '../src/index.js';
 import { phase1Landing } from '../src/landing-row.js';
-import { A, B, C, HOUR, LANDER, MIN, P, STANDBY, errorOf, failLanding, setRunning, setup, sha } from './landing-setup.js';
+import { A, B, C, HOUR, LANDER, LANDER_AUTH, MIN, P, STANDBY, errorOf, failLanding, setRunning, setup, sha } from './landing-setup.js';
 
 // H2 (design §1.4 T0, T1, T15; §2.1 queueLanding): queue-mode land, replay,
 // supersede, the retry chain, the advisory claim gate and record mode's refusal.
@@ -477,7 +477,7 @@ describe('record mode', () => {
     expect(hub.land(P, A, { summary: 'docs' }).landing.status).toBe('recorded');
 
     // A lander lease claim, even one released since, closes it for good.
-    const lease = hub.claim(P, LANDER, { files: [LANDER_LEASE_KEY], intent: 'lander on build1' }).claim!;
+    const lease = hub.claim(P, LANDER, { files: [LANDER_LEASE_KEY], intent: 'lander on build1' }, LANDER_AUTH).claim!;
     hub.release(P, LANDER, { claim_id: lease.id });
     hub.createTask(P, A, { title: 'y' });
     hub.takeTask(P, A, 'T-2');
@@ -523,8 +523,8 @@ describe('position, ETA and lander', () => {
     const first = hub.land(P, A, { commit: sha('1'), queue: true, branch: 'a' });
     expect(first).toMatchObject({ position: 1, eta_ms: null, lander: null, landing: { id: 'L-4', position: 1, eta_ms: null } });
 
-    const lease = hub.claim(P, LANDER, { files: [LANDER_LEASE_KEY], ttl_ms: 10 * MIN }).claim!;
-    hub.claim(P, STANDBY, { files: [LANDER_LEASE_KEY], queue: true, ttl_ms: 10 * MIN });
+    const lease = hub.claim(P, LANDER, { files: [LANDER_LEASE_KEY], ttl_ms: 10 * MIN }, LANDER_AUTH).claim!;
+    hub.claim(P, STANDBY, { files: [LANDER_LEASE_KEY], queue: true, ttl_ms: 10 * MIN }, LANDER_AUTH);
     const second = hub.land(P, B, { commit: sha('2'), queue: true, branch: 'b' });
     expect(second.lander).toEqual({ holder: LANDER, claim_id: lease.id, expires_at: lease.expires_at, standby: [STANDBY] });
     expect(second).toMatchObject({ position: 2, eta_ms: 6 * MIN, landing: { position: 2, eta_ms: 6 * MIN } });

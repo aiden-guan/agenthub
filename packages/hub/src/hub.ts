@@ -1,6 +1,51 @@
-import { LANDER_LEASE_KEY } from '@agenthub/contract';
-import { HubError, capText, claimFiles, cleanText, idOf, normalizeRepoPath, toConflict, unique, type HubInternals } from './common.js';
-import { parseQueueRequest, queueLanding, taskLandingError } from './landings.js';
+import { LANDER_LEASE_KEY, RESERVED_PREFIX } from '@agenthub/contract';
+import { HubError, NO_AUTH, capText, claimFiles, cleanText, idOf, normalizeRepoPath, toConflict, unique, type HubAuth, type HubInternals } from './common.js';
+import {
+  parseAdmit,
+  parseAdvance,
+  parseApprove,
+  parseCancel,
+  parseDays,
+  parseLease,
+  parsePause,
+  parseReject,
+  parseResolve,
+  parseResume,
+  parseTrunkReport,
+} from './landing-requests.js';
+import {
+  assertLander,
+  expireLandings,
+  isLeaseClaim,
+  landingDue,
+  onLeaseEnded,
+  pauseLander,
+  reportTrunk,
+  requireApprover,
+  requireLander,
+  resumeLander,
+} from './lander-control.js';
+import {
+  LIVE_LANDING_STATUSES,
+  admitLanding,
+  advanceLanding,
+  approveLanding,
+  cancelLanding,
+  landerInfo,
+  landingStats,
+  mustGetLanding,
+  nextLanding,
+  parseQueueRequest,
+  queueLanding,
+  queueView,
+  rejectLanding,
+  resolveLanding,
+  shownLanding,
+  taskLandingError,
+  withEstimates,
+  withoutSeq,
+  type Transition,
+} from './landings.js';
 import {
   AGENT_ID_RE,
   CHANNEL_RE,
@@ -23,6 +68,24 @@ import {
   type Landing,
   type LandRequest,
   type LandResult,
+  type LanderControl,
+  type LanderInfo,
+  type LanderNextRequest,
+  type LanderNextResult,
+  type LanderPauseRequest,
+  type LanderResumeRequest,
+  type LandingAdmitRequest,
+  type LandingAdmitResult,
+  type LandingAdvanceRequest,
+  type LandingAdvanceResult,
+  type LandingResolveRequest,
+  type LandingStats,
+  type LandingStatus,
+  type ApproveRequest,
+  type CancelRequest,
+  type RejectRequest,
+  type TrunkReportRequest,
+  type LanderAuth,
   type Message,
   type ReleaseRequest,
   type ReleaseResult,
@@ -35,7 +98,7 @@ import {
 import { phase1Landing } from './landing-row.js';
 import type { AgentTouch, Store } from './store.js';
 
-export { HubError, cleanText, normalizeRepoPath } from './common.js';
+export { HubError, NO_AUTH, cleanText, normalizeRepoPath, type HubAuth } from './common.js';
 
 export interface HubOptions {
   store: Store;
@@ -75,6 +138,8 @@ const MAX_EVENTS_SCANNED = 5000;
 
 /** At most this many claims are named in a landing note. */
 const MAX_NOTE_CLAIMS = 10;
+
+const ALL_LANDING_STATUSES: readonly LandingStatus[] = ['recorded', 'submitted', 'queued', 'needs_approval', 'running', 'landed', 'failed', 'cancelled', 'superseded'];
 
 /**
  * The coordination core. Every state change goes through `write()`, which
@@ -117,6 +182,7 @@ export class Hub {
       emit: (project, type, actor, data, targets) => this.emit(project, type, actor, data, targets),
       endClaim: (project, c, status, reason, now) => this.endClaim(project, c, status, reason, now),
       promoteQueued: (project, now) => this.promoteQueued(project, now),
+      breakWaitCycles: (project, agent, now, reason) => this.breakWaitCycles(project, agent, now, reason),
       announceUnblocked: (project, doneId, actor) => this.announceUnblocked(project, doneId, actor),
       touch: (project, agent, now) => this.touch(project, agent, now),
       withBlocked: (project, task) => this.withBlocked(project, task),
@@ -150,12 +216,22 @@ export class Hub {
 
   // ---------------------------------------------------------------- claims
 
-  claim(project: string, agent: string, req: ClaimRequest): ClaimResult {
+  /**
+   * `auth` matters only for the reserved key: a claim under RESERVED_PREFIX
+   * needs lander credentials and must be exactly [LANDER_LEASE_KEY],
+   * exclusive (403 forbidden otherwise). That claim is the lander lease.
+   */
+  claim(project: string, agent: string, req: ClaimRequest, auth: HubAuth = NO_AUTH): ClaimResult {
     assertAgent(agent);
     const scope = normalizeScope(req);
     const mode = req.mode ?? 'exclusive';
     if (mode !== 'exclusive' && mode !== 'shared' && mode !== 'auto') {
       throw new HubError('bad_request', 'mode must be exclusive, shared or auto');
+    }
+    if (scope.some((s) => s.file.startsWith(RESERVED_PREFIX))) {
+      if (!auth.lander) throw new HubError('forbidden', `${RESERVED_PREFIX} is reserved for the lander lease: only a lander, with lander credentials, may claim it`, 403);
+      const lease = scope.length === 1 && scope[0].file === LANDER_LEASE_KEY && scope[0].symbol === undefined && mode === 'exclusive';
+      if (!lease) throw new HubError('forbidden', `a lander claims exactly ${LANDER_LEASE_KEY}, exclusive, and nothing else in that claim`, 403);
     }
     const ttl = clampInt(req.ttl_ms, this.leaseTtlMs, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS, 'ttl_ms');
     // Heartbeats for a claim come before its lease runs out, by default three times per lease.
@@ -683,6 +759,135 @@ export class Hub {
     });
   }
 
+  // ------------------------------------------------------- lander protocol
+  // Lander writes (design §1.4, §1.5) are durable, need lander credentials
+  // (403 forbidden) and are fenced by the lease after the expiry pre-step (409
+  // not_lander). Approver writes need an approver (403 not_approver).
+
+  /** POST /lander/next (T4): an in-doubt or this lease's running landing first, else the next queued one starts. */
+  nextLanding(project: string, agent: string, req: LanderNextRequest, auth: HubAuth = NO_AUTH): LanderNextResult {
+    assertAgent(agent);
+    requireLander(auth);
+    const lease = parseLease(req?.lease);
+    return this.landerWrite(project, agent, lease, (now, claim) => {
+      const next = nextLanding(this.ix, project, agent, claim, now);
+      return {
+        landing: next.landing && shownLanding(this.store, project, next.landing, now),
+        resolve: next.resolve,
+        control: this.store.getLanderControl(project),
+        now,
+        seq: this.store.latestSeq(project),
+      };
+    });
+  }
+
+  /** POST /landings/:id/admit (T2, T3). */
+  admitLanding(project: string, agent: string, id: string, req: LandingAdmitRequest, auth: HubAuth = NO_AUTH): LandingAdmitResult {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parseAdmit(req);
+    return this.landerWrite(project, agent, input.lease, (now) => {
+      const r = admitLanding(this.ix, project, agent, id, input, now);
+      return { landing: shownLanding(this.store, project, r.landing, now), conflicts: r.conflicts, now, seq: this.store.latestSeq(project) };
+    });
+  }
+
+  /** POST /landings/:id/advance (T3, T5, T6, T9, T11, T13), attempt-fenced, with replay detection. */
+  advanceLanding(project: string, agent: string, id: string, req: LandingAdvanceRequest, auth: HubAuth = NO_AUTH): LandingAdvanceResult {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parseAdvance(req);
+    return this.landerWrite(project, agent, input.lease, (now, claim) => this.advanced(project, advanceLanding(this.ix, project, agent, id, input, claim, now), now));
+  }
+
+  /** POST /landings/:id/resolve (T11, T12): an in-doubt or this lease's landing in pushing, after the remote was inspected. */
+  resolveLanding(project: string, agent: string, id: string, req: LandingResolveRequest, auth: HubAuth = NO_AUTH): LandingAdvanceResult {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parseResolve(req);
+    return this.landerWrite(project, agent, input.lease, (now, claim) => this.advanced(project, resolveLanding(this.ix, project, agent, id, input, claim, now), now));
+  }
+
+  /** POST /lander/trunk: policy, trunk tip, reconcile (T16), foreign commits, rewrite pause. */
+  reportTrunk(project: string, agent: string, req: TrunkReportRequest, auth: HubAuth = NO_AUTH): { control: LanderControl } {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parseTrunkReport(req);
+    return this.landerWrite(project, agent, input.lease, (now) => ({ control: reportTrunk(this.ix, project, agent, input, now) }));
+  }
+
+  /** POST /lander/pause. */
+  pauseLander(project: string, agent: string, req: LanderPauseRequest, auth: HubAuth = NO_AUTH): { control: LanderControl } {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parsePause(req);
+    return this.landerWrite(project, agent, input.lease, (now) => ({ control: pauseLander(this.ix, project, agent, input, now) }));
+  }
+
+  /** POST /lander/resume (approver). */
+  resumeLander(project: string, req: LanderResumeRequest, auth: HubAuth = NO_AUTH): { control: LanderControl } {
+    const approver = requireApprover(auth);
+    const input = parseResume(req);
+    return this.write(project, (now) => ({ control: resumeLander(this.ix, project, approver, input, now) }), { durable: true });
+  }
+
+  /** POST /landings/:id/approve (T7). */
+  approveLanding(project: string, id: string, req: ApproveRequest, auth: HubAuth = NO_AUTH): { landing: Landing } {
+    const approver = requireApprover(auth);
+    const input = parseApprove(req);
+    return this.write(project, (now) => ({ landing: shownLanding(this.store, project, approveLanding(this.ix, project, id, input, approver, now), now) }), { durable: true });
+  }
+
+  /** POST /landings/:id/reject (T8). */
+  rejectLanding(project: string, id: string, req: RejectRequest, auth: HubAuth = NO_AUTH): { landing: Landing } {
+    const approver = requireApprover(auth);
+    const input = parseReject(req);
+    return this.write(project, (now) => ({ landing: shownLanding(this.store, project, rejectLanding(this.ix, project, id, input, approver, now), now) }), { durable: true });
+  }
+
+  /** POST /landings/:id/cancel (T14): its author (`agent`) or an approver. */
+  cancelLanding(project: string, agent: string | null, id: string, req: CancelRequest = {}, auth: HubAuth = NO_AUTH): { landing: Landing } {
+    if (agent !== null) assertAgent(agent);
+    const approver = auth.approver === null ? null : requireApprover(auth);
+    parseCancel(req);
+    return this.write(project, (now) => ({ landing: shownLanding(this.store, project, cancelLanding(this.ix, project, id, agent, approver, now), now) }), { durable: true });
+  }
+
+  /** GET /lander: the lease and the control. */
+  landerStatus(project: string): { lease: LanderInfo | null; control: LanderControl } {
+    return this.read(project, () => ({ lease: landerInfo(this.store, project), control: this.store.getLanderControl(project) }));
+  }
+
+  /** GET /landings: live landings first, in queue order, then the most recent; at most `limit` (default 50). */
+  listLandings(project: string, filter: { statuses?: LandingStatus[]; agent?: string; task_id?: string; limit?: number } = {}): Landing[] {
+    const limit = clampInt(filter.limit, 50, 1, 500, 'limit');
+    const statuses = filter.statuses ?? ALL_LANDING_STATUSES;
+    if (!Array.isArray(statuses) || statuses.some((st) => !ALL_LANDING_STATUSES.includes(st))) {
+      throw new HubError('bad_request', `status must be among ${ALL_LANDING_STATUSES.join(', ')}`);
+    }
+    const agent = filter.agent || undefined;
+    const taskId = filter.task_id || undefined;
+    return this.read(project, (now) => {
+      const view = queueView(this.store, project, now);
+      const live = statuses.filter((st) => LIVE_LANDING_STATUSES.includes(st));
+      const rest = statuses.filter((st) => !LIVE_LANDING_STATUSES.includes(st));
+      const first = live.length > 0 ? this.store.listLandings(project, { statuses: live, agent, task_id: taskId, order: 'queue', limit }) : [];
+      const then = rest.length > 0 && first.length < limit ? this.store.listLandings(project, { statuses: rest, agent, task_id: taskId, order: 'recent', limit: limit - first.length }) : [];
+      return [...first, ...then].map((l) => withEstimates(view, withoutSeq(l)));
+    });
+  }
+
+  /** GET /landings/:id. */
+  getLanding(project: string, id: string): Landing {
+    return this.read(project, (now) => shownLanding(this.store, project, mustGetLanding(this.store, project, id), now));
+  }
+
+  /** GET /landings/stats?days=7. */
+  landingStats(project: string, days?: number | string): LandingStats {
+    const window = parseDays(days);
+    return this.read(project, (now) => landingStats(this.store, project, window, now));
+  }
+
   // ------------------------------------------------------- status & events
 
   status(project: string, agent: string | null): StatusResult {
@@ -711,13 +916,9 @@ export class Hub {
         unread: agent ? this.store.countMessagesFor(project, agent, this.store.getInboxCursor(project, agent)) : 0,
         decisions: this.store.listDecisions(project, 10),
         landings: this.store.listLandings(project, { order: 'recent', limit: 5 }),
-        queue: [],
-        lander: null,
-        control: {
-          paused: null,
-          trunk: null,
-          policy: { keep_place_retries: 2, sendback_grace_min: 30, approval_timeout_hours: 24, claim_gate: 'fail' },
-        },
+        queue: this.queue(project, now),
+        lander: landerInfo(this.store, project),
+        control: this.store.getLanderControl(project),
       };
     });
   }
@@ -769,6 +970,21 @@ export class Hub {
 
   // -------------------------------------------------------------- internals
 
+  /** A lander write: durable, with the lease fenced after the expiry pre-step (409 not_lander). */
+  private landerWrite<T>(project: string, agent: string, lease: LanderAuth, fn: (now: number, lease: Claim) => T): T {
+    return this.write(project, (now) => fn(now, assertLander(this.store, project, agent, lease, now)), { durable: true });
+  }
+
+  private advanced(project: string, t: Transition, now: number): LandingAdvanceResult {
+    return { landing: shownLanding(this.store, project, t.landing, now), released: t.released, unblocked: t.unblocked, replayed: t.replayed, now, seq: this.store.latestSeq(project) };
+  }
+
+  /** Live landings in queue order, with positions and ETAs. */
+  private queue(project: string, now: number): Landing[] {
+    const view = queueView(this.store, project, now);
+    return this.store.listLandings(project, { statuses: [...LIVE_LANDING_STATUSES], order: 'queue' }).map((l) => withEstimates(view, withoutSeq(l)));
+  }
+
   /**
    * The single serialized write path. Runs `fn` synchronously in one store
    * transaction after expiring overdue leases; refuses re-entry; publishes the
@@ -788,6 +1004,7 @@ export class Hub {
           this.txNow = now;
           this.store.ensureProject(project, now);
           this.expireDue(project, now);
+          expireLandings(this.ix, project, now);
           return fn(now);
         },
         { durable: opts.durable === true },
@@ -833,14 +1050,19 @@ export class Hub {
     }
   }
 
-  /** Reads go through `write` only when a lease is overdue, so they never see a dead claim. */
+  /**
+   * Reads go through `write` only when a lease or a landing deadline is
+   * overdue, so they never see a dead claim or a landing the hub should have
+   * moved on.
+   */
   private read<T>(project: string, fn: (now: number) => T): T {
     assertProject(project);
     if (this.pending) return fn(this.txNow);
     const now = this.clock();
-    if (this.store.listClaims(project, { statuses: ['active', 'queued'], expiresAtOrBefore: now }).length > 0) {
-      this.write(project, () => undefined);
-    }
+    const due =
+      this.store.listClaims(project, { statuses: ['active', 'queued'], expiresAtOrBefore: now }).length > 0 ||
+      this.store.listLandings(project, { statuses: ['running', 'needs_approval'], order: 'queue' }).some((l) => landingDue(l, now));
+    if (due) this.write(project, () => undefined);
     return fn(this.clock());
   }
 
@@ -880,10 +1102,20 @@ export class Hub {
   private expireDue(project: string, now: number): void {
     const due = this.store.listClaims(project, { statuses: ['active', 'queued'], expiresAtOrBefore: now });
     if (due.length === 0) return;
-    for (const c of due) this.endClaim(project, c, 'expired', 'lease expired: heartbeats stopped', now);
+    for (const { id } of due) {
+      // As it is now: a lander lease that ends can fail its landing, whose effects end or extend other claims.
+      const c = this.store.getClaim(project, id);
+      if (!c || (c.status !== 'active' && c.status !== 'queued') || c.expires_at > now) continue;
+      this.endClaim(project, c, 'expired', 'lease expired: heartbeats stopped', now);
+    }
     this.promoteQueued(project, now);
   }
 
+  /**
+   * The single place a claim ends: release, expiry, land, holds. A lander
+   * lease that ends takes its running landing with it (onLeaseEnded: requeued,
+   * or in doubt when it was pushing), in the same transaction.
+   */
   private endClaim(project: string, c: Claim, status: 'released' | 'expired', reason: string, now: number): Claim {
     this.store.updateClaim(project, c.id, { status, ended_at: now, end_reason: reason });
     this.emit(project, status === 'expired' ? 'claim.expired' : 'claim.released', status === 'expired' ? null : c.holder, {
@@ -895,7 +1127,9 @@ export class Hub {
       landing_id: c.landing_id,
       scope: c.scope,
     });
-    return { ...c, status, ended_at: now, end_reason: reason };
+    const ended = { ...c, status, ended_at: now, end_reason: reason };
+    if (c.status === 'active' && isLeaseClaim(c)) onLeaseEnded(this.ix, project, ended, now);
+    return ended;
   }
 
   /**
@@ -928,6 +1162,29 @@ export class Hub {
         promoted.push(this.store.getClaim(project, q.id)!);
       }
     }
+  }
+
+  /**
+   * Ends `agent`'s queued claims that wait, directly or through others, for
+   * `agent` itself, then promotes what that frees. claim() never queues such a
+   * claim. But a landing's hold is a node that waits for nobody, so the agent
+   * may queue for a file held by someone who waits for the hold; when the
+   * landing comes back and the hold is the agent's lease again, the two would
+   * wait for each other until one lets go. Ending the agent's claim keeps the
+   * graph acyclic; asked again, it is refused with the deadlock explained.
+   */
+  private breakWaitCycles(project: string, agent: string, now: number, reason: string): Claim[] {
+    const ended: Claim[] = [];
+    for (;;) {
+      const waits = this.waitGraph(project);
+      if (!waits.reach.has(agent, agent)) break;
+      // The cycle leaves the agent through one of its waits in `all` (the others are implied by those).
+      const closing = [...(waits.all.get(agent)?.entries() ?? [])].find(([node]) => node === agent || waits.reach.has(node, agent))?.[1].waiter;
+      if (!closing || closing.holder !== agent || closing.status !== 'queued') break;
+      ended.push(this.endClaim(project, closing, 'released', reason, now));
+    }
+    if (ended.length > 0) this.promoteQueued(project, now);
+    return ended;
   }
 
   /**

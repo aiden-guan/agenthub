@@ -1,6 +1,6 @@
 # Lane H (hub) notes
 
-No dependency requests so far. One contract-amendment request (a comment only, H2 below).
+No dependency requests so far. Contract-amendment requests: one comment (H2), two additive fields (H3). All are worked around, so nothing waits on them.
 
 ## H1: storage and migration
 
@@ -31,5 +31,57 @@ Decisions H3 and H4 build on:
 - **Gate `warn` at T1** leaves the conflicting entries out and says so in the note. Nothing tells the other side at T1; H3's admission (T2) is where the lander messages both.
 - **Record mode.** 409 `landing_queue_active` once any claim on `LANDER_LEASE_KEY` exists in the project, whatever its status; it never releases holds; and a task in `landing` answers 409 `task_landing` there too. Until H3 adds the reserved-key rule, any agent can claim that key.
 - **The holder's own request on a held file** gets a separate lease, but like any request it waits behind other agents already queued for that file (they asked first; the hold doesn't make the holder jump the line).
-- **Open for H3: a send-back can close a wait cycle.** If A's landing holds X, B waits for X, and A waits for Y that B holds, there is no cycle while X is a hold (node `landing:L`). When the landing fails, `holdsToLeases` makes X A's lease again and the cycle is real; `buildWaits` copes (cyclic waits come last) but neither claim is promoted until A re-lands, releases X, or its grace runs out. H3's failure path may want to end the holder's queued claims that close such a cycle, with a reason.
+- **A send-back can close a wait cycle (done in H3).** If A's landing holds X, B waits for X, and A waits for Y that B holds, there is no cycle while X is a hold (node `landing:L`). When the landing fails or is cancelled, `holdsToLeases` makes X A's lease again and the cycle would be real. The failure effects now end A's queued claims that close it (`Hub.breakWaitCycles`, reason "deadlock: L-n came back, ..."), so the graph stays acyclic; A asking again gets Phase 1's 409 deadlock with the explanation.
 - **For H5: symbol-only trims.** When `setHolds` drops a symbol entry but the hold keeps other entries of that file, its partial `claim.released` names no file (the adapter's feed drops the files an event names), so the cached wait graph treats it as changing nothing. That is right while waits are file-level; once H5 makes waits symbol-aware, such an event must invalidate the cache.
+
+## H3: the lander protocol
+
+Layout:
+
+- **`src/landing-requests.ts` (new).** Validation of every lander and approver body before the write (`parseAdmit`, `parseAdvance`, `parseResolve`, `parseTrunkReport`, `parsePause`, `parseResume`, `parseApprove`, `parseReject`, `parseCancel`, `parseDays`, `parsePolicy`, `parseRequirements`, `parseReport`). Problems are 400 `bad_request`; bad paths `invalid_path`; bad symbol keys `invalid_symbol`; reserved paths 403 `forbidden`. `normalizeLandingScope` moved here from `landings.ts` (unchanged, plus the reserved-path check).
+- **`src/lander-control.ts` (new).** `requireLander`, `requireApprover`, `isLeaseClaim`, `assertLander`, `onLeaseEnded`, `landingDue`, `expireLandings`, `reportTrunk`, `pauseLander`, `resumeLander`.
+- **`src/landings.ts`.** The transitions: `nextLanding` (T4), `admitLanding` (T2/T3), `advanceLanding` (T3, T5, T6, T9, T11, T13), `resolveLanding` (T11/T12), `approveLanding`/`rejectLanding` (T7/T8), `cancelLanding` (T14), the shared `requeueLanding`, `failLanding`, `completeLanding`, plus `satisfied`/`allowedBy` and `landingStats`.
+- **`src/hub.ts`.** Public methods (below), the reserved-key rule in `claim()`, `endClaim` calling `onLeaseEnded`, the write pre-step `expireDue` then `expireLandings`, `read()` writing first when a claim or a landing deadline is due, `status()` with `queue`/`lander`/`control`.
+
+**Hub API for H4 and lane L** (every method also takes the request body as the protocol types it; `auth` defaults to `NO_AUTH`; all writes but `claim` are durable):
+
+| Method | Route | Needs |
+|---|---|---|
+| `claim(project, agent, req, auth)` | `POST /claims` | `auth.lander` for the reserved key |
+| `nextLanding(project, agent, req, auth)` | `POST /lander/next` | lander |
+| `admitLanding(project, agent, id, req, auth)` | `POST /landings/:id/admit` | lander |
+| `advanceLanding(project, agent, id, req, auth)` | `POST /landings/:id/advance` | lander |
+| `resolveLanding(project, agent, id, req, auth)` | `POST /landings/:id/resolve` | lander |
+| `reportTrunk(project, agent, req, auth)` → `{control}` | `POST /lander/trunk` | lander |
+| `pauseLander(project, agent, req, auth)` → `{control}` | `POST /lander/pause` | lander |
+| `resumeLander(project, req, auth)` → `{control}` | `POST /lander/resume` | approver |
+| `approveLanding(project, id, req, auth)` → `{landing}` | `POST /landings/:id/approve` | approver |
+| `rejectLanding(project, id, req, auth)` → `{landing}` | `POST /landings/:id/reject` | approver |
+| `cancelLanding(project, agent \| null, id, req, auth)` → `{landing}` | `POST /landings/:id/cancel` | author (`agent`) or approver |
+| `landerStatus(project)` → `{lease, control}` | `GET /lander` | |
+| `listLandings(project, {statuses?, agent?, task_id?, limit?})` | `GET /landings` (wrap in `{landings}`) | |
+| `getLanding(project, id)` | `GET /landings/:id` (wrap in `{landing}`) | |
+| `landingStats(project, days?)` | `GET /landings/stats` | |
+
+`HubAuth = {lander: boolean, approver: string | null}` and `NO_AUTH` are exported from `index.ts`. The hub checks only what the server computed: lander methods without `auth.lander` answer 403 `forbidden`; approver methods without a valid human name in `auth.approver` answer 403 `not_approver` (H4 adds `approvals_disabled` and the token checks in front).
+
+Decisions H4, lane L and lane A build on:
+
+- **T3 (admission failure).** `LandingAdmitRequest` has no failure field, so a lander fails a submitted landing (`not_pushed`, `nothing_to_land`, `too_large`, `contains_unlanded`, ...) with `advance {to: 'failed', attempt: 0, code, report}`, which works with the frozen types. `admit` also accepts optional `code` and `report` (the design names T3 under admit). **Contract-amendment request (additive):** add `code?: LandingFailureCode; report?: LandingReport` to `LandingAdmitRequest`, documented as "fail the landing instead of admitting it". Either form ends the landing with the failure effects; `base_sha` may be absent then.
+- **T6 (park) and the candidate.** The `needs_approval` request names no candidate, but `Landing.candidate` is "set ... when parked" and the approved fast path needs it. The hub takes optional `candidate` and `candidate_ref` on that request, else the candidate of a `merged`/`ai_resolution` requirement in `required`, else what the landing had. **Contract-amendment request (additive):** add `candidate?: string; candidate_ref?: string` to the `needs_approval` variant of `LandingAdvanceRequest`. Until then lane L can also find the staged candidate on the remote (`ls-remote <P>cand/<epoch8>/<L-id>/*`).
+- **Replay rules** (`replayed: true`, nothing changes): same attempt, and for running phases the same phase and trunk_base (or none); pushing the same candidate; landed the same trunk_sha; failed the same code; needs_approval parked. All but queued also need the same lease claim (a requeue clears the lease; an admission failure at attempt 0 has none). Anything else on a landing that isn't running this attempt under this lease is 409 `landing_stale`. A repeat with the same phase but a new deadline is a replay too (the deadline isn't extended).
+- **Phases** only go forward (400 `bad_request` otherwise); a same-phase advance updates trunk_base and the deadline and emits nothing; `landing.updated {reason: phase}` only when the phase changes. In `pushing` only `advance landed` (with `trunk_sha == candidate`) or `resolve` move it on; anything else is 400.
+- **Into pushing** the hub requires the lander's `required` plus its own pending `approval` entries that are candidate-independent or bound to this candidate; `details.missing` lists the unsatisfied ones. A requirement is satisfied when every rule has an approval with its kind and digest from a human the rule allows (one approval may satisfy several rules).
+- **needs_approval** stores only the still-pending requirements as `approval`, keeps the lander and lease (for replay), and sets `candidate_checked` when the candidate is known. If every requirement was approved while the checks ran, it goes straight back to the queue (`landing.updated {reason: approved}`).
+- **Requeue** (T9/T12) clears phase, lander, lease, deadline and in_doubt, keeps queue_seq, trunk_base and the candidate fields (the lander decides on the fast path). A lander may requeue only for `trunk_moved`, `lander_stopping`, `remote_unavailable`, `config_invalid`, `trunk_rewritten`; `lander_lost` and `step_timeout` are the hub's. `resolve {requeue}` counts `trunk_moved` and does not move `control.trunk` (the next trunk report does, so foreign commits are still reported).
+- **Failed and landed** keep `lander`, `lease_claim_id` and `attempt` (the record; replay detection uses them). `failure.summary` is the first line of the lander's `report.message`, else a hub-written line; hub-made failures (`trunk_busy`, `lander_lost`, `lander_stuck`, `approval_timeout`, `approval_rejected`, `claim_conflict`) have hub-written summaries. A rejection's summary quotes the approver's reason, labelled as theirs.
+- **Landed** sets `control.trunk` only when it moves trunk forward from what the hub knew (unknown, the landing's trunk_base, or the same sha), so a landing found on trunk at an older commit never moves it back. `trunk.moved {foreign: false}` is skipped when from == to (a no-op landing). `also_landed` names only the same agent's failed, superseded or cancelled landings; others are ignored and left out of the event.
+- **In doubt.** `next` hands the in-doubt landing to any lease holder with `resolve: true` and does not take it over (its `lease_claim_id` stays the old lease, so `advance` is `landing_stale` for it; `resolve` is the way). A running landing under a live lease that isn't the caller's is never handed out.
+- **Approvals.** A repeat approval by the same human with the same kind and digest changes nothing (no row, no event). `landing.updated {reason: approved}` is emitted with the approver's name as the actor, whatever the status (fixture event 421). `reject` works in any live state but pushing (409 `too_late`) while an approval is pending (else 409 `approval_stale`), for an approver some pending rule allows; it appends a `reject` row per such requirement. Carried approvals keep the original `at` and name the landing they were first given on.
+- **Cancel** takes `reason` but doesn't store it (there is no column, and it is agent text). It emits `landing.updated {reason: cancelled}` (cancel has no failure code, so no `landing.failed`).
+- **Pause and resume.** A pause for the same reason, or any pause while `trunk_rewritten` is set, changes nothing. Resuming a `trunk_rewritten` pause needs `accept_trunk` (400 otherwise), which becomes `control.trunk`. `lander.resumed` is `{reason: 'human', by}` and only when something was paused.
+- **Trunk reports** store the policy every time, then: rewritten pauses (control.trunk stays); otherwise each commit is matched by Landing (`<project>/<L-id>`), Hub (this epoch) and Source (the landing's commit). A match not yet landed is reconciled (landed effects as far as they still apply, `landing.landed {reconciled: true}`, `trunk.moved {foreign: false}`, and a hub-written direct message from the reporting lander to the author); an already landed match emits nothing; no match is `trunk.moved {foreign: true}`. Commit paths no claim could name are dropped from `files` rather than refusing the report.
+- **Admission warnings** are kept as a minimal `report` (`message: ''`, `warnings`) until the lander writes its own.
+- **Stats.** Window: landings whose `ended_at` is within `days` (1 to 365, default 7). Time to trunk per landed landing from the earliest landing of its retry/supersede chain; p90 by nearest rank; first-try rate = landed chains with no failed landing, rounded to 2 decimals; send-backs by failure code; median check from `report.check.duration_ms` and queue wait from `started_at - created_at` (latest pick), over landed and failed landings.
+- **expireDue** re-reads each due claim before ending it: a lander lease that ends can fail its landing, whose effects end or extend other claims in the same loop.
+- **Tests' race child.** `test/fixtures/race-child.mjs` takes optional `[file] [lander]` arguments (the old three-argument form is unchanged).

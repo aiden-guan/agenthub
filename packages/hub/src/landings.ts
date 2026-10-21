@@ -1,14 +1,36 @@
-import { FULL_SHA_RE, LANDER_LEASE_KEY, isValidSymbolKey } from '@agenthub/contract';
-import { HubError, cleanText, entryName, idOf, normalizeRepoPath, unique, type HubInternals } from './common.js';
+import { FULL_SHA_RE, LANDER_LEASE_KEY, humanOf } from '@agenthub/contract';
+import { HubError, capText, cleanText, entryName, idOf, normalizeRepoPath, unique, type HubInternals } from './common.js';
 import { holdsToLeases, moveHolds, planHolds, releaseHolds, setHolds, type HoldOwner } from './holds.js';
+import { assertNotReserved, normalizeLandingScope, type AdmitInput, type AdvanceInput, type ResolveInput } from './landing-requests.js';
 import { phase1Landing } from './landing-row.js';
-import type { Claim, ClaimConflict, LandRequest, LandResult, LanderInfo, Landing, LandingStatus, ScopeEntry, Task } from './protocol.js';
-import type { Store } from './store.js';
+import type {
+  ApprovalKind,
+  ApprovalRequirement,
+  ApprovalRule,
+  Claim,
+  ClaimConflict,
+  LandRequest,
+  LandResult,
+  LanderInfo,
+  Landing,
+  LandingApproval,
+  LandingFailureCode,
+  LandingPhase,
+  LandingReport,
+  LandingStats,
+  LandingStatus,
+  RequeueReason,
+  ResolvedBy,
+  ScopeEntry,
+  Task,
+} from './protocol.js';
+import type { LandingPatch, Store } from './store.js';
 
-// The landing queue's agent side (design §1.4 T1 and T15, §2.1): queue-mode
-// land, queue positions and ETAs, and the effects of a landing that lands or
-// comes back, which the lander protocol applies. Every function that changes
-// anything runs inside Hub.write.
+// The landing queue (design §1.4, §2.1): the agent's queue-mode land (T1,
+// T15), queue positions and ETAs, the effects of a landing that lands or comes
+// back, and the lander protocol (T2-T14): admission, next, the fenced advance
+// and resolve, approvals and cancel. Every function that changes anything runs
+// inside Hub.write; the lander's lease is checked before (lander-control.ts).
 
 /** Landings that still hold their change: they may yet reach trunk. */
 export const LIVE_LANDING_STATUSES: readonly LandingStatus[] = ['submitted', 'queued', 'needs_approval', 'running'];
@@ -56,7 +78,7 @@ export function parseQueueRequest(req: LandRequest): QueueRequest {
     if (typeof req.mapper !== 'string') throw new HubError('bad_request', 'mapper must be a string');
     mapper = cleanText(req.mapper, MAX_MAPPER) || null;
   }
-  const files = unique(listOf(req.files, 'files').map(normalizeRepoPath));
+  const files = unique(listOf(req.files, 'files').map((f) => assertNotReserved(normalizeRepoPath(f))));
   const scope = normalizeLandingScope(listOf(req.scope, 'scope'), mapper);
   const all = unique([...files, ...scope.map((e) => e.file)]);
   if (all.length > MAX_LAND_FILES) throw new HubError('bad_request', `a landing names at most ${MAX_LAND_FILES} files`);
@@ -76,34 +98,6 @@ export function parseQueueRequest(req: LandRequest): QueueRequest {
     release_claims: req.release_claims !== false,
     protected: protectedPaths,
   };
-}
-
-/**
- * Scope entries of a landing: `{file}` is the whole file; a symbol must be a
- * declaration key (SYMBOL_KEY_RE, at most 200 characters) and needs the
- * mapper that produced it (400 invalid_symbol).
- */
-function normalizeLandingScope(raw: unknown[], mapper: string | null): ScopeEntry[] {
-  const seen = new Set<string>();
-  const out: ScopeEntry[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== 'object') throw new HubError('bad_request', 'scope entries look like {file, symbol?}');
-    const { file: rawFile, symbol: rawSymbol } = entry as { file?: unknown; symbol?: unknown };
-    const file = normalizeRepoPath(rawFile);
-    let symbol: string | undefined;
-    if (rawSymbol !== undefined && rawSymbol !== null) {
-      if (typeof rawSymbol !== 'string' || !isValidSymbolKey(rawSymbol.normalize('NFC'))) {
-        throw new HubError('invalid_symbol', 'scope symbols are declaration keys such as login, Session.refresh, @imports or @toplevel, at most 200 characters');
-      }
-      if (mapper === null) throw new HubError('invalid_symbol', 'symbol entries need the mapper (MAPPER_VERSION) that produced them');
-      symbol = rawSymbol.normalize('NFC');
-    }
-    const key = `${file}\u0000${symbol ?? ''}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(symbol === undefined ? { file } : { file, symbol });
-  }
-  return out;
 }
 
 /**
@@ -411,6 +405,10 @@ export function landedEffects(ix: HubInternals, project: string, landing: Landin
 export function failureEffects(ix: HubInternals, project: string, landing: Landing, now: number, actor: string | null = null): { released: Claim[] } {
   const grace = ix.store.getLanderControl(project).policy.sendback_grace_min;
   const released = holdsToLeases(ix, project, landing.id, now, grace);
+  // Its files are the agent's leases again: a claim it queued meanwhile for something held by one of their waiters would now deadlock.
+  if (released.length > 0) {
+    ix.breakWaitCycles(project, landing.agent, now, `deadlock: ${landing.id} came back, so you hold its files again, and this claim waited for someone who waits for them. Ask again once you can let them go`);
+  }
   const task = carriedTask(ix.store, project, landing);
   if (task) {
     ix.store.updateTask(project, task.id, { status: 'in_progress', updated_at: now });
@@ -504,8 +502,654 @@ function andList(items: string[]): string {
   return items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
 }
 
-/** A stored landing as land answers it: without the row's undeclared seq. */
-function withoutSeq(landing: Landing): Landing {
+/** A stored landing as the hub answers it: without the row's undeclared seq (status().landings keeps it, as Phase 1 did). */
+export function withoutSeq(landing: Landing): Landing {
   const { seq: _seq, ...rest } = landing as Landing & { seq?: number };
   return rest;
+}
+
+// =============================================================== lander protocol (H3)
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+/** A picked landing must report progress within this (design §1.4 T4). */
+const PICK_DEADLINE_MS = 10 * MINUTE_MS;
+/** Step deadlines the lander asks for are clamped to this range (T5). */
+const MIN_STEP_MS = MINUTE_MS;
+const MAX_STEP_MS = 6 * HOUR_MS;
+const PHASE_ORDER: Record<LandingPhase, number> = { merging: 0, resolving: 1, checking: 2, pushing: 3 };
+/** Requeues that count against a limit, and what the landing fails with past it (T9). */
+const RETRY_LIMITS: Partial<Record<RequeueReason, { key: keyof Landing['retries']; max: number; code: LandingFailureCode; why: string }>> = {
+  trunk_moved: { key: 'trunk_moved', max: 3, code: 'trunk_busy', why: 'trunk was pushed outside the landing queue more than 3 times while it was landing' },
+  lander_lost: { key: 'lander_lost', max: 3, code: 'lander_lost', why: 'the lander running it stopped more than 3 times' },
+  step_timeout: { key: 'step_timeout', max: 2, code: 'lander_stuck', why: 'a step of its landing outlived its deadline more than twice (the lander seems stuck)' },
+};
+
+/** What a lander or approver write did to a landing. */
+export interface Transition {
+  landing: Landing;
+  /** Holds released (landed) or turned back into leases (failed, cancelled). */
+  released: Claim[];
+  unblocked: string[];
+  /** The request was already applied; nothing changed now. */
+  replayed: boolean;
+}
+
+export function isLive(landing: Pick<Landing, 'status'>): boolean {
+  return LIVE_LANDING_STATUSES.includes(landing.status);
+}
+
+/** A stored landing, without the row's seq; 404 when there is none. */
+export function mustGetLanding(store: Store, project: string, id: string): Landing {
+  const landing = typeof id === 'string' ? store.getLanding(project, id) : null;
+  if (!landing) throw new HubError('not_found', `no landing ${id}`, 404);
+  return withoutSeq(landing);
+}
+
+/** A landing as the hub shows it: with its position and ETA. */
+export function shownLanding(store: Store, project: string, landing: Landing, now: number): Landing {
+  return withEstimates(queueView(store, project, now), landing);
+}
+
+/** Writes `patch` (and updated_at) and reads the landing back. */
+export function updateLanding(ix: HubInternals, project: string, landing: Pick<Landing, 'id'>, patch: LandingPatch, now: number): Landing {
+  ix.store.updateLanding(project, landing.id, { ...patch, updated_at: now });
+  return mustGetLanding(ix.store, project, landing.id);
+}
+
+/** landing.updated: fixed reason codes and ids only, no agent text (design §1.8). */
+export function emitUpdated(ix: HubInternals, project: string, landing: Landing, reason: string, actor: string | null, now: number): void {
+  ix.emit(project, 'landing.updated', actor, {
+    landing_id: landing.id,
+    agent: landing.agent,
+    task_id: landing.task_id,
+    status: landing.status,
+    phase: landing.phase,
+    attempt: landing.attempt,
+    reason,
+    position: positionOf(queueView(ix.store, project, now), landing),
+  });
+}
+
+function emitNeedsApproval(ix: HubInternals, project: string, landing: Landing, pending: ApprovalRequirement[], parked: boolean, actor: string): void {
+  const rules = pending.flatMap((r) => r.rules);
+  ix.emit(project, 'landing.needs_approval', actor, {
+    landing_id: landing.id,
+    agent: landing.agent,
+    task_id: landing.task_id,
+    kinds: unique(pending.map((r) => r.kind)),
+    paths: unique(pending.flatMap((r) => r.paths)).sort().slice(0, 20),
+    approvers: rules.some((r) => r.approvers === null) ? null : unique(rules.flatMap((r) => r.approvers ?? [])),
+    parked,
+  });
+}
+
+/**
+ * T9 and T12: back to the queue in its place (queue_seq kept), lander and
+ * lease cleared. trunk_moved, lander_lost and step_timeout count, and past
+ * their limits the landing fails instead (trunk_busy, lander_lost,
+ * lander_stuck); the other reasons don't count.
+ */
+export function requeueLanding(ix: HubInternals, project: string, landing: Landing, reason: RequeueReason, now: number, actor: string | null): Transition {
+  const retries = { ...landing.retries };
+  const limit = RETRY_LIMITS[reason];
+  if (limit) {
+    retries[limit.key] += 1;
+    if (retries[limit.key] > limit.max) {
+      return failLanding(ix, project, landing, limit.code, `${landing.id} came back: ${limit.why}. Nothing of it reached trunk, and it is not caused by your change: land again once this is sorted out.`, null, now, actor, { retries });
+    }
+  }
+  const queued = updateLanding(ix, project, landing, { status: 'queued', phase: null, lander: null, lease_claim_id: null, deadline_at: null, in_doubt: false, retries }, now);
+  emitUpdated(ix, project, queued, `requeued:${reason}`, actor, now);
+  return { landing: queued, released: [], unblocked: [], replayed: false };
+}
+
+/** T3, T8, T13 and the retry limits: failed, with the failure effects and landing.failed. */
+export function failLanding(
+  ix: HubInternals,
+  project: string,
+  landing: Landing,
+  code: LandingFailureCode,
+  summary: string,
+  report: LandingReport | null,
+  now: number,
+  actor: string | null,
+  extra: LandingPatch = {},
+): Transition {
+  const failed = updateLanding(
+    ix,
+    project,
+    landing,
+    { status: 'failed', failure: { code, summary: capText(summary, 1000) }, ...(report ? { report } : {}), phase: null, deadline_at: null, in_doubt: false, ended_at: now, ...extra },
+    now,
+  );
+  const { released } = failureEffects(ix, project, failed, now, actor);
+  ix.emit(project, 'landing.failed', actor, { landing_id: failed.id, agent: failed.agent, task_id: failed.task_id, code, files: failed.files.slice(0, 50) });
+  return { landing: failed, released, unblocked: [], replayed: false };
+}
+
+/**
+ * T11 and T16: landed. The landed effects (holds released, waiters promoted,
+ * the task done, its dependents announced), also_landed annotated, and,
+ * unless reconciled from a trunk report (which says where trunk is itself),
+ * control.trunk and trunk.moved.
+ */
+export function completeLanding(
+  ix: HubInternals,
+  project: string,
+  landing: Landing,
+  o: { trunk_sha: string; base_sha?: string | null; files?: string[] | null; report?: LandingReport | null; also_landed?: string[]; reconciled: boolean },
+  now: number,
+  actor: string,
+): Transition {
+  const { store } = ix;
+  const known = store.getLanderControl(project).trunk;
+  const from = landing.trunk_base ?? known?.sha ?? null;
+  // The hub's trunk moves from where this landing merged onto (or a trunk it
+  // doesn't know yet) to the landing; a landing found on trunk at an older
+  // commit never moves it back.
+  const advancesTrunk = known === null || known.sha === from || known.sha === o.trunk_sha;
+  const patch: LandingPatch = { status: 'landed', trunk_sha: o.trunk_sha, phase: null, deadline_at: null, in_doubt: false, ended_at: now, reconciled: o.reconciled };
+  if (o.base_sha) patch.base_sha = o.base_sha;
+  if (o.files) patch.files = o.files;
+  if (o.report) patch.report = o.report;
+  const done = updateLanding(ix, project, landing, patch, now);
+  const effects = landedEffects(ix, project, done, now, actor);
+  const also: string[] = [];
+  for (const id of o.also_landed ?? []) {
+    const other = store.getLanding(project, id);
+    if (!other || other.id === done.id || other.agent !== done.agent || !['failed', 'superseded', 'cancelled'].includes(other.status)) continue;
+    store.updateLanding(project, id, { landed_with: done.id, updated_at: now });
+    also.push(id);
+  }
+  if (!o.reconciled && advancesTrunk) store.putLanderControl(project, { trunk: { sha: o.trunk_sha, landing_id: done.id, at: now } }, now);
+  ix.emit(project, 'landing.landed', actor, {
+    landing_id: done.id,
+    agent: done.agent,
+    task_id: done.task_id,
+    trunk_sha: o.trunk_sha,
+    files: done.files.slice(0, 200),
+    resolved_by: done.report?.resolved_by ?? null,
+    also_landed: also,
+    reconciled: o.reconciled,
+  });
+  if (!o.reconciled && from !== o.trunk_sha) {
+    ix.emit(project, 'trunk.moved', actor, { from, to: o.trunk_sha, landing_id: done.id, files: done.files.slice(0, 200), foreign: false });
+  }
+  return { landing: done, released: effects.released, unblocked: effects.unblocked, replayed: false };
+}
+
+/**
+ * T4: the landing to work on. A running landing comes first: in doubt (in
+ * pushing when the lease that ran it ended), or this lease's own, also while
+ * paused, with `resolve` when it is in pushing. Otherwise, unless paused, the
+ * lowest queue_seq queued landing whose waits_for is terminal starts: running,
+ * merging, attempt + 1, under this lease, with a 10 minute deadline.
+ */
+export function nextLanding(ix: HubInternals, project: string, agent: string, lease: Claim, now: number): { landing: Landing | null; resolve: boolean } {
+  const { store } = ix;
+  const running = store.listLandings(project, { statuses: ['running'], order: 'queue', limit: 1 })[0];
+  if (running) {
+    const landing = withoutSeq(running);
+    // Another lease's running landing that isn't in doubt: that lease is live, so it isn't ours to touch.
+    if (landing.in_doubt || landing.lease_claim_id === lease.id) return { landing, resolve: landing.phase === 'pushing' };
+    return { landing: null, resolve: false };
+  }
+  if (store.getLanderControl(project).paused) return { landing: null, resolve: false };
+  for (const queued of store.listLandings(project, { statuses: ['queued'], order: 'queue' })) {
+    if (queued.waits_for !== null) {
+      const first = store.getLanding(project, queued.waits_for);
+      if (first && isLive(first)) continue;
+    }
+    const picked = updateLanding(
+      ix,
+      project,
+      queued,
+      { status: 'running', phase: 'merging', phase_at: now, attempt: queued.attempt + 1, lander: agent, lease_claim_id: lease.id, in_doubt: false, started_at: now, deadline_at: now + PICK_DEADLINE_MS },
+      now,
+    );
+    emitUpdated(ix, project, picked, 'picked', agent, now);
+    return { landing: picked, resolve: false };
+  }
+  return { landing: null, resolve: false };
+}
+
+/**
+ * T2 and T3: the lander's authoritative view of a submitted landing. The
+ * holds are re-made from its exact scope through the gate (claim_gate fail:
+ * the landing fails with claim_conflict; warn: the conflicting entries are
+ * left out), entries the change doesn't touch are released, approvals the
+ * landing's chain already granted for the same content carry over, and what
+ * is still needed is asked for at once. A landing that is no longer submitted
+ * makes this a replay; a terminal one is 409 landing_closed.
+ */
+export function admitLanding(ix: HubInternals, project: string, agent: string, id: string, req: AdmitInput, now: number): { landing: Landing; conflicts: ClaimConflict[] } {
+  const { store } = ix;
+  const landing = mustGetLanding(store, project, id);
+  if (landing.status !== 'submitted') {
+    if (!isLive(landing)) throw closedError(landing);
+    return { landing, conflicts: [] };
+  }
+  if (req.waits_for !== null && (req.waits_for === id || !store.getLanding(project, req.waits_for))) {
+    throw new HubError('bad_request', `waits_for names no other landing of this project: ${req.waits_for}`);
+  }
+  const recorded: LandingPatch = {
+    base_sha: req.base_sha ?? landing.base_sha,
+    files: req.files,
+    scope: req.scope,
+    mapper: req.mapper,
+    protected: req.protected,
+    waits_for: req.waits_for,
+  };
+  if (req.failure) {
+    const failed = failLanding(ix, project, landing, req.failure.code, summaryOf(req.failure.report, req.failure.code, id), req.failure.report, now, agent, recorded);
+    return { landing: failed.landing, conflicts: [] };
+  }
+
+  const gate = store.getLanderControl(project).policy.claim_gate;
+  const own = store.listClaims(project, { statuses: ['active'], landing_id: id });
+  const scope = req.scope ?? [];
+  const entries = [...scope, ...req.files.filter((f) => !scope.some((e) => e.file === f)).map((file) => ({ file }))];
+  const holds = setHolds(ix, project, { ...landing, files: req.files }, entries, req.mapper, gate, now, { own });
+  if (!holds.applied) {
+    const failed = failLanding(ix, project, landing, 'claim_conflict', conflictSummary(landing.id, holds.conflicts), null, now, agent, recorded);
+    return { landing: failed.landing, conflicts: holds.conflicts };
+  }
+
+  carryApprovals(store, project, landing, req.required);
+  const approvals = mustGetLanding(store, project, id).approvals;
+  const pending = req.required.filter((r) => !satisfied(r, approvals, landing.agent));
+  const admitted = updateLanding(
+    ix,
+    project,
+    landing,
+    { ...recorded, status: 'queued', approval: pending, hold_ids: holds.holds.map((h) => h.id), ...(req.warnings.length > 0 ? { report: warningsReport(req.warnings) } : {}) },
+    now,
+  );
+  emitUpdated(ix, project, admitted, 'admitted', agent, now);
+  if (pending.length > 0) emitNeedsApproval(ix, project, admitted, pending, false, agent);
+  if (holds.trimmed) ix.promoteQueued(project, now);
+  return { landing: admitted, conflicts: holds.conflicts };
+}
+
+/**
+ * T5, T6, T9, T11 and T13 for the lease's own attempt (`lease` checked by
+ * assertLander), plus T3 for a submitted landing at attempt 0. A request the
+ * row already reflects answers replayed: true; any other request for a landing
+ * that isn't running this attempt under this lease is 409 landing_stale.
+ */
+export function advanceLanding(ix: HubInternals, project: string, agent: string, id: string, req: AdvanceInput, lease: Claim, now: number): Transition {
+  const { store } = ix;
+  const landing = mustGetLanding(store, project, id);
+  if (landing.status === 'submitted' && req.to === 'failed' && req.attempt === 0 && landing.attempt === 0) {
+    return failLanding(ix, project, landing, req.code, summaryOf(req.report, req.code, id), req.report, now, agent);
+  }
+  if (isReplay(landing, req, lease.id)) return { landing, released: [], unblocked: [], replayed: true };
+  if (landing.status !== 'running' || landing.attempt !== req.attempt || landing.lease_claim_id !== lease.id) throw staleError(landing, req.attempt);
+  const pushing = landing.phase === 'pushing';
+  if (pushing && req.to !== 'landed') {
+    throw new HubError('bad_request', `${id} is in pushing: it moves on only as landed (the push went through) or by resolve, once the remote has been inspected`);
+  }
+  switch (req.to) {
+    case 'running':
+      return req.phase === 'pushing' ? enterPushing(ix, project, landing, req, now, agent) : changePhase(ix, project, landing, req, now, agent);
+    case 'queued':
+      return requeueLanding(ix, project, landing, req.reason, now, agent);
+    case 'needs_approval':
+      return park(ix, project, landing, req, now, agent);
+    case 'landed':
+      if (pushing && req.trunk_sha !== landing.candidate) {
+        throw new HubError('bad_request', `${id} was pushing candidate ${landing.candidate}: landed means trunk is that commit, not ${req.trunk_sha}`);
+      }
+      return completeLanding(ix, project, landing, { trunk_sha: req.trunk_sha, base_sha: req.base_sha, files: req.files, report: req.report, also_landed: req.also_landed, reconciled: false }, now, agent);
+    case 'failed':
+      return failLanding(ix, project, landing, req.code, summaryOf(req.report, req.code, id), req.report, now, agent);
+  }
+}
+
+/** Whether the row already reflects `req` (design §1.5 replay): same attempt and lease, and the state asked for. */
+function isReplay(l: Landing, req: AdvanceInput, leaseId: string): boolean {
+  if (l.attempt !== req.attempt) return false;
+  // A landing failed at admission (attempt 0) ran under no lease.
+  const ours = l.lease_claim_id === leaseId || (req.attempt === 0 && l.lease_claim_id === null);
+  switch (req.to) {
+    case 'running':
+      if (l.status !== 'running' || !ours) return false;
+      if (req.phase === 'pushing') return l.phase === 'pushing' && l.candidate === req.candidate;
+      return l.phase === req.phase && (req.trunk_base === null || req.trunk_base === l.trunk_base);
+    case 'queued':
+      // A requeue clears the lease; the attempt number still names it.
+      return l.status === 'queued';
+    case 'needs_approval':
+      return l.status === 'needs_approval' && ours;
+    case 'landed':
+      return l.status === 'landed' && l.trunk_sha === req.trunk_sha && ours;
+    case 'failed':
+      return l.status === 'failed' && l.failure?.code === req.code && ours;
+  }
+}
+
+/** T5 short of pushing: phases only go forward; trunk_base (and first_base once); a deadline of 1 min to 6 h. */
+function changePhase(ix: HubInternals, project: string, landing: Landing, req: Extract<AdvanceInput, { to: 'running' }> & { deadline_ms: number }, now: number, agent: string): Transition {
+  const current = landing.phase ?? 'merging';
+  if (PHASE_ORDER[req.phase] < PHASE_ORDER[current]) {
+    throw new HubError('bad_request', `${landing.id} is in ${current}: phases go merging, resolving, checking, pushing, never back`);
+  }
+  const patch: LandingPatch = { deadline_at: now + Math.min(MAX_STEP_MS, Math.max(MIN_STEP_MS, Math.round(req.deadline_ms))) };
+  const moves = req.phase !== landing.phase;
+  if (moves) Object.assign(patch, { phase: req.phase, phase_at: now });
+  if (req.trunk_base !== null) {
+    patch.trunk_base = req.trunk_base;
+    if (landing.first_base === null) patch.first_base = req.trunk_base;
+  }
+  const moved = updateLanding(ix, project, landing, patch, now);
+  if (moves) emitUpdated(ix, project, moved, 'phase', agent, now);
+  return { landing: moved, released: [], unblocked: [], replayed: false };
+}
+
+/**
+ * T5 into pushing, the write-ahead: the request names the staged candidate,
+ * and every requirement it lists, and every pending one the hub holds for this
+ * candidate, has a granted approval (409 approval_missing with
+ * details.missing). From here on the landing has no deadline.
+ */
+function enterPushing(ix: HubInternals, project: string, landing: Landing, req: Extract<AdvanceInput, { phase: 'pushing' }>, now: number, agent: string): Transition {
+  const needed = new Map<string, ApprovalRequirement>();
+  for (const r of [...req.required, ...landing.approval.filter((p) => p.candidate === null || p.candidate === req.candidate)]) {
+    const key = `${r.kind}\u0000${r.digest}`;
+    if (!needed.has(key)) needed.set(key, r);
+  }
+  const missing = [...needed.values()].filter((r) => !satisfied(r, landing.approvals, landing.agent));
+  if (missing.length > 0) {
+    throw new HubError(
+      'approval_missing',
+      `${landing.id} can't be pushed yet: ${missing.length === 1 ? 'an approval is' : `${missing.length} approvals are`} missing (${missing.map((r) => `${r.kind} ${r.paths.slice(0, 3).join(', ')}`).join('; ')}). Park it (needs_approval) until an approver grants ${missing.length === 1 ? 'it' : 'them'}.`,
+      409,
+      { missing },
+    );
+  }
+  const moved = updateLanding(
+    ix,
+    project,
+    landing,
+    {
+      phase: 'pushing',
+      phase_at: now,
+      candidate: req.candidate,
+      candidate_ref: req.candidate_ref,
+      candidate_checked: landing.candidate_checked && landing.candidate === req.candidate,
+      trunk_base: req.trunk_base,
+      first_base: landing.first_base ?? req.trunk_base,
+      deadline_at: null,
+    },
+    now,
+  );
+  emitUpdated(ix, project, moved, 'phase', agent, now);
+  return { landing: moved, released: [], unblocked: [], replayed: false };
+}
+
+/**
+ * T6: the checks passed on the staged candidate but an approval is still
+ * missing. The landing parks in needs_approval (the running slot is free, its
+ * holds stay) until approved (back to the queue in its place) or rejected, or
+ * approval_timeout_hours pass. If its approvals all came in while it ran, it
+ * goes straight back to the queue instead.
+ */
+function park(ix: HubInternals, project: string, landing: Landing, req: Extract<AdvanceInput, { to: 'needs_approval' }>, now: number, agent: string): Transition {
+  const check = req.report.check;
+  if (!check || check.exit_code !== 0 || check.timed_out) {
+    throw new HubError('bad_request', `${landing.id} parks for an approval only once its checks passed: report.check must be the passing run on the candidate`);
+  }
+  const fromRequirement = req.required.find((r) => r.candidate !== null && (req.candidate === null || r.candidate === req.candidate));
+  const candidate = req.candidate ?? fromRequirement?.candidate ?? landing.candidate;
+  const candidate_ref = req.candidate_ref ?? fromRequirement?.candidate_ref ?? (candidate === landing.candidate ? landing.candidate_ref : null);
+  const pending = req.required.filter((r) => !satisfied(r, landing.approvals, landing.agent));
+  const common: LandingPatch = { phase: null, candidate, candidate_ref, candidate_checked: candidate !== null, report: req.report };
+  if (pending.length === 0) {
+    const queued = updateLanding(ix, project, landing, { ...common, status: 'queued', approval: [], lander: null, lease_claim_id: null, deadline_at: null }, now);
+    emitUpdated(ix, project, queued, 'approved', agent, now);
+    return { landing: queued, released: [], unblocked: [], replayed: false };
+  }
+  const hours = ix.store.getLanderControl(project).policy.approval_timeout_hours;
+  const parked = updateLanding(ix, project, landing, { ...common, status: 'needs_approval', approval: pending, deadline_at: now + hours * HOUR_MS }, now);
+  emitNeedsApproval(ix, project, parked, pending, true, agent);
+  return { landing: parked, released: [], unblocked: [], replayed: false };
+}
+
+/**
+ * T11 and T12 for a landing in pushing that is in doubt (any lease holder) or
+ * this lease's own, after the lander inspected the remote: landed applies the
+ * landed effects; requeue (trunk moved past trunk_base without the candidate,
+ * or the candidate is gone) keeps its place and counts trunk_moved.
+ */
+export function resolveLanding(ix: HubInternals, project: string, agent: string, id: string, req: ResolveInput, lease: Claim, now: number): Transition {
+  const landing = mustGetLanding(ix.store, project, id);
+  if (landing.status === 'running' && landing.phase === 'pushing' && (landing.in_doubt || landing.lease_claim_id === lease.id)) {
+    if (req.outcome === 'landed') return completeLanding(ix, project, landing, { trunk_sha: req.trunk_sha, reconciled: false }, now, agent);
+    return requeueLanding(ix, project, landing, 'trunk_moved', now, agent);
+  }
+  const already = req.outcome === 'landed' ? landing.status === 'landed' && landing.trunk_sha === req.trunk_sha : landing.status === 'queued';
+  if (already) return { landing, released: [], unblocked: [], replayed: true };
+  throw new HubError('landing_stale', `${id} is ${describe(landing)}: resolve is only for a landing in pushing that is in doubt or this lease's own`, 409);
+}
+
+/**
+ * T7: `approver` grants the pending requirement with this kind and digest
+ * (409 approval_stale if none). A rule allows the approver when it names
+ * them (or anyone) and, if distinct, they aren't the author's human (403
+ * not_approver otherwise, naming the rules). The approval is appended; once
+ * nothing is pending, a parked landing goes back to the queue in its place.
+ */
+export function approveLanding(ix: HubInternals, project: string, id: string, req: { kind: ApprovalKind; digest: string; note: string }, approver: string, now: number): Landing {
+  const { store } = ix;
+  const landing = mustGetLanding(store, project, id);
+  if (!isLive(landing)) throw closedError(landing);
+  const matching = landing.approval.filter((r) => r.kind === req.kind && r.digest === req.digest);
+  if (matching.length === 0) {
+    throw new HubError(
+      'approval_stale',
+      `${id} waits for no ${req.kind} approval with that digest${landing.approval.length > 0 ? ': the content changed since it was computed, so look at it again (hub approve recomputes it)' : ''}`,
+      409,
+    );
+  }
+  const rules = matching.flatMap((r) => r.rules);
+  if (!rules.some((rule) => allowedBy(rule, approver, landing.agent))) throw notApprover(approver, landing, rules);
+  if (landing.approvals.some((a) => a.by === approver && a.kind === req.kind && a.digest === req.digest)) return landing;
+  store.insertApproval({ project, landing_id: id, kind: req.kind, digest: req.digest, approver, decision: 'approve', note: req.note, carried_from: null, at: now });
+  const approvals = mustGetLanding(store, project, id).approvals;
+  const pending = landing.approval.filter((r) => !satisfied(r, approvals, landing.agent));
+  const patch: LandingPatch = { approval: pending };
+  if (pending.length === 0 && landing.status === 'needs_approval') Object.assign(patch, { status: 'queued', lander: null, lease_claim_id: null, deadline_at: null });
+  const after = updateLanding(ix, project, landing, patch, now);
+  emitUpdated(ix, project, after, 'approved', approver, now);
+  return after;
+}
+
+/** T8: `approver`, allowed by a rule of a pending requirement, rejects the landing: approval_rejected, with the failure effects. */
+export function rejectLanding(ix: HubInternals, project: string, id: string, req: { reason: string }, approver: string, now: number): Landing {
+  const { store } = ix;
+  const landing = mustGetLanding(store, project, id);
+  if (!isLive(landing)) throw closedError(landing);
+  if (landing.status === 'running' && landing.phase === 'pushing') throw tooLate(landing);
+  if (landing.approval.length === 0) throw new HubError('approval_stale', `${id} waits for no approval, so there is nothing to reject; cancel it instead`, 409);
+  const mine = landing.approval.filter((r) => r.rules.some((rule) => allowedBy(rule, approver, landing.agent)));
+  if (mine.length === 0) throw notApprover(approver, landing, landing.approval.flatMap((r) => r.rules));
+  for (const r of mine) {
+    store.insertApproval({ project, landing_id: id, kind: r.kind, digest: r.digest, approver, decision: 'reject', note: req.reason, carried_from: null, at: now });
+  }
+  const summary = `${id} was rejected by ${approver}. Their reason, as written: "${capText(req.reason, 500)}"`;
+  return failLanding(ix, project, landing, 'approval_rejected', summary, null, now, approver).landing;
+}
+
+/** T14: the author or an approver cancels a live landing, except in pushing (409 too_late); its holds go back to the author. */
+export function cancelLanding(ix: HubInternals, project: string, id: string, agent: string | null, approver: string | null, now: number): Landing {
+  const landing = mustGetLanding(ix.store, project, id);
+  const actor = agent === landing.agent ? agent : approver;
+  if (actor === null) throw new HubError('forbidden', `${id} is ${landing.agent}'s landing: only its author or an approver can cancel it`, 403);
+  if (!isLive(landing)) throw closedError(landing);
+  if (landing.status === 'running' && landing.phase === 'pushing') throw tooLate(landing);
+  const cancelled = updateLanding(ix, project, landing, { status: 'cancelled', phase: null, deadline_at: null, in_doubt: false, ended_at: now }, now);
+  failureEffects(ix, project, cancelled, now, actor);
+  emitUpdated(ix, project, cancelled, 'cancelled', actor, now);
+  return cancelled;
+}
+
+// ------------------------------------------------------------- approvals
+
+/** A rule lets `approver` approve `agent`'s landing: it names them (or anyone), and, if distinct, they aren't the agent's human. */
+export function allowedBy(rule: ApprovalRule, approver: string, agent: string): boolean {
+  return (rule.approvers === null || rule.approvers.includes(approver)) && !(rule.distinct && approver === humanOf(agent));
+}
+
+/** Every rule of the requirement has an approval with its kind and digest from a human the rule allows. */
+export function satisfied(r: ApprovalRequirement, approvals: readonly LandingApproval[], agent: string): boolean {
+  return r.rules.every((rule) => approvals.some((a) => a.kind === r.kind && a.digest === r.digest && allowedBy(rule, a.by, agent)));
+}
+
+/**
+ * Copies the approvals that the landing's chain (its retry_of and supersedes
+ * predecessors, of the same agent) granted with a required kind and digest,
+ * from approvers its rules allow, naming the landing each was first given on.
+ */
+function carryApprovals(store: Store, project: string, landing: Landing, required: readonly ApprovalRequirement[]): void {
+  if (required.length === 0) return;
+  const key = (approver: string, kind: string, digest: string) => `${approver}\u0000${kind}\u0000${digest}`;
+  const have = new Set(store.listApprovals(project, landing.id).filter((a) => a.decision === 'approve').map((a) => key(a.approver, a.kind, a.digest)));
+  for (const prior of chainOf(landing, (id) => store.getLanding(project, id))) {
+    for (const row of store.listApprovals(project, prior.id)) {
+      if (row.decision !== 'approve' || have.has(key(row.approver, row.kind, row.digest))) continue;
+      const rules = required.filter((r) => r.kind === row.kind && r.digest === row.digest).flatMap((r) => r.rules);
+      if (!rules.some((rule) => allowedBy(rule, row.approver, landing.agent))) continue;
+      have.add(key(row.approver, row.kind, row.digest));
+      store.insertApproval({ project, landing_id: landing.id, kind: row.kind, digest: row.digest, approver: row.approver, decision: 'approve', note: row.note, carried_from: row.carried_from ?? row.landing_id, at: row.at });
+    }
+  }
+}
+
+/** The landings before this one in its retry and supersede chain, nearest first (the same agent's only). */
+function chainOf(landing: Pick<Landing, 'id' | 'agent' | 'retry_of' | 'supersedes'>, get: (id: string) => Landing | null): Landing[] {
+  const out: Landing[] = [];
+  const seen = new Set([landing.id]);
+  const todo = [landing.retry_of, landing.supersedes];
+  while (todo.length > 0 && out.length < 100) {
+    const id = todo.shift();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const prior = get(id);
+    if (!prior || prior.agent !== landing.agent) continue;
+    out.push(withoutSeq(prior));
+    todo.push(prior.retry_of, prior.supersedes);
+  }
+  return out;
+}
+
+function notApprover(approver: string, landing: Landing, rules: ApprovalRule[]): HubError {
+  const why = unique(
+    rules.map((rule) => {
+      const where = `the rule for ${rule.paths.join(', ')}`;
+      if (rule.approvers !== null && !rule.approvers.includes(approver)) return `${where} allows only ${andList(rule.approvers)}`;
+      return `${where} is distinct: ${approver} is the human of ${landing.agent}, whose change this is, so someone else approves it`;
+    }),
+  );
+  return new HubError('not_approver', `${approver} can't approve ${landing.id}: ${why.join('; ')}.`, 403);
+}
+
+// --------------------------------------------------------- statistics
+
+/**
+ * Landing statistics over the last `days` days (landings that ended in that
+ * window): per retry/supersede chain, the time from its first land to trunk
+ * (median and p90, nearest rank), the share of chains that landed with no
+ * send-back, send-backs by code, the median check run and queue wait
+ * (picked minus submitted), and how landed merges were resolved.
+ */
+export function landingStats(store: Store, project: string, days: number, now: number): LandingStats {
+  const since = now - days * DAY_MS;
+  const all = store.listLandings(project, { order: 'recent' }).map(withoutSeq);
+  const byId = new Map(all.map((l) => [l.id, l]));
+  const ended = all.filter((l) => l.ended_at !== null && l.ended_at >= since);
+  const landed = ended.filter((l) => l.status === 'landed');
+  const toTrunk: number[] = [];
+  let firstTry = 0;
+  for (const l of landed) {
+    const chain = [l, ...chainOf(l, (id) => byId.get(id) ?? null)];
+    const first = chain.reduce((a, b) => (b.created_at < a.created_at ? b : a));
+    toTrunk.push(l.ended_at! - first.created_at);
+    if (!chain.some((x) => x.status === 'failed')) firstTry++;
+  }
+  const sendbacks: LandingStats['sendbacks'] = {};
+  for (const l of ended) if (l.status === 'failed' && l.failure) sendbacks[l.failure.code] = (sendbacks[l.failure.code] ?? 0) + 1;
+  const finished = ended.filter((l) => l.status === 'landed' || l.status === 'failed');
+  const checks = finished.map((l) => l.report?.check?.duration_ms).filter((ms): ms is number => typeof ms === 'number' && Number.isFinite(ms));
+  const waits = finished.filter((l) => l.started_at !== null && l.started_at >= l.created_at).map((l) => l.started_at! - l.created_at);
+  const resolvedBy: LandingStats['resolved_by'] = {};
+  for (const l of landed) {
+    const by = l.report?.resolved_by as ResolvedBy | null | undefined;
+    if (by) resolvedBy[by] = (resolvedBy[by] ?? 0) + 1;
+  }
+  return {
+    days,
+    landed: landed.length,
+    median_to_trunk_ms: median(toTrunk),
+    p90_to_trunk_ms: percentile(toTrunk, 0.9),
+    first_try_rate: landed.length > 0 ? Math.round((firstTry / landed.length) * 100) / 100 : null,
+    sendbacks,
+    median_check_ms: median(checks),
+    median_queue_wait_ms: median(waits),
+    resolved_by: resolvedBy,
+  };
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 === 1 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+}
+
+/** Nearest rank. */
+function percentile(values: number[], p: number): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length, Math.max(1, Math.ceil(p * sorted.length))) - 1];
+}
+
+// ------------------------------------------------------------- texts
+
+export function closedError(landing: Pick<Landing, 'id' | 'status'>): HubError {
+  return new HubError('landing_closed', `${landing.id} is ${landing.status}: it can't change any more`, 409);
+}
+
+function tooLate(landing: Pick<Landing, 'id'>): HubError {
+  return new HubError('too_late', `${landing.id} is being pushed to trunk right now, so it can't be stopped; it lands or comes back within seconds (hub_wait {"landing_id": "${landing.id}"}).`, 409);
+}
+
+function staleError(landing: Landing, attempt: number): HubError {
+  return new HubError('landing_stale', `${landing.id} is ${describe(landing)}, not attempt ${attempt} under this lease: stop working on it (kill its check, push nothing)`, 409);
+}
+
+function describe(landing: Landing): string {
+  if (landing.status === 'running') return `running attempt ${landing.attempt} (${landing.phase ?? 'starting'}${landing.in_doubt ? ', in doubt' : ''})`;
+  return landing.superseded_by ? `${landing.status} by ${landing.superseded_by}` : landing.status;
+}
+
+/** failure.summary: the first line of the lander's own message, else a hub-written one. */
+function summaryOf(report: LandingReport, code: LandingFailureCode, id: string): string {
+  const first = cleanText(report.message.split('\n')[0] ?? '', 500);
+  return first || `${id} came back: ${code}`;
+}
+
+/** The claim_conflict failure: entries and holders only (intents stay in the conflicts, as the holders' words). */
+function conflictSummary(id: string, conflicts: ClaimConflict[]): string {
+  const items = conflicts.map((c) => {
+    const what = andList(capped(c.scope.map(entryName), MAX_NAMED));
+    return `${what} ${c.scope.length > 1 ? 'are' : 'is'} ${c.landing_id ? `being landed by ${c.landing_id} (${c.holder})` : `claimed by ${c.holder} (${c.claim_id})`}`;
+  });
+  return `${id} touches code other agents hold: ${items.join('; ')}. Coordinate with them (hub_post) or wait for them, then land again.`;
+}
+
+/** Admission warnings, kept on the landing until the lander writes its report. */
+function warningsReport(warnings: string[]): LandingReport {
+  return { message: '', resolved_by: null, files_via: [], conflicts: [], check: null, resolver: null, next_steps: [], warnings, foreign_commits: [], timings: null };
 }

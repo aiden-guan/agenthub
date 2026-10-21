@@ -1,4 +1,5 @@
-import { Hub, HubError, SqliteStore, type HubEvent, type Landing } from '../src/index.js';
+import { LANDER_LEASE_KEY } from '@agenthub/contract';
+import { Hub, HubError, SqliteStore, type HubAuth, type HubEvent, type Landing, type LandingReport } from '../src/index.js';
 import type { HubInternals } from '../src/common.js';
 import { failureEffects, landedEffects } from '../src/landings.js';
 
@@ -15,6 +16,28 @@ export const MIN = 60_000;
 export const HOUR = 60 * MIN;
 /** A full lowercase sha made of one repeated hex digit. */
 export const sha = (c: string) => c.repeat(40);
+
+/** What the server passes for a request with a valid lander token. */
+export const LANDER_AUTH: HubAuth = { lander: true, approver: null };
+/** What the server passes for a request with a valid approver token of `name`. */
+export const approverAuth = (name: string): HubAuth => ({ lander: false, approver: name });
+
+/** `agent` claims the lander lease (queued when another lander holds it), as hub-lander does at start. */
+export function takeLease(hub: Hub, agent = LANDER, ttl_ms = 60_000) {
+  const r = hub.claim(P, agent, { files: [LANDER_LEASE_KEY], queue: true, ttl_ms, intent: `lander on ${agent.split('/')[1]}` }, LANDER_AUTH);
+  return { status: r.status, claim: r.claim!, lease: { lease_claim_id: r.claim!.id, epoch: hub.epoch } };
+}
+
+/** A lander-written report; `passed` adds a check that passed. */
+export function report(message = 'L-1 landed.', extra: Partial<LandingReport> = {}): LandingReport {
+  return { message, resolved_by: 'clean', files_via: [], conflicts: [], check: null, resolver: null, next_steps: [], warnings: [], foreign_commits: [], timings: null, ...extra };
+}
+
+export function passedReport(message = 'The checks passed.'): LandingReport {
+  return report(message, {
+    check: { command_hash: 'fc21ee81dccb', exit_code: 0, signal: null, timed_out: false, duration_ms: 4 * MIN, log_tail: 'ok', failed_tests: [], passes_on_trunk: true, reproduce: 'npm test' },
+  });
+}
 
 export function setup(opts: { leaseTtlMs?: number } = {}) {
   const clock = { t: T0 };

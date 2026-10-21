@@ -20,6 +20,20 @@ export class HubError extends Error {
 }
 
 /**
+ * What the caller proved besides its agent id (design §1.7), as the server
+ * computes it from the request headers. `lander`: a lander route with a valid
+ * lander token (or a loopback hub without one). `approver`: the human name a
+ * valid approver token belongs to. Tests pass it directly.
+ */
+export interface HubAuth {
+  lander: boolean;
+  approver: string | null;
+}
+
+/** An agent request with no lander or approver credentials. */
+export const NO_AUTH: Readonly<HubAuth> = Object.freeze({ lander: false, approver: null });
+
+/**
  * What the landing and hold helpers may do inside the hub's one write path.
  * Every call happens inside `Hub.write`, so it is serialized with claim
  * decisions and its events publish only once the transaction commits.
@@ -33,6 +47,12 @@ export interface HubInternals {
   /** The single place a claim ends. */
   endClaim(project: string, c: Claim, status: 'released' | 'expired', reason: string, now: number): Claim;
   promoteQueued(project: string, now: number): Claim[];
+  /**
+   * Ends the agent's queued claims that wait, directly or through others, for
+   * the agent itself, then promotes what that frees. claim() never queues such
+   * a claim, but a hold turned back into a lease can close a cycle.
+   */
+  breakWaitCycles(project: string, agent: string, now: number, reason: string): Claim[];
   announceUnblocked(project: string, doneId: string, actor: string): string[];
   touch(project: string, agent: string, now: number): void;
   withBlocked(project: string, task: Omit<Task, 'blocked_by'>): Task;
