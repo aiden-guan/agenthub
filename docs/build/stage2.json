@@ -1,0 +1,48 @@
+{
+ "repo": "${REPO}",
+ "scratch": "${SCRATCH}",
+ "planPath": "${REPO}/docs/build/plan.json",
+ "base": "cp1a",
+ "lanes": {
+  "hub": {
+   "wt": "${SCRATCH}/lanes23/hub",
+   "branch": "p23/hub",
+   "steps": [
+    "H4"
+   ]
+  },
+  "lander": {
+   "wt": "${SCRATCH}/lanes23/lander",
+   "branch": "p23/lander",
+   "steps": [
+    "L2",
+    "L3"
+   ]
+  },
+  "adapter": {
+   "wt": "${SCRATCH}/lanes23/adapter",
+   "branch": "p23/adapter",
+   "steps": [
+    "A1",
+    "A2"
+   ]
+  },
+  "symbols": {
+   "wt": "${SCRATCH}/lanes23/symbols",
+   "branch": "p23/symbols",
+   "steps": []
+  }
+ },
+ "checkpoint": {
+  "name": "cp1",
+  "mergeOrder": [
+   "p23/hub",
+   "p23/symbols",
+   "p23/lander",
+   "p23/adapter"
+  ],
+  "e2e": false,
+  "extra": "",
+  "gate": "CP1 from design 6.6: H4, L2-L3 and A1-A2 merged. npm run build, npm test and npm run typecheck green; every acceptance test for those steps passes on phase23; every row of the section 5.3 test matrix except the AI-resolver rows is green; dogfood once on a throwaway test repository with a local bare remote, a real hub, a real lander and two agent worktrees (Phase 2 without AI or crash hardening)."
+ }
+}

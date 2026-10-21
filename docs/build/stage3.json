@@ -1,0 +1,47 @@
+{
+ "repo": "${REPO}",
+ "scratch": "${SCRATCH}",
+ "planPath": "${REPO}/docs/build/plan.json",
+ "base": "cp1",
+ "lanes": {
+  "hub": {
+   "wt": "${SCRATCH}/lanes23/hub",
+   "branch": "p23/hub",
+   "steps": [
+    "H5"
+   ]
+  },
+  "lander": {
+   "wt": "${SCRATCH}/lanes23/lander",
+   "branch": "p23/lander",
+   "steps": [
+    "L4",
+    "L5"
+   ]
+  },
+  "adapter": {
+   "wt": "${SCRATCH}/lanes23/adapter",
+   "branch": "p23/adapter",
+   "steps": [
+    "A5"
+   ]
+  },
+  "symbols": {
+   "wt": "${SCRATCH}/lanes23/symbols",
+   "branch": "p23/symbols",
+   "steps": []
+  }
+ },
+ "checkpoint": {
+  "name": "cp2",
+  "mergeOrder": [
+   "p23/hub",
+   "p23/symbols",
+   "p23/lander",
+   "p23/adapter"
+  ],
+  "e2e": true,
+  "extra": "Lane A runs only the Phase 2 scenarios of A5 in this stage. As the integrator, write the README landing-queue section and host setup guide and extend scripts/demo.sh exactly as design 6.7 items 3 and 4 describe for CP2, and make sure H5 (Phase 3 symbol-scope claims in the hub) is merged so CP3a holds too.",
+  "gate": "CP2 from design 6.6 (Phase 2 complete) plus CP3a: L4, L5, the A5 Phase 2 scenarios, H5 and S1-S3 merged; the deterministic simulation and the crash tests green; npm run test:e2e Phase 2 scenarios green; README and demo updated per 6.7; npm run build, npm test, npm run typecheck green."
+ }
+}

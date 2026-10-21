@@ -1,0 +1,51 @@
+{
+ "repo": "${REPO}",
+ "scratch": "${SCRATCH}",
+ "planPath": "${REPO}/docs/build/plan.json",
+ "base": "cp0",
+ "lanes": {
+  "hub": {
+   "wt": "${SCRATCH}/lanes23/hub",
+   "branch": "p23/hub",
+   "steps": [
+    "H1",
+    "H2",
+    "H3"
+   ]
+  },
+  "lander": {
+   "wt": "${SCRATCH}/lanes23/lander",
+   "branch": "p23/lander",
+   "steps": [
+    "L1"
+   ]
+  },
+  "adapter": {
+   "wt": "${SCRATCH}/lanes23/adapter",
+   "branch": "p23/adapter",
+   "steps": []
+  },
+  "symbols": {
+   "wt": "${SCRATCH}/lanes23/symbols",
+   "branch": "p23/symbols",
+   "steps": [
+    "S1",
+    "S2",
+    "S3",
+    "S4"
+   ]
+  }
+ },
+ "checkpoint": {
+  "name": "cp1a",
+  "mergeOrder": [
+   "p23/hub",
+   "p23/symbols",
+   "p23/lander",
+   "p23/adapter"
+  ],
+  "e2e": false,
+  "extra": "",
+  "gate": "CP1a from design 6.6: H1-H3 and L1 merged (S1-S4 are merged early too, since lane S is independent). npm run build, npm test and npm run typecheck are green; every acceptance test listed for H1, H2, H3, L1, S1, S2, S3 and S4 in 6.5 exists and passes on phase23; all Phase 1 tests and the contract vectors still pass; the real hub and the real gitops are usable from the lander and adapter packages for the next stage (L3 against a real hub; A1 and A2 against a real hub and real gitops)."
+ }
+}

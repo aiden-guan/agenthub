@@ -1,0 +1,49 @@
+{
+ "repo": "${REPO}",
+ "scratch": "${SCRATCH}",
+ "planPath": "${REPO}/docs/build/plan.json",
+ "base": "cp2",
+ "lanes": {
+  "hub": {
+   "wt": "${SCRATCH}/lanes23/hub",
+   "branch": "p23/hub",
+   "steps": [
+    "H6"
+   ]
+  },
+  "lander": {
+   "wt": "${SCRATCH}/lanes23/lander",
+   "branch": "p23/lander",
+   "steps": [
+    "L6"
+   ]
+  },
+  "adapter": {
+   "wt": "${SCRATCH}/lanes23/adapter",
+   "branch": "p23/adapter",
+   "steps": [
+    "A3",
+    "A4",
+    "A5",
+    "A6"
+   ]
+  },
+  "symbols": {
+   "wt": "${SCRATCH}/lanes23/symbols",
+   "branch": "p23/symbols",
+   "steps": []
+  }
+ },
+ "checkpoint": {
+  "name": "cp3",
+  "mergeOrder": [
+   "p23/hub",
+   "p23/symbols",
+   "p23/lander",
+   "p23/adapter"
+  ],
+  "e2e": true,
+  "extra": "Lane A runs A3, A4, then the Phase 3 scenarios of A5, then the optional A6 Stop-hook hold. As the integrator, add the Phase 3 README sections (symbol claims, impact warnings, who_uses) and extend scripts/demo.sh per design 6.7, and write the release notes from 6.7 item 6.",
+  "gate": "CP3 from design 6.6 (Phase 3 complete): S4, H6, L6, A3-A5 (and A6) merged; the full e2e suite green including the 6.7 item 5 assertions and the kill-the-lander-during-checks run; the simulation at 20,000 seeds green; npm run build, npm test, npm run typecheck green."
+ }
+}
