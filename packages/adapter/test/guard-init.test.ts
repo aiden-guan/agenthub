@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
@@ -182,6 +182,33 @@ describe('hub init', () => {
         ...expected,
         PostToolUse: [{ matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: 'echo mine' }] }, ...expected.PostToolUse],
       });
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it("leaves other tools' hooks alone, even ones whose subcommands share the hub hooks' names", () => {
+    const x = makeRepo();
+    try {
+      const settingsPath = path.join(x.main, '.claude', 'settings.json');
+      mkdirSync(path.dirname(settingsPath), { recursive: true });
+      const theirs = (command: string) => ({ type: 'command', command });
+      const before = {
+        PreToolUse: [{ matcher: 'Edit|Write', hooks: [theirs('npx @acme/agent-audit hook pre-edit')] }],
+        SessionStart: [{ hooks: [theirs('./tools/notes hook digest')] }],
+        Stop: [{ hooks: [theirs('npx entire hook settle'), theirs('"/opt/hub-audit" hook settle')] }],
+      };
+      writeFileSync(settingsPath, JSON.stringify({ hooks: before }));
+      const opts = { cwd: x.main, project: PROJECT, guard: false, env: {} };
+      init(opts);
+      init({ ...opts, command: CLI_COMMAND });
+      const hooks = JSON.parse(readFileSync(settingsPath, 'utf8')).hooks;
+      expect(hooks.PreToolUse).toEqual([
+        ...before.PreToolUse,
+        { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: `${CLI_COMMAND} hook pre-edit`, timeout: 30, onFailure: 'block' }] },
+      ]);
+      expect(hooks.SessionStart).toEqual([...before.SessionStart, { hooks: [{ type: 'command', command: `${CLI_COMMAND} hook digest`, timeout: 30 }] }]);
+      expect(hooks.Stop).toEqual([...before.Stop, { hooks: [{ type: 'command', command: `${CLI_COMMAND} hook settle`, timeout: 30 }] }]);
     } finally {
       x.cleanup();
     }
@@ -990,38 +1017,84 @@ describe('hub init where git runs hooks from somewhere else (core.hooksPath)', (
     }
   });
 
-  it('runs a chained symlink or non-shell hook under its own name too (dispatchers, overcommit)', async () => {
+  it("runs a chained bash hook as its own file, so BASH_SOURCE names it as $0 does", async () => {
     const x = makeRepo();
     try {
       const hooksDir = git(x.main, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks').trim();
       mkdirSync(hooksDir, { recursive: true });
-      // A dispatcher the hook links to, which runs tools/<its name>.d/*.
-      const tools = path.join(x.dir, 'tools');
+      writeFileSync(
+        path.join(hooksDir, 'pre-commit'),
+        '#!/usr/bin/env bash\nme="${BASH_SOURCE[0]}"\n[ "$(basename "$me")" = pre-commit ] || exit 0\necho "bash lint ($(basename "$(dirname "$me")")/$(basename "$me"), $0): FAILED" >&2\nexit 1\n',
+      );
+      chmodSync(path.join(hooksDir, 'pre-commit'), 0o755);
+      const failed = { code: 1, stderr: expect.stringMatching(/^bash lint \(hooks\/pre-commit, \.git\/hooks\/pre-commit\): FAILED$/m) };
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject(failed);
+      expect(init({ cwd: x.main, ...opts }).join('\n')).toMatch(/kept your existing pre-commit hook as pre-commit\.pre-agenthub/);
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject(failed);
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it('leaves a symlinked or non-shell hook where it is, which the guard could not run as git does, and says how to call the guard from it', async () => {
+    const x = makeRepo();
+    try {
+      const hooksDir = git(x.main, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks').trim();
+      const called = path.join(git(x.main, 'rev-parse', '--path-format=absolute', '--git-common-dir').trim(), 'agenthub-hooks');
+      mkdirSync(hooksDir, { recursive: true });
+      // A hook linked to a dispatcher in the checkout, which finds the checkout through its own place
+      // and runs tools/<its own name>.d/*.
+      const tools = path.join(x.main, 'tools');
       mkdirSync(path.join(tools, 'pre-commit.d'), { recursive: true });
-      writeFileSync(path.join(tools, 'dispatch'), `#!/bin/sh\nd="${tools}/$(basename "$0").d"\n[ -d "$d" ] || exit 0\nfor s in "$d"/*; do sh "$s" || exit 1; done\n`);
+      const dispatch = '#!/bin/sh\nd="$(dirname "$0")/../../tools/$(basename "$0").d"\n[ -d "$d" ] || exit 0\nfor s in "$d"/*; do sh "$s" || exit 1; done\n';
+      writeFileSync(path.join(tools, 'dispatch'), dispatch);
       chmodSync(path.join(tools, 'dispatch'), 0o755);
       writeFileSync(path.join(tools, 'pre-commit.d', 'lint'), 'echo "dispatched lint: FAILED" >&2\nexit 1\n');
-      symlinkSync(path.relative(hooksDir, path.join(tools, 'dispatch')), path.join(hooksDir, 'pre-commit'));
+      symlinkSync('../../tools/dispatch', path.join(hooksDir, 'pre-commit'));
       const dispatched = { code: 1, stderr: expect.stringMatching(/dispatched lint: FAILED/) };
       expect(await commit(x.main, 'src/users.ts')).toMatchObject(dispatched);
-      expect(init({ cwd: x.main, ...opts }).join('\n')).toMatch(/kept your existing pre-commit hook as pre-commit\.pre-agenthub/);
+
+      const report = init({ cwd: x.main, ...opts }).join('\n');
+      expect(readlinkSync(path.join(hooksDir, 'pre-commit'))).toBe('../../tools/dispatch');
+      expect(existsSync(path.join(hooksDir, 'pre-commit.pre-agenthub'))).toBe(false);
+      expect(report).toContain(`note: ${path.join(hooksDir, 'pre-commit')} is a symlink (to ../../tools/dispatch), so hub init left it where it is`);
+      expect(report).toContain(HOOKS_PATH_LINE);
+      expect(readFileSync(path.join(called, 'pre-commit'), 'utf8')).toBe(guardScript(CLI_COMMAND));
+      expect(readFileSync(path.join(hooksDir, 'prepare-commit-msg'), 'utf8')).toContain('# agenthub-guard'); // the other hooks get theirs
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject(dispatched);
+      expect(init({ cwd: x.main, ...opts })[0]).toBe('already set up; nothing to change');
+
+      // Wired in as the note says, the guard runs first.
+      writeFileSync(path.join(tools, 'dispatch'), dispatch.replace('\n', `\n${HOOKS_PATH_LINE}\n`));
+      await client(hub.url, A).claim({ files: ['src/auth.ts'], intent: 'Migrate login to OAuth2' });
+      const blocked = await commit(x.main, 'src/auth.ts');
+      expect(blocked.code).not.toBe(0);
+      expect(blocked.stderr).toMatch(/hub guard: commit blocked[\s\S]*src\/auth\.ts — claimed by maya\/claude-1/);
+      expect(blocked.stderr).not.toMatch(/dispatched lint/);
+      git(x.main, 'reset', '-q');
       expect(await commit(x.main, 'src/users.ts')).toMatchObject(dispatched);
 
-      // A hook in another language that reads its own name.
-      rmSync(path.join(hooksDir, 'pre-commit.pre-agenthub'));
-      writeFileSync(
-        path.join(hooksDir, 'pre-commit.pre-agenthub'),
-        '#!/usr/bin/env node\nconst n = require("path").basename(process.argv[1]);\nif (n !== "pre-commit") process.exit(0);\nconsole.error(`node lint (${n}): FAILED`);\nprocess.exit(1);\n',
-      );
-      chmodSync(path.join(hooksDir, 'pre-commit.pre-agenthub'), 0o755);
-      const named = { code: 1, stderr: expect.stringMatching(/node lint \(pre-commit\): FAILED/) };
+      // A hook in another language, which sees the path it is started from.
+      rmSync(path.join(hooksDir, 'pre-commit'));
+      const nodeHook =
+        '#!/usr/bin/env node\nconst p = require("path"), me = process.argv[1];\nconsole.error(`node lint (${p.basename(p.dirname(me))}/${p.basename(me)}): FAILED`);\nprocess.exit(1);\n';
+      writeFileSync(path.join(hooksDir, 'pre-commit'), nodeHook);
+      chmodSync(path.join(hooksDir, 'pre-commit'), 0o755);
+      const named = { code: 1, stderr: expect.stringMatching(/node lint \(hooks\/pre-commit\): FAILED/) };
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject(named);
+      expect(init({ cwd: x.main, ...opts }).join('\n')).toContain(`note: ${path.join(hooksDir, 'pre-commit')} is not a shell script, so hub init left it where it is`);
+      expect(readFileSync(path.join(hooksDir, 'pre-commit'), 'utf8')).toBe(nodeHook);
       expect(await commit(x.main, 'src/users.ts')).toMatchObject(named);
 
-      // Kept by an older hub init, which made no link: running it again does.
-      rmSync(path.join(hooksDir, 'agenthub-chained'), { recursive: true, force: true });
-      expect(init({ cwd: x.main, ...opts }).join('\n')).toMatch(/pre-commit\.pre-agenthub/);
+      // Kept and chained by an older hub init: it goes back where it was.
+      rmSync(path.join(hooksDir, 'pre-commit'));
+      writeFileSync(path.join(hooksDir, 'pre-commit.pre-agenthub'), nodeHook);
+      chmodSync(path.join(hooksDir, 'pre-commit.pre-agenthub'), 0o755);
+      writeFileSync(path.join(hooksDir, 'pre-commit'), guardScript(CLI_COMMAND));
+      expect(init({ cwd: x.main, ...opts }).join('\n')).toMatch(/moved your pre-commit hook back from pre-commit\.pre-agenthub/);
+      expect(readFileSync(path.join(hooksDir, 'pre-commit'), 'utf8')).toBe(nodeHook);
+      expect(existsSync(path.join(hooksDir, 'pre-commit.pre-agenthub'))).toBe(false);
       expect(await commit(x.main, 'src/users.ts')).toMatchObject(named);
-      expect(init({ cwd: x.main, ...opts })[0]).toBe('already set up; nothing to change');
     } finally {
       x.cleanup();
     }
