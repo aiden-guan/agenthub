@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -41,7 +41,8 @@ async function startCli(args: string[] = []): Promise<{ url: string; port: numbe
   child.stderr!.on('data', (d) => (out += d));
   const url = await new Promise<string>((resolve, reject) => {
     const check = () => {
-      const m = /listening on (http:\/\/\S+)/.exec(out);
+      // The startup report ends with the lease settings.
+      const m = /listening on (http:\/\/\S+)[^]*lease ttl .*\n/.exec(out);
       if (m) resolve(m[1]);
     };
     child.stdout!.on('data', check);
@@ -528,6 +529,68 @@ describe('browser origins', () => {
       expect(r.stderr.trim().split('\n')).toHaveLength(1);
       expect(r.stdout).not.toContain('listening');
     }
+  });
+});
+
+describe('hub-server settings', () => {
+  const bin = path.join(here, '..', 'bin', 'hub-server.js');
+  /** Runs hub-server with settings that must be refused, and returns its one-line complaint. */
+  function refused(args: string[], env: Record<string, string> = {}): string {
+    const dir = mkdtempSync(path.join(tmpdir(), 'agenthub-cli-'));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const db = path.join(dir, 'hub.db');
+    const r = spawnSync(process.execPath, [bin, '--db', db, ...args], { encoding: 'utf8', timeout: 5_000, env: { ...process.env, ...env } });
+    const what = `${args.join(' ')} ${JSON.stringify(env)}`;
+    expect(r.stdout, what).not.toContain('listening');
+    expect(r.status, `${what}: ${r.stderr}`).toBe(2);
+    expect(r.stderr.trim().split('\n'), what).toHaveLength(1);
+    expect(existsSync(db), what).toBe(false); // refused before the database is created
+    return r.stderr.trim();
+  }
+
+  it('refuses a lease TTL that would expire leases at once, never, or in a flood of heartbeats, naming the option', () => {
+    const range = 'must be from 100 to 86400000 ms';
+    expect(refused(['--port', '0', '--lease-ttl-ms', '0'])).toBe(`hub-server: --lease-ttl-ms ${range}, got 0`);
+    expect(refused(['--port', '0', '--lease-ttl-ms=-1'])).toBe('hub-server: --lease-ttl-ms must be a whole number of milliseconds, got "-1"');
+    expect(refused(['--port', '0'], { HUB_LEASE_TTL_MS: '-1' })).toBe('hub-server: HUB_LEASE_TTL_MS must be a whole number of milliseconds, got "-1"');
+    expect(refused(['--port', '0'], { HUB_LEASE_TTL_MS: ' ' })).toBe('hub-server: HUB_LEASE_TTL_MS must be a whole number of milliseconds, got " "');
+    expect(refused(['--port', '0', '--lease-ttl-ms', '5'])).toBe(`hub-server: --lease-ttl-ms ${range}, got 5`);
+    expect(refused(['--port', '0', '--lease-ttl-ms', '172800000'])).toBe(`hub-server: --lease-ttl-ms ${range}, got 172800000`);
+    expect(refused(['--port', '0', '--lease-ttl-ms', '100000000000000000000'])).toBe(`hub-server: --lease-ttl-ms ${range}, got 100000000000000000000`);
+    for (const value of ['2m', 'Infinity', '1e20', '0x10000', '1.5', 'abc']) {
+      expect(refused(['--port', '0', '--lease-ttl-ms', value])).toBe(`hub-server: --lease-ttl-ms must be a whole number of milliseconds, got "${value}"`);
+    }
+    expect(refused(['--port', '0'], { HUB_LEASE_TTL_MS: '120000ms' })).toBe('hub-server: HUB_LEASE_TTL_MS must be a whole number of milliseconds, got "120000ms"');
+    // A negative value after a space is taken for a flag; that is reported in one line too.
+    expect(refused(['--port', '0', '--lease-ttl-ms', '-5'])).toContain("hub-server: Option '--lease-ttl-ms' argument is ambiguous.");
+  });
+
+  it('refuses a heartbeat interval that would let live sessions lose their leases, naming the option', () => {
+    expect(refused(['--port', '0', '--heartbeat-ms', '30s'])).toBe('hub-server: --heartbeat-ms must be a whole number of milliseconds, got "30s"');
+    expect(refused(['--port', '0', '--heartbeat-ms', '0'])).toBe('hub-server: --heartbeat-ms must be from 25 to 40000 ms (a third of the 120000 ms lease TTL), got 0');
+    expect(refused(['--port', '0', '--heartbeat-ms', '1'])).toBe('hub-server: --heartbeat-ms must be from 25 to 40000 ms (a third of the 120000 ms lease TTL), got 1');
+    expect(refused(['--port', '0', '--lease-ttl-ms', '3000', '--heartbeat-ms', '9000'])).toBe('hub-server: --heartbeat-ms must be from 25 to 1000 ms (a third of the 3000 ms lease TTL), got 9000');
+    expect(refused(['--port', '0', '--lease-ttl-ms', '3000', '--heartbeat-ms', '3000'])).toBe('hub-server: --heartbeat-ms must be from 25 to 1000 ms (a third of the 3000 ms lease TTL), got 3000');
+    // Lowering only the TTL while HUB_HEARTBEAT_MS keeps the documented 30000.
+    expect(refused(['--port', '0', '--lease-ttl-ms', '20000'], { HUB_HEARTBEAT_MS: '30000' })).toBe('hub-server: HUB_HEARTBEAT_MS must be from 25 to 6666 ms (a third of the 20000 ms lease TTL), got 30000');
+  });
+
+  it('refuses a port that is not a whole number from 0 to 65535 instead of binding a random one, naming the option', () => {
+    for (const value of [' ', 'abc', '7077x', '1.5', '0x1F00', '1e3']) {
+      expect(refused(['--port', value])).toBe(`hub-server: --port must be a port number from 0 to 65535, got "${value}"`);
+    }
+    expect(refused(['--port', '70000'])).toBe('hub-server: --port must be a port number from 0 to 65535, got "70000"');
+    expect(refused([], { HUB_PORT: ' ' })).toBe('hub-server: HUB_PORT must be a port number from 0 to 65535, got " "');
+  });
+
+  it('starts with settings in range and reports what it runs with', async () => {
+    const s = await startCli(['--lease-ttl-ms', '3000', '--heartbeat-ms', '1000']);
+    expect(s.output()).toContain('lease ttl 3000 ms, heartbeat every 1000 ms');
+    const { json } = await api(s.url, 'GET', '/status', undefined, A);
+    expect(json.lease).toEqual({ ttl_ms: 3000, heartbeat_interval_ms: 1000 });
+    // Only the TTL given: the heartbeat comes four times per lease.
+    const derived = await startCli(['--lease-ttl-ms', '20000']);
+    expect(derived.output()).toContain('lease ttl 20000 ms, heartbeat every 5000 ms');
   });
 });
 

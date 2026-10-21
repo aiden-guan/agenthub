@@ -37,11 +37,13 @@ export interface HubOptions {
   now?: () => number;
   /** How long a claim lives without a heartbeat. Default 2 minutes. */
   leaseTtlMs?: number;
-  /** How often adapters are asked to heartbeat. Default 30 seconds. */
+  /** How often adapters are asked to heartbeat: at most a third of the lease TTL. Default 30 seconds, or TTL/4 if less. */
   heartbeatIntervalMs?: number;
   /** An agent counts as online if seen within this window. Default = lease TTL. */
   presenceTtlMs?: number;
 }
+
+export type LeaseSettings = Required<Pick<HubOptions, 'leaseTtlMs' | 'heartbeatIntervalMs' | 'presenceTtlMs'>>;
 
 export class HubError extends Error {
   constructor(
@@ -59,7 +61,11 @@ const MAX_INTENT = 300;
 const MAX_TITLE = 200;
 const MAX_LONG_TEXT = 4000;
 const MAX_SUMMARY = 300;
-const DAY_MS = 24 * 60 * 60 * 1000;
+/** Lease TTLs a hub or a claim can have: up to a day. TTLs under a second are for tests. */
+const MIN_LEASE_TTL_MS = 100;
+const MAX_LEASE_TTL_MS = 24 * 60 * 60 * 1000;
+/** The shortest heartbeat interval a hub asks for or a claim gets (what the shortest TTL gives by default). */
+const MIN_HEARTBEAT_MS = 25;
 /** Past this many events since a wait graph was built, building a new one is cheaper than checking them. */
 const MAX_EVENTS_TO_REUSE = 100;
 
@@ -88,9 +94,10 @@ export class Hub {
   constructor(opts: HubOptions) {
     this.store = opts.store;
     this.clock = opts.now ?? Date.now;
-    this.leaseTtlMs = opts.leaseTtlMs ?? 120_000;
-    this.heartbeatIntervalMs = opts.heartbeatIntervalMs ?? Math.min(30_000, Math.max(1, Math.floor(this.leaseTtlMs / 4)));
-    this.presenceTtlMs = opts.presenceTtlMs ?? this.leaseTtlMs;
+    const lease = leaseSettings(opts);
+    this.leaseTtlMs = lease.leaseTtlMs;
+    this.heartbeatIntervalMs = lease.heartbeatIntervalMs;
+    this.presenceTtlMs = lease.presenceTtlMs;
   }
 
   now(): number {
@@ -112,8 +119,9 @@ export class Hub {
     if (mode !== 'exclusive' && mode !== 'shared' && mode !== 'auto') {
       throw new HubError('bad_request', 'mode must be exclusive, shared or auto');
     }
-    const ttl = clampInt(req.ttl_ms, this.leaseTtlMs, 1, DAY_MS, 'ttl_ms');
-    const heartbeat = clampInt(req.heartbeat_interval_ms, Math.min(this.heartbeatIntervalMs, Math.max(1, Math.floor(ttl / 3))), 1, ttl, 'heartbeat_interval_ms');
+    const ttl = clampInt(req.ttl_ms, this.leaseTtlMs, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS, 'ttl_ms');
+    // Heartbeats for a claim come before its lease runs out, by default three times per lease.
+    const heartbeat = clampInt(req.heartbeat_interval_ms, Math.min(this.heartbeatIntervalMs, Math.floor(ttl / 3)), MIN_HEARTBEAT_MS, ttl - 1, 'heartbeat_interval_ms');
     const intentIn = cleanText(req.intent, MAX_INTENT);
     const baseCommit = cleanText(req.base_commit, 64) || null;
 
@@ -912,6 +920,28 @@ export function cleanText(value: unknown, max: number, multiline = false): strin
   s = multiline ? s.replace(/\n{3,}/g, '\n\n') : s.replace(/\s+/g, ' ');
   s = s.trim();
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+/**
+ * The lease settings a hub runs with, defaults filled in. Throws a RangeError
+ * naming the first setting that can't work, under the name `names` gives it
+ * (hub-server passes the flag or variable it came from). Leases need a TTL
+ * from 100 ms to a day, and heartbeats at least three times per lease TTL
+ * and presence window, so a live agent keeps its leases across a late
+ * heartbeat. Adapters heartbeat at the announced interval at the slowest, so a
+ * longer one would let leases expire while their holders run.
+ */
+export function leaseSettings(opts: Partial<LeaseSettings>, names: Partial<Record<keyof LeaseSettings, string>> = {}): LeaseSettings {
+  const check = (key: keyof LeaseSettings, value: number, min: number, max: number, why = '') => {
+    const name = names[key] ?? key;
+    if (!Number.isInteger(value)) throw new RangeError(`${name} must be a whole number of milliseconds, got ${value}`);
+    if (value < min || value > max) throw new RangeError(`${name} must be from ${min} to ${max} ms${why}, got ${value}`);
+    return value;
+  };
+  const leaseTtlMs = check('leaseTtlMs', opts.leaseTtlMs ?? 120_000, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS);
+  const heartbeatIntervalMs = check('heartbeatIntervalMs', opts.heartbeatIntervalMs ?? Math.min(30_000, Math.floor(leaseTtlMs / 4)), MIN_HEARTBEAT_MS, Math.floor(leaseTtlMs / 3), ` (a third of the ${leaseTtlMs} ms lease TTL)`);
+  const presenceTtlMs = check('presenceTtlMs', opts.presenceTtlMs ?? leaseTtlMs, 3 * heartbeatIntervalMs, MAX_LEASE_TTL_MS, ` (three ${heartbeatIntervalMs} ms heartbeats or more)`);
+  return { leaseTtlMs, heartbeatIntervalMs, presenceTtlMs };
 }
 
 function clampInt(value: unknown, fallback: number, min: number, max: number, name: string): number {

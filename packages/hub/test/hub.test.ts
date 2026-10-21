@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { Hub, HubError, SqliteStore, type HubEvent } from '../src/index.js';
+import { Hub, HubError, SqliteStore, type HubEvent, type HubOptions } from '../src/index.js';
 
 const P = 'demo';
 const A = 'maya/claude-1';
@@ -332,6 +332,44 @@ describe('leases', () => {
     expect(expired[0].data).toMatchObject({ claim_id: 'C-1', holder: A, files: ['a.ts'] });
     expect(hub.heartbeat(P, A).renewed).toBe(0);
     expect(hub.getClaim(P, 'C-1').status).toBe('expired');
+  });
+
+  it('a hub refuses lease settings under which leases cannot work, naming the setting', () => {
+    const store = new SqliteStore(':memory:');
+    const make = (opts: Omit<HubOptions, 'store'>) => () => new Hub({ store, ...opts });
+    // 0 or less expires every lease at once, NaN fails every claim, and Infinity
+    // or more than a day keeps a crashed agent's files; tiny TTLs flood the hub.
+    for (const ttl of [0, -1, Number.NaN, Infinity, 1e20, 24 * 3600_000 + 1, 99, 1500.5]) {
+      expect(make({ leaseTtlMs: ttl }), `ttl ${ttl}`).toThrow(/^leaseTtlMs must be/);
+    }
+    // A heartbeat must come at least three times per lease, or a live agent loses its leases.
+    for (const [ttl, hb] of [[3000, 9000], [3000, 3000], [3000, 1001], [20_000, 30_000], [120_000, 0], [120_000, -1], [120_000, Number.NaN], [120_000, 1], [120_000, 24]]) {
+      expect(make({ leaseTtlMs: ttl, heartbeatIntervalMs: hb }), `ttl ${ttl} hb ${hb}`).toThrow(/^heartbeatIntervalMs must be/);
+    }
+    expect(make({ leaseTtlMs: 60_000, heartbeatIntervalMs: 15_000, presenceTtlMs: 0 })).toThrow(/^presenceTtlMs must be/);
+    expect(make({ leaseTtlMs: 60_000, heartbeatIntervalMs: 15_000, presenceTtlMs: 44_999 })).toThrow(/^presenceTtlMs must be/);
+    expect(make({ leaseTtlMs: 3000, heartbeatIntervalMs: 9000 })).toThrow('heartbeatIntervalMs must be from 25 to 1000 ms (a third of the 3000 ms lease TTL), got 9000');
+
+    expect(new Hub({ store, leaseTtlMs: 3000, heartbeatIntervalMs: 1000 })).toMatchObject({ leaseTtlMs: 3000, heartbeatIntervalMs: 1000, presenceTtlMs: 3000 });
+    // Without a heartbeat setting the hub picks one that fits every TTL it accepts.
+    for (const ttl of [100, 300, 1000, 20_000, 120_000, 24 * 3600_000]) {
+      const { heartbeatIntervalMs } = new Hub({ store, leaseTtlMs: ttl });
+      expect(heartbeatIntervalMs).toBeGreaterThanOrEqual(25);
+      expect(heartbeatIntervalMs).toBeLessThanOrEqual(ttl / 3);
+    }
+  });
+
+  it('every claim heartbeats more often than its TTL, whatever the request asks for', () => {
+    const { hub, advance } = setup();
+    const asks = [{ ttl_ms: 0 }, { ttl_ms: 1 }, { ttl_ms: 1, heartbeat_interval_ms: 1 }, { ttl_ms: 5000, heartbeat_interval_ms: 5000 }, { ttl_ms: 5000, heartbeat_interval_ms: 1e9 }, { heartbeat_interval_ms: 0 }, { heartbeat_interval_ms: 60_000 }];
+    for (const [i, ask] of asks.entries()) {
+      const { claim } = hub.claim(P, A, { files: [`f${i}.ts`], ...ask });
+      expect(claim!.heartbeat_interval_ms, JSON.stringify(ask)).toBeLessThan(claim!.ttl_ms);
+      expect(claim!.heartbeat_interval_ms, JSON.stringify(ask)).toBeGreaterThanOrEqual(25);
+    }
+    // A zero TTL is not a lease that is gone before the next request.
+    advance(50);
+    expect(hub.claim(P, B, { files: ['f0.ts'] }).status).toBe('denied');
   });
 
   it('renewing many leases on every request compiles no SQL once warmed up', () => {
