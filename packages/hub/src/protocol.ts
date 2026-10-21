@@ -78,6 +78,8 @@ export interface ClaimResult {
    * Only when denied, and only when waiting would deadlock: a holder in the way is
    * itself waiting, directly or not, for a claim of yours. Names the claims and
    * agents in the cycle (no paths or intents) and which of your claims to release.
+   * When the holder only waits in line behind a queued claim of yours, it also says
+   * that asking again with `queue: true` works: the hub then reorders that line.
    */
   deadlock?: string;
   now: number;

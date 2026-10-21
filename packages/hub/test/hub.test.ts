@@ -498,15 +498,142 @@ describe('queueing and release', () => {
       expect(hub.listClaims(P).filter((c) => c.status === 'queued').map((c) => c.holder)).toEqual([A, B]);
     }
     {
-      // Waiting behind an earlier waiter counts: D holds b.ts, B waits for [w.ts, b.ts], so D can't queue behind B for w.ts.
+      // Four agents round four files, the cycle closing at the last request.
       const { hub } = setup();
-      hub.claim(P, A, { files: ['w.ts'] });
-      hub.claim(P, D, { files: ['b.ts'] });
-      expect(hub.claim(P, B, { files: ['w.ts', 'b.ts'], queue: true }).status).toBe('queued');
-      expect(errorCode(() => hub.claim(P, D, { files: ['w.ts'], queue: true }))).toBe('deadlock');
-      // Waiting without a cycle is still fine, and asking without queue is a plain denial.
-      expect(hub.claim(P, C, { files: ['w.ts'], queue: true })).toMatchObject({ status: 'queued', position: 2 });
-      expect(hub.claim(P, D, { files: ['w.ts'] }).status).toBe('denied');
+      const agents = [A, B, C, D];
+      agents.forEach((agent, i) => hub.claim(P, agent, { files: [`f${i}.ts`] }));
+      for (let i = 0; i < 3; i++) expect(hub.claim(P, agents[i], { files: [`f${i + 1}.ts`], queue: true }).status).toBe('queued');
+      expect(errorCode(() => hub.claim(P, D, { files: ['f0.ts'], queue: true }))).toBe('deadlock');
+      expect(hub.claim(P, D, { files: ['f0.ts'] }).deadlock).toContain('could ever be granted');
+    }
+  });
+
+  it('an agent a waiter waits for queues ahead of it for a file they both want, as its direct request would go', () => {
+    const { hub } = setup();
+    const D = 'dan/claude-1';
+    hub.claim(P, A, { files: ['w.ts'] });
+    hub.claim(P, D, { files: ['b.ts'] });
+    const b = hub.claim(P, B, { files: ['w.ts', 'b.ts'], queue: true }); // waits for A and for D
+    // B can't be granted before D lets go of b.ts, so B doesn't stand in D's way: only A does, queued or not.
+    const direct = hub.claim(P, D, { files: ['w.ts'] });
+    expect(direct).toMatchObject({ status: 'denied', conflicts: [expect.objectContaining({ holder: A, status: 'active' })] });
+    expect(direct).not.toHaveProperty('deadlock');
+    const d = hub.claim(P, D, { files: ['w.ts'], queue: true });
+    expect(d).toMatchObject({ status: 'queued', position: 1, conflicts: [expect.objectContaining({ holder: A, status: 'active' })] });
+    // Someone B doesn't wait for still lines up behind B (and D).
+    const c = hub.claim(P, C, { files: ['w.ts'], queue: true });
+    expect(c).toMatchObject({ status: 'queued', position: 3 });
+
+    expect(hub.release(P, A, { all: true }).promoted.map((x) => x.id)).toEqual([d.claim!.id]);
+    expect(hub.release(P, D, { all: true }).promoted.map((x) => x.id)).toEqual([b.claim!.id]);
+    expect(hub.release(P, B, { all: true }).promoted.map((x) => x.id)).toEqual([c.claim!.id]);
+  });
+
+  it('queues a request that would deadlock only behind its own earlier waiter, which then steps back', () => {
+    const { hub, events } = setup();
+    const D = 'dan/claude-1';
+    hub.claim(P, D, { files: ['f.ts'] });
+    const cWaits = hub.claim(P, C, { files: ['f.ts', 'g.ts'], queue: true }).claim!; // C waits for D
+    hub.claim(P, A, { files: ['x.ts'] });
+    const a = hub.claim(P, A, { files: ['g.ts'], queue: true }); // A is behind C for g.ts
+    expect(a).toMatchObject({ status: 'queued', conflicts: [expect.objectContaining({ claim_id: cWaits.id })] });
+
+    // C's edit hook asks for A's x.ts. Waiting outside the queue would never end, and the denial says how to get out.
+    const hook = hub.claim(P, C, { files: ['x.ts'], mode: 'auto' });
+    expect(hook.status).toBe('denied');
+    expect(hook.deadlock).toContain(`${a.claim!.id} (${A}) waits for your ${cWaits.id}`);
+    expect(hook.deadlock).toContain('queue');
+    expect(hook.deadlock).not.toContain('could ever be granted');
+
+    // Queued, C waits for A, so C's earlier claim on g.ts goes behind A's, and A gets g.ts at once.
+    const c = hub.claim(P, C, { files: ['x.ts'], queue: true });
+    expect(c).toMatchObject({ status: 'queued', conflicts: [expect.objectContaining({ holder: A, status: 'active' })] });
+    expect(hub.getClaim(P, a.claim!.id).status).toBe('active');
+    expect(events.filter((e) => e.type === 'claim.granted' && e.data.from_queue).map((e) => e.data.claim_id)).toEqual([a.claim!.id]);
+    expect(hub.release(P, A, { all: true }).promoted.map((x) => x.id)).toEqual([c.claim!.id]);
+    expect(hub.release(P, D, { all: true }).promoted.map((x) => x.id)).toEqual([cWaits.id]);
+  });
+
+  it('a queue request refused as a deadlock still renews the leases and presence of the agent, and leaves nothing behind', () => {
+    const { hub, advance, events } = setup({ leaseTtlMs: 60_000 });
+    hub.claim(P, A, { files: ['x.ts'] });
+    const bHolds = hub.claim(P, B, { files: ['y.ts'] }).claim!;
+    hub.claim(P, A, { files: ['y.ts'], queue: true });
+    advance(50_000);
+    hub.heartbeat(P, A);
+    const before = events.length;
+    expect(errorCode(() => hub.claim(P, B, { files: ['x.ts'], queue: true }))).toBe('deadlock');
+    expect(hub.getClaim(P, bHolds.id).expires_at).toBe(hub.now() + 60_000);
+    expect(hub.status(P, B).agents.find((x) => x.agent === B)!.last_seen).toBe(hub.now());
+    expect(events.slice(before)).toEqual([]);
+    expect(hub.claim(P, C, { files: ['z.ts'] }).claim!.id).toBe('C-4');
+  });
+
+  it('decides claims with a fixed number of store reads however long the queue is', () => {
+    const { hub, store } = setup();
+    const files = Array.from({ length: 10 }, (_, i) => `f${i}.ts`);
+    files.forEach((f, i) => hub.claim(P, `holder${i}/a`, { files: [f] }));
+    for (let i = 0; i < 200; i++) hub.claim(P, `w${i}/a`, { files: [files[i % 10], files[(i * 7 + 3) % 10]], queue: true });
+    // Requesters that hold something, so the hub has to check who waits for them.
+    hub.claim(P, 'editor/a', { files: ['own.ts'] });
+    hub.claim(P, 'late/a', { files: ['mine.ts'] });
+    let reads = 0;
+    for (const m of ['listClaims', 'claimsForFiles'] as const) {
+      const real = store[m].bind(store) as (...args: unknown[]) => unknown;
+      (store as unknown as Record<string, unknown>)[m] = (...args: unknown[]) => (reads++, real(...args));
+    }
+    expect(hub.claim(P, 'editor/a', { files: ['f0.ts'], mode: 'auto' }).status).toBe('denied');
+    expect(reads).toBeLessThan(10);
+    reads = 0;
+    expect(hub.claim(P, 'late/a', { files: ['f0.ts'], queue: true }).status).toBe('queued');
+    expect(reads).toBeLessThan(10);
+    // w0 waits for f0.ts and f3.ts, first in line for both.
+    expect(hub.release(P, 'holder0/a', { all: true }).promoted).toEqual([]);
+    reads = 0;
+    expect(hub.release(P, 'holder3/a', { all: true }).promoted.map((c) => c.holder)).toEqual(['w0/a']);
+    expect(reads).toBeLessThan(10);
+  });
+
+  it('random workloads never grant conflicting claims or leave a queue that can never move', () => {
+    const agents = [A, B, C, 'dan/claude-1', 'eve/claude-1'];
+    const files = ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'];
+    let seed = 7;
+    const rnd = (n: number) => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) % n);
+    const overlap = (x: { scope: { file: string }[] }, y: { scope: { file: string }[] }) => x.scope.some((s) => y.scope.some((t) => t.file === s.file));
+    for (let run = 0; run < 80; run++) {
+      const { hub, store, advance } = setup();
+      for (let step = 0; step < 40; step++) {
+        const agent = agents[rnd(agents.length)];
+        const op = rnd(10);
+        if (op < 7) {
+          const want = [...new Set([files[rnd(5)], files[rnd(5)]].slice(0, 1 + rnd(2)))];
+          const code = errorCode(() => hub.claim(P, agent, { files: want, mode: (['exclusive', 'shared', 'auto'] as const)[rnd(3)], queue: rnd(2) === 0 }));
+          if (code && code !== 'deadlock') throw new Error(code);
+        } else if (op < 9) {
+          const mine = hub.listClaims(P, { holder: agent });
+          if (mine.length) hub.release(P, agent, { claim_id: mine[rnd(mine.length)].id });
+        } else {
+          for (const x of agents) if (rnd(3) > 0) hub.heartbeat(P, x);
+          advance(25_000);
+        }
+        const active = hub.listClaims(P).filter((c) => c.status === 'active');
+        for (const x of active) {
+          for (const y of active) {
+            if (x.id < y.id && x.holder !== y.holder && !(x.mode === 'shared' && y.mode === 'shared')) expect(overlap(x, y)).toBe(false);
+          }
+        }
+      }
+      // Agents that wait for nothing finish and let go of everything; every queue must drain.
+      for (let round = 0; round < 20; round++) {
+        const idle = agents.filter((x) => {
+          const mine = hub.listClaims(P, { holder: x });
+          return mine.length > 0 && mine.every((c) => c.status === 'active');
+        });
+        if (idle.length === 0) break;
+        for (const x of idle) hub.release(P, x, { all: true });
+      }
+      expect(hub.listClaims(P).filter((c) => c.status === 'queued')).toEqual([]);
+      store.close();
     }
   });
 

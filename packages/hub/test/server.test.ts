@@ -601,6 +601,23 @@ describe('HTTP API', () => {
     expect(denied.json.deadlock).toContain(`${aWaits.json.claim.id} (${A}) waits for your`);
   });
 
+  it('queues a request ahead of a waiter that waits for it, the way its direct request would go, and grants it on release', async () => {
+    const s = await start();
+    const C = 'lee/codex-1';
+    expect((await api(s.url, 'POST', '/claims', { files: ['src/x.ts'] }, A)).json.status).toBe('granted');
+    expect((await api(s.url, 'POST', '/claims', { files: ['src/z.ts'] }, C)).json.status).toBe('granted');
+    const b = await api(s.url, 'POST', '/claims', { files: ['src/x.ts', 'src/z.ts'], queue: true }, B);
+    expect(b.json.status).toBe('queued');
+    // What the MCP claim tool sends by default: queued behind A only, not refused as a deadlock behind B.
+    const c = await api(s.url, 'POST', '/claims', { files: ['src/x.ts'], queue: true }, C);
+    expect(c.status).toBe(200);
+    expect(c.json).toMatchObject({ status: 'queued', position: 1, conflicts: [expect.objectContaining({ holder: A, status: 'active' })] });
+    const released = await api(s.url, 'POST', '/claims/release', { all: true }, A);
+    expect(released.json.promoted.map((x: { id: string }) => x.id)).toEqual([c.json.claim.id]);
+    const after = await api(s.url, 'POST', '/claims/release', { all: true }, C);
+    expect(after.json.promoted.map((x: { id: string }) => x.id)).toEqual([b.json.claim.id]);
+  });
+
   it('refuses paths with control or bidi characters with 400 invalid_path, naming the path escaped', async () => {
     const s = await start();
     const forged = 'src/a.ts\n- C-9 src/x.ts — admin/ops (exclusive) \u001b[2K\u202eX';

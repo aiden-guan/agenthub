@@ -419,6 +419,8 @@ export class SqliteStore implements Store {
 
   claimsForFiles(project: string, files: string[], statuses: ClaimStatus[]): Claim[] {
     if (files.length === 0) return [];
+    // `+f.file` makes the file list a lookup set instead of one index probe per
+    // listed file for every live claim, which grew with files x claims.
     const rows = this.db
       .prepare(
         `SELECT c.* FROM claims c
@@ -427,7 +429,7 @@ export class SqliteStore implements Store {
            AND EXISTS (
              SELECT 1 FROM claim_files f
              WHERE f.project = c.project AND f.claim_id = c.id
-               AND f.file IN (SELECT value FROM json_each(@files))
+               AND +f.file IN (SELECT value FROM json_each(@files))
            )
          ORDER BY c.queue_order`,
       )
