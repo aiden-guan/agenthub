@@ -120,9 +120,24 @@ export interface HeartbeatResult {
   seq: number;
 }
 
+/** POST /claims/check. */
+export interface CheckRequest {
+  files: string[];
+  /**
+   * Without it (the guard): only other agents' active exclusive claims count.
+   * With it: for each file, the claims a `queue: false` request of the caller's
+   * for that file alone in this mode would be denied for, queued waiters
+   * included (`hub_wait` asks with `auto`, as the edit hook claims). Older hubs
+   * ignore it.
+   */
+  mode?: ClaimRequestMode;
+}
+
 export interface CheckResult {
-  /** Active exclusive claims by other agents on the given files. */
+  /** Active exclusive claims by other agents on the given files; with `mode`, what such a request would be denied for. */
   conflicts: ClaimConflict[];
+  /** Only with `mode`: waiting for these conflicts would never end (see ClaimResult.deadlock). */
+  deadlock?: string;
   now: number;
   seq: number;
 }

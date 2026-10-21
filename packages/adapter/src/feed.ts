@@ -25,8 +25,13 @@ export interface WaitResult {
 
 const BUFFER_LIMIT = 1000;
 const NOTICE_LIMIT = 50;
-/** However short a claim's interval, heartbeats don't come faster than this. */
-const MIN_PERIOD_MS = 100;
+/**
+ * However short an interval the hub announces, heartbeats don't come faster
+ * than this: the shortest a hub hands out (25 ms, a third of its shortest
+ * 100 ms lease, rounded down), so a lease that short still gets its heartbeats,
+ * and an older hub that announces less can't make the feed flood it.
+ */
+const MIN_PERIOD_MS = 25;
 
 const validMs = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0;
 

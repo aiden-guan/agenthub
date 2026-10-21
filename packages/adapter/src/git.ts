@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 /** Nearest ancestor of `start` (inclusive) containing `.git` (a directory, or a file in a worktree). */
@@ -102,16 +102,17 @@ export function isIgnored(file: string, root: string): boolean {
 export function isTracked(root: string, name: string): boolean {
   const tracked = gitRaw(root, ['ls-files', '-z', '--', ':(glob)*'])?.split('\0') ?? [];
   if (tracked.includes(name)) return true;
-  const stat = (p: string) => {
+  const stat = (p: string, follow: boolean) => {
     try {
-      return statSync(path.join(root, p), { throwIfNoEntry: false });
+      return (follow ? statSync : lstatSync)(path.join(root, p), { throwIfNoEntry: false });
     } catch {
       return undefined;
     }
   };
-  const file = stat(name);
+  const file = stat(name, true);
+  // A tracked entry as git sees it: a committed symlink to `name` is a link, not another name for it.
   return !!file && tracked.some((t) => {
-    const s = t && stat(t);
+    const s = t && stat(t, false);
     return !!s && s.ino === file.ino && s.dev === file.dev;
   });
 }

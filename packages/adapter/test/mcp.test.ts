@@ -7,7 +7,7 @@ import { HubClient } from '../src/client.js';
 import type { HubConfig } from '../src/config.js';
 import { Feed } from '../src/feed.js';
 import { createMcpServer } from '../src/mcp.js';
-import { A, B, PROJECT, failingHub, hubCli, makeRepo, preToolUseInput, sessionEventInput, sleep, startHub, testEnv, type SampleRepo } from './helpers.js';
+import { A, B, PROJECT, client, failingHub, hubCli, makeRepo, preToolUseInput, sessionEventInput, sleep, startHub, testEnv, type SampleRepo } from './helpers.js';
 
 const TOOLS = ['claim', 'decide', 'hub_post', 'hub_status', 'hub_wait', 'inbox', 'land', 'release', 'task_create', 'task_list', 'task_take'];
 
@@ -86,6 +86,33 @@ describe('hub mcp', () => {
     expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
     expect(res.text).toMatch(/Woke up after: maya\/claude-1 released C-\d+ \(src\/users\.ts\)/);
     expect(res.text).toContain('src/users.ts is free of other agents\' claims now.');
+  });
+
+  it('hub_wait on files agrees with the edit hook about an earlier waiter it may not overtake, and wakes once the file is free', async () => {
+    const L = 'lee/claude-1';
+    const a = await connect(A, repo.wtA);
+    const b = await connect(B, repo.wtB);
+    const lee = await connect(L, repo.wtB);
+    await a.call('claim', { files: ['src/w1.ts'], intent: 'hold w1' });
+    const queued = await b.call('claim', { files: ['src/w1.ts', 'src/w2.ts'], intent: 'both files' });
+    const waiter = /^Queued as (C-\d+)/.exec(queued.text)![1];
+    // Nobody holds src/w2.ts, yet the edit hook's request for it is denied: sam's waiter is ahead.
+    const hookAsks = () => client(srv.url, L).claim({ files: ['src/w2.ts'], mode: 'auto', queue: false });
+    expect((await hookAsks()).status).toBe('denied');
+    const quick = await lee.call('hub_wait', { files: ['src/w2.ts'], timeout_s: 1 });
+    expect(quick.text).not.toContain('free of other agents');
+    expect(quick.text).toContain(`Still claimed: sam/claude-1 (${waiter}, exclusive) waits in line for src/w2.ts ahead of you, to "both files"`);
+
+    const waiting = lee.call('hub_wait', { files: ['src/w2.ts'], timeout_s: 10 });
+    await sleep(200);
+    await a.call('release', { all: true }); // sam is granted from the queue, and now holds src/w2.ts
+    await sleep(300);
+    await b.call('release', { all: true });
+    const woke = await waiting;
+    expect(woke.text).toMatch(/Woke up after: sam\/claude-1 released C-\d+ \(src\/w1\.ts, src\/w2\.ts\)/);
+    expect(woke.text).toContain("src/w2.ts is free of other agents' claims now.");
+    expect((await hookAsks()).status).toBe('granted');
+    await client(srv.url, L).release({ all: true });
   });
 
   it("hub_wait on another agent's claim id says so instead of reporting it as granted to you", async () => {

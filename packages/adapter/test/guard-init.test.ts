@@ -343,6 +343,30 @@ describe('hub guard: only an unreachable hub may let a commit through unchecked'
     }
   });
 
+  it("blocks a commit with a name the real hub refuses, with the hub's escaped reason, and checks legal odd names like a:b.md and ..env", async () => {
+    const bad = 'notes\u0007.txt';
+    stage(bad, 'x\n');
+    try {
+      const res = await hubCli(['guard'], { cwd: r.wtB, env: env() });
+      expect(res.code).toBe(1);
+      expect(res.stderr).toContain('refused the request (HTTP 400 invalid_path: invalid path "notes\\u0007.txt": contains U+0007;');
+      expect(res.stderr).not.toContain('\u0007');
+    } finally {
+      unstage();
+      rmSync(path.join(r.wtB, bad), { force: true });
+    }
+    for (const odd of ['a:b.md', '..env']) stage(odd, 'x\n');
+    stage('src/auth.ts', 'export const login = () => "b";\n');
+    try {
+      const res = await hubCli(['guard'], { cwd: r.wtB, env: env() });
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/commit blocked[\s\S]*src\/auth\.ts — claimed by maya\/claude-1/);
+    } finally {
+      unstage();
+      for (const odd of ['a:b.md', '..env']) rmSync(path.join(r.wtB, odd), { force: true });
+    }
+  });
+
   it('blocks the commit when the hub rejects the credentials (401)', async () => {
     const secured = await startHub({ token: 's3cret' });
     await client(secured.url, A, 's3cret').claim({ files: ['src/auth.ts'], intent: 'Migrate login to OAuth2' });

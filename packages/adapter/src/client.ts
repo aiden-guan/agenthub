@@ -3,6 +3,7 @@ import type {
   Claim,
   ClaimConflict,
   ClaimRequest,
+  ClaimRequestMode,
   ClaimResult,
   Decision,
   DecisionRequest,
@@ -66,6 +67,9 @@ export function classifyFailure(err: unknown, cfg: Pick<HubConfig, 'url' | 'toke
   if (err instanceof HubApiError) {
     const detail = `HTTP ${err.status} ${err.code}: ${err.message}`;
     if (err.status === 401 || err.status === 403) {
+      // A 403 isn't about the token: the hub doesn't serve this Host or Origin (its message names the
+      // hub-server flag that would), or the request touched another agent's claim or task.
+      if (err.status === 403) return { kind: 'auth', message: `hub at ${url} refused this client (${detail})` };
       if (cfg.tokenWithheld) return { kind: 'auth', message: `${cfg.tokenWithheld} The hub rejected the request without it (${detail})` };
       return { kind: 'auth', message: `hub at ${url} rejected this agent's credentials (${detail}); set HUB_TOKEN (or "token" in .hub.json) to the hub's token` };
     }
@@ -142,8 +146,13 @@ export class HubClient {
   release(req: ReleaseRequest): Promise<ReleaseResult> {
     return this.request('POST', '/claims/release', req);
   }
-  /** Exclusive claims by others on `files`, asked in batches small enough for the hub's body limit. */
-  async check(files: string[]): Promise<CheckResult> {
+  /**
+   * Exclusive claims by others on `files`, asked in batches small enough for the
+   * hub's body limit. With `mode`, what a claim of each file in that mode would
+   * be denied for (queued waiters included); a hub older than that answers as
+   * without it.
+   */
+  async check(files: string[], mode?: ClaimRequestMode): Promise<CheckResult> {
     const batches: string[][] = [[]];
     let size = 0;
     for (const f of files) {
@@ -156,16 +165,19 @@ export class HubClient {
       size += bytes;
     }
     let result: CheckResult | null = null;
+    let deadlock: string | undefined;
     const byClaim = new Map<string, ClaimConflict>();
     for (const batch of batches) {
-      result = await this.request<CheckResult>('POST', '/claims/check', { files: batch });
+      result = await this.request<CheckResult>('POST', '/claims/check', mode ? { files: batch, mode } : { files: batch });
+      deadlock ??= typeof result.deadlock === 'string' ? result.deadlock : undefined;
       for (const c of result.conflicts) {
         const seen = byClaim.get(c.claim_id);
         if (seen) seen.files = [...new Set([...seen.files, ...c.files])];
         else byClaim.set(c.claim_id, { ...c, files: [...c.files] });
       }
     }
-    return { ...result!, conflicts: [...byClaim.values()] };
+    const { deadlock: _last, ...rest } = result!;
+    return { ...rest, conflicts: [...byClaim.values()], ...(deadlock ? { deadlock } : {}) };
   }
   async getClaim(id: string): Promise<Claim> {
     return (await this.request<{ claim: Claim }>('GET', `/claims/${encodeURIComponent(id)}`)).claim;

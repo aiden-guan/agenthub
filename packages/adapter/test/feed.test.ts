@@ -125,6 +125,25 @@ async function proxyTo(port: number) {
   return proxy;
 }
 
+describe("the adapter's clients and a hub that refuses browsers", () => {
+  it('send no Origin header over HTTP or on the feed upgrade, so a hub with no --allow-origin serves them', async () => {
+    const srv = await hubAt();
+    // The hub refuses any Origin it wasn't given: a request that carried one would fail.
+    const browser = await fetch(`${srv.url}/v1/p/${PROJECT}/status`, { headers: { origin: 'http://localhost:5173' } });
+    expect(browser.status).toBe(403);
+    const raw = client(srv.url, A);
+    expect((await raw.status()).project).toBe(PROJECT); // GET
+    expect((await raw.claim({ files: ['src/origin.ts'], intent: 'no origin' })).status).toBe('granted'); // POST
+    expect((await raw.check(['src/origin.ts'], 'auto')).conflicts).toEqual([]);
+    expect(Array.isArray((await raw.events(0, 0)).events)).toBe(true); // the long-poll
+    const feed = new Feed(raw, { info: { client: 'mcp' } });
+    feed.start();
+    cleanups.push(() => feed.stop());
+    await until(() => feed.connected); // the WebSocket upgrade
+    await raw.release({ all: true });
+  });
+});
+
 describe('feed heartbeat period', () => {
   it("heartbeats as often as the hub's acks ask, so a claim with a TTL shorter than the hub's interval stays alive", async () => {
     // TTL 6 s: the hub announces 1500 ms. A raw-API claim with ttl_ms 1200 needs a heartbeat every 400 ms.
@@ -196,6 +215,20 @@ describe('feed heartbeat period', () => {
     const got = await feed.waitFor(since, (e) => e.type === 'message.posted', 5000);
     expect(Date.now() - t0).toBeLessThan(2000);
     expect(got.events.map((e) => e.type)).toEqual(['message.posted']);
+  });
+
+  it('heartbeats at the shortest interval a hub hands out (25 ms, with a 100 ms lease), so such a lease stays alive', async () => {
+    const srv = await hubAt({ leaseTtlMs: 100 });
+    expect(srv.hub.heartbeatIntervalMs).toBe(25);
+    const { feed, client: raw } = await mcpFor(srv.url, A);
+    await until(() => feed.connected);
+    const claim = (await raw.claim({ files: ['src/brief.ts'], intent: 'brief' })).claim!;
+    expect(claim.heartbeat_interval_ms).toBe(25);
+    const before = feed.heartbeatsSent;
+    await sleep(1000);
+    // A floor above the hub's interval (it was 100 ms) heartbeats once per lease, and the lease runs out between beats.
+    expect(feed.heartbeatsSent - before).toBeGreaterThanOrEqual(15);
+    expect((await raw.getClaim(claim.id)).status).toBe('active');
   });
 
   it('heartbeats at once at the interval of a claim it was just given', async () => {

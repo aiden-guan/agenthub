@@ -922,6 +922,61 @@ describe('queueing and release', () => {
   });
 });
 
+describe('checking what a claim would get', () => {
+  it('check with a mode answers what the edit hook request for each file would be denied for, queued waiters included, and changes nothing', () => {
+    const { hub, advance } = setup();
+    const D = 'kim/claude-1';
+    hub.claim(P, A, { files: ['src/a.ts'] }); // C-1
+    const multi = hub.claim(P, B, { files: ['src/a.ts', 'src/b.ts'], queue: true }); // C-2 waits for A, and holds back src/b.ts
+    hub.claim(P, D, { files: ['src/s.ts'], mode: 'shared' }); // C-3
+    const upgrade = hub.claim(P, B, { files: ['src/s.ts'], queue: true }); // C-4: an exclusive waiter behind a shared holder
+    expect([multi.status, upgrade.status]).toEqual(['queued', 'queued']);
+    advance(1000); // a renewal would move a lease now
+    const snapshot = () => ({ seq: hub.latestSeq(P), claims: hub.listClaims(P).map((c) => [c.id, c.status, c.expires_at]) });
+    const before = snapshot();
+
+    // The guard's check only sees active exclusive claims: src/b.ts looks free.
+    expect(hub.check(P, C, ['src/b.ts', 'src/s.ts']).conflicts).toEqual([]);
+    // With a mode it sees what the edit hook would be denied for: the waiter, and the shared holder plus the exclusive waiter.
+    const both = hub.check(P, C, ['src/b.ts', 'src/s.ts', 'src/free.ts'], 'auto');
+    expect(both.conflicts.map((c) => [c.claim_id, c.status, c.files])).toEqual([
+      ['C-2', 'queued', ['src/b.ts']],
+      ['C-3', 'active', ['src/s.ts']],
+      ['C-4', 'queued', ['src/s.ts']],
+    ]);
+    // A waiter that waits, directly or through others, for the asker doesn't hold it back.
+    expect(hub.check(P, A, ['src/b.ts'], 'auto').conflicts).toEqual([]);
+    expect(hub.check(P, D, ['src/b.ts'], 'exclusive').conflicts).toEqual([]); // C-2's B waits for D through C-4
+    expect(hub.check(P, C, ['src/b.ts'], 'exclusive').conflicts.map((c) => c.claim_id)).toEqual(['C-2']);
+    expect(hub.check(P, C, ['src/free.ts'], 'shared').conflicts).toEqual([]);
+    expect(errorCode(() => hub.check(P, C, ['src/b.ts'], 'bogus' as never))).toBe('bad_request');
+    // Checking wrote nothing: no event, no lease renewed.
+    expect(snapshot()).toEqual(before);
+
+    // And it agrees with what the requests themselves get.
+    const ids = (r: { conflicts: { claim_id: string }[] }) => r.conflicts.map((c) => c.claim_id).sort();
+    for (const file of ['src/b.ts', 'src/s.ts']) {
+      const real = hub.claim(P, C, { files: [file], mode: 'auto', queue: false });
+      expect(real.status).toBe('denied');
+      expect(ids(hub.check(P, C, [file], 'auto'))).toEqual(ids(real));
+    }
+    expect(hub.claim(P, A, { files: ['src/b.ts'], mode: 'auto', queue: false }).status).toBe('granted');
+  });
+
+  it('check with a mode says when waiting for the files would never end, as the denial does', () => {
+    const { hub } = setup();
+    hub.claim(P, A, { files: ['src/x.ts'] }); // C-1
+    hub.claim(P, B, { files: ['src/y.ts'] }); // C-2
+    expect(hub.claim(P, B, { files: ['src/x.ts'], queue: true }).status).toBe('queued'); // B waits for A
+    const checked = hub.check(P, A, ['src/y.ts'], 'auto');
+    const denied = hub.claim(P, A, { files: ['src/y.ts'], mode: 'auto', queue: false });
+    expect(denied.deadlock).toContain('would deadlock');
+    expect(checked.deadlock).toBe(denied.deadlock);
+    expect(checked.conflicts.map((c) => c.claim_id)).toEqual(['C-2']);
+    expect(hub.check(P, C, ['src/y.ts'], 'auto').deadlock).toBeUndefined();
+  });
+});
+
 describe('tasks', () => {
   it('blocked tasks cannot be taken until their dependencies are done', () => {
     const { hub, events } = setup();

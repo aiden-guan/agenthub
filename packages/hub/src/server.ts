@@ -166,6 +166,10 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   wss.on('error', (err) => console.error('[hub] feed server error:', err));
   const sockets = new Set<WebSocket>();
   server.on('upgrade', (req, socket, head) => {
+    // Node takes its own 'error' listener off the socket before emitting
+    // 'upgrade'. Without this one, a client that resets the connection while a
+    // refusal is being written (EPIPE, ECONNRESET) would crash the hub.
+    socket.on('error', () => {});
     try {
       checkHost(req);
       checkOrigin(req);
@@ -324,7 +328,7 @@ function buildRoutes(hub: Hub, maxWaitMs: number): Route[] {
     })),
     r('POST', '/claims', (c) => hub.claim(c.project, me(c), c.body)),
     r('POST', '/claims/release', (c) => hub.release(c.project, me(c), c.body)),
-    r('POST', '/claims/check', (c) => hub.check(c.project, c.agent, Array.isArray(c.body.files) ? c.body.files : [])),
+    r('POST', '/claims/check', (c) => hub.check(c.project, c.agent, Array.isArray(c.body.files) ? c.body.files : [], c.body.mode ?? undefined)),
     r('GET', '/claims/:id', (c) => ({ claim: hub.getClaim(c.project, c.params[0]) })),
 
     r('POST', '/messages', (c) => ({ message: hub.post(c.project, me(c), c.body as any) })),

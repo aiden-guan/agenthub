@@ -1,4 +1,4 @@
-import { existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -146,6 +146,16 @@ describe('config', () => {
       writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'sam/claude-1' }));
       expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ agent: 'sam/claude-1', warnings: [] });
     }
+  });
+
+  it("keeps this worktree's .hub.json its own when a committed symlink points at it", () => {
+    const root = path.join(dir, 'tracked-symlink');
+    mkdirSync(root);
+    git(root, 'init', '-q');
+    writeFileSync(path.join(root, '.hub.json'), JSON.stringify({ agent: 'sam/claude-1' }));
+    symlinkSync('.hub.json', path.join(root, 'local-config.json'));
+    git(root, 'add', 'local-config.json'); // git tracks the link itself, not what it points at
+    expect(loadConfig({ cwd: root, env: noGlobal })).toMatchObject({ agent: 'sam/claude-1', warnings: [] });
   });
 
   it('sends HUB_TOKEN without HUB_URL, or a global token without a url, only to a hub this machine names, not to one only the repository names (even after hub init recorded it)', () => {

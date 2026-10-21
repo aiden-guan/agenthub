@@ -9,6 +9,7 @@ import {
   type ClaimConflict,
   type ClaimMode,
   type ClaimRequest,
+  type ClaimRequestMode,
   type ClaimResult,
   type Decision,
   type DecisionRequest,
@@ -146,6 +147,7 @@ export class Hub {
     const heartbeat = clampInt(req.heartbeat_interval_ms, Math.min(this.heartbeatIntervalMs, Math.floor(ttl / 3)), MIN_HEARTBEAT_MS, ttl - 1, 'heartbeat_interval_ms');
     const intentIn = cleanText(req.intent, MAX_INTENT);
     const baseCommit = cleanText(req.base_commit, 64) || null;
+    const requestedTask = idOf(req.task_id, 'task_id');
 
     // A deadlock refusal comes back as a value so the renewal below still commits.
     const result = this.write(project, (now): ClaimResult | HubError => {
@@ -154,22 +156,17 @@ export class Hub {
       // agent holds. Agents that only run the edit hook (no heartbeating MCP
       // server) keep the files they touched earlier in the session.
       const held = this.renewLeases(project, agent, now);
+      // Nobody can wait for an agent that holds nothing, so its requests need no graph.
+      const waitedFor = held.length > 0;
       const files = unique(scope.map((s) => s.file));
-      const live = this.store.claimsForFiles(project, files, ['active']);
-      const mine = live.filter((c) => c.holder === agent);
-      const others = live.filter((c) => c.holder !== agent);
-
-      // A claim of mine covers a file if it includes it with a strong enough mode.
-      const covers = (c: Claim, file: string) => hasFile(c, file) && (mode !== 'exclusive' || c.mode === 'exclusive');
-      const covering = mine.filter((c) => files.some((f) => covers(c, f)));
-      const uncovered = files.filter((f) => !mine.some((c) => covers(c, f)));
+      const { covering, uncovered, queuedOnFiles, waiters, blockers, effectiveMode, waits } = this.standing(project, agent, files, mode, waitedFor);
       if (uncovered.length === 0) {
         // A renewal ties the claims it renews that have no task to the task it is
         // for, as a new claim would be, so landing that task releases them (see
         // land). A task_id that names no task ties nothing; the renewal stands.
         const untied = covering.filter((c) => c.task_id === null);
-        const known = !req.task_id || this.store.getTask(project, req.task_id) !== null;
-        const taskId = untied.length > 0 && known ? this.resolveTaskId(project, agent, req.task_id) : null;
+        const known = !requestedTask || this.store.getTask(project, requestedTask) !== null;
+        const taskId = untied.length > 0 && known ? this.resolveTaskId(project, agent, requestedTask) : null;
         for (const c of taskId ? untied : []) {
           c.task_id = taskId;
           this.store.updateClaim(project, c.id, { task_id: taskId });
@@ -177,21 +174,6 @@ export class Hub {
         return { status: 'granted', claim: covering[0], claims: covering, renewed: true, conflicts: [], now, seq: this.store.latestSeq(project) };
       }
 
-      // Earlier waiters stand in the way like holders do, so a later request can't
-      // overtake them. A waiter whose agent is itself waiting, directly or not, for
-      // this agent doesn't: it can't be granted before this agent lets go anyway,
-      // so this request goes ahead of it, queued or not (see waitGraph).
-      const queuedOnFiles = this.store.claimsForFiles(project, uncovered, ['queued']);
-      let graph: Waits | undefined;
-      const waits = () => (graph ??= this.waitGraph(project));
-      // Nobody can wait for an agent that holds nothing, so its requests need no graph.
-      const waitedFor = held.length > 0;
-      const theirs = queuedOnFiles.filter((q) => q.holder !== agent);
-      const waiters = theirs.filter((q) => !(waitedFor && waits().reach.has(q.holder, agent)));
-      const blocking = [...others.filter((c) => uncovered.some((f) => hasFile(c, f))), ...waiters];
-      const effectiveMode: ClaimMode =
-        mode === 'auto' ? (blocking.length > 0 && blocking.every((c) => c.mode === 'shared') ? 'shared' : 'exclusive') : mode;
-      const blockers = blocking.filter((c) => c.mode === 'exclusive' || effectiveMode === 'exclusive');
       const conflicts = blockers.map((c) => toConflict(c, uncovered));
       // A holder in the way that waits, directly or not, for a claim this agent holds
       // would wait forever, and so would this request. That can't be queued.
@@ -199,15 +181,7 @@ export class Hub {
       const cycle = waitsForMe ? waitCycle(waits().held, agent, blockers) : null;
 
       if (conflicts.length > 0 && !req.queue) {
-        // Waiting outside the queue also never ends when a holder in the way waits in
-        // line behind a claim of this agent's. Queued instead, the request would let
-        // the hub reorder that line (see waitGraph).
-        const inLine = cycle || !waitsForMe ? null : waitCycle(waits().all, agent, blockers);
-        const deadlock = cycle
-          ? `waiting for it would deadlock: ${cycle.steps}, so none of these claims could ever be granted. Release ${cycle.release}, or go on without this claim.`
-          : inLine
-            ? `waiting for it outside the queue would deadlock: ${inLine.steps}. Ask again with queue: true and the hub reorders the line so this claim is granted in turn, or release ${inLine.release}, or go on without this claim.`
-            : null;
+        const deadlock = denialDeadlock(waits, agent, blockers, waitsForMe, cycle);
         return {
           status: 'denied',
           claims: covering,
@@ -226,7 +200,7 @@ export class Hub {
         );
       }
 
-      const taskId = this.resolveTaskId(project, agent, req.task_id);
+      const taskId = this.resolveTaskId(project, agent, requestedTask);
       const intent = intentIn || this.defaultIntent(project, taskId, uncovered);
       const claimScope = scope.filter((s) => uncovered.includes(s.file));
 
@@ -294,24 +268,62 @@ export class Hub {
     return result;
   }
 
+  /**
+   * Where a claim request of `agent`'s for `files` in `mode` stands, as claim()
+   * decides it: the agent's claims that already cover files (`covering`), the
+   * files they don't (`uncovered`) and, for those, the other agents' claims in
+   * the way (`blockers`) and the mode a grant would have. `waitedFor`: the
+   * agent holds a claim, active or queued, so others may wait for it.
+   */
+  private standing(project: string, agent: string, files: string[], mode: ClaimRequestMode, waitedFor: boolean) {
+    const live = this.store.claimsForFiles(project, files, ['active']);
+    const mine = live.filter((c) => c.holder === agent);
+    const others = live.filter((c) => c.holder !== agent);
+    let graph: Waits | undefined;
+    const waits = () => (graph ??= this.waitGraph(project));
+
+    // A claim of mine covers a file if it includes it with a strong enough mode.
+    const covers = (c: Claim, file: string) => hasFile(c, file) && (mode !== 'exclusive' || c.mode === 'exclusive');
+    const covering = mine.filter((c) => files.some((f) => covers(c, f)));
+    const uncovered = files.filter((f) => !mine.some((c) => covers(c, f)));
+    if (uncovered.length === 0) {
+      return { covering, uncovered, queuedOnFiles: [] as Claim[], waiters: [] as Claim[], blockers: [] as Claim[], effectiveMode: (mode === 'shared' ? 'shared' : 'exclusive') as ClaimMode, waits };
+    }
+
+    // Earlier waiters stand in the way like holders do, so a later request can't
+    // overtake them. A waiter whose agent is itself waiting, directly or not, for
+    // this agent doesn't: it can't be granted before this agent lets go anyway,
+    // so this request goes ahead of it, queued or not (see waitGraph).
+    const queuedOnFiles = this.store.claimsForFiles(project, uncovered, ['queued']);
+    const theirs = queuedOnFiles.filter((q) => q.holder !== agent);
+    const waiters = theirs.filter((q) => !(waitedFor && waits().reach.has(q.holder, agent)));
+    const blocking = [...others.filter((c) => uncovered.some((f) => hasFile(c, f))), ...waiters];
+    const effectiveMode: ClaimMode =
+      mode === 'auto' ? (blocking.length > 0 && blocking.every((c) => c.mode === 'shared') ? 'shared' : 'exclusive') : mode;
+    const blockers = blocking.filter((c) => c.mode === 'exclusive' || effectiveMode === 'exclusive');
+    return { covering, uncovered, queuedOnFiles, waiters, blockers, effectiveMode, waits };
+  }
+
   /** `claim_id`, `task_id` and `files` each narrow what is released; `all` alone names every claim of the agent's. */
   release(project: string, agent: string, req: ReleaseRequest): ReleaseResult {
     assertAgent(agent);
     if (req.files != null && !Array.isArray(req.files)) throw new HubError('bad_request', 'files must be a list of repo paths');
     // An empty list names no files, so it narrows nothing.
     const files = req.files?.length ? unique(req.files.map(normalizeRepoPath)) : undefined;
-    if (!req.claim_id && !files && !req.task_id && !req.all) {
+    const claimId = idOf(req.claim_id, 'claim_id');
+    const taskId = idOf(req.task_id, 'task_id');
+    if (!claimId && !files && !taskId && !req.all) {
       throw new HubError('bad_request', 'say what to release: claim_id, files, task_id or all');
     }
     return this.write(project, (now) => {
       let targets: Claim[];
-      if (req.claim_id) {
-        const c = this.store.getClaim(project, req.claim_id);
-        if (!c) throw new HubError('not_found', `no claim ${req.claim_id}`, 404);
+      if (claimId) {
+        const c = this.store.getClaim(project, claimId);
+        if (!c) throw new HubError('not_found', `no claim ${claimId}`, 404);
         if (c.holder !== agent) throw new HubError('forbidden', `${c.id} is held by ${c.holder}; only its holder can release it`, 403);
-        targets = (c.status === 'active' || c.status === 'queued') && (!req.task_id || c.task_id === req.task_id) ? [c] : [];
+        targets = (c.status === 'active' || c.status === 'queued') && (!taskId || c.task_id === taskId) ? [c] : [];
       } else {
-        targets = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: req.task_id });
+        targets = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: taskId });
       }
       if (files) targets = targets.filter((c) => c.scope.some((s) => files.includes(s.file)));
 
@@ -336,26 +348,53 @@ export class Hub {
   /** Renew the agent's active and queued leases (all of them, or `claim_ids`) and mark it present. */
   heartbeat(project: string, agent: string, req: HeartbeatRequest = {}): HeartbeatResult {
     assertAgent(agent);
+    const claimIds = req.claim_ids == null ? undefined : idList(req.claim_ids, 'claim_ids');
     return this.write(project, (now) => {
       this.touch(project, agent, now, {
         client: cleanText(req.client, 64) || null,
         branch: cleanText(req.branch, 200) || null,
         worktree: cleanText(req.worktree, 500) || null,
       });
-      const claims = this.renewLeases(project, agent, now, req.claim_ids);
+      const claims = this.renewLeases(project, agent, now, claimIds);
       const next = claims.length ? Math.min(...claims.map((c) => c.heartbeat_interval_ms)) : this.heartbeatIntervalMs;
       return { renewed: claims.length, claims, next_heartbeat_ms: next, now, seq: this.store.latestSeq(project) };
     });
   }
 
-  /** Active exclusive claims by anyone other than `agent` on these files (for the pre-commit guard). */
-  check(project: string, agent: string | null, files: string[]): CheckResult {
+  /**
+   * Without `mode`: active exclusive claims by anyone other than `agent` on
+   * these files (for the pre-commit guard). With it: for each file, what a
+   * claim request of `agent`'s for that file alone in `mode`, with queue
+   * false, would be denied for right now, so a wait for the files (hub_wait)
+   * ends exactly when the edit hook's request would be granted. Changes nothing.
+   */
+  check(project: string, agent: string | null, files: string[], mode?: ClaimRequestMode): CheckResult {
     if (agent !== null) assertAgent(agent);
+    if (mode !== undefined && mode !== 'exclusive' && mode !== 'shared' && mode !== 'auto') {
+      throw new HubError('bad_request', 'mode must be exclusive, shared or auto');
+    }
     const norm = unique(files.map(normalizeRepoPath));
     return this.read(project, (now) => {
-      const live = this.store.claimsForFiles(project, norm, ['active']);
-      const conflicts = live.filter((c) => c.holder !== agent && c.mode === 'exclusive').map((c) => toConflict(c, norm));
-      return { conflicts, now, seq: this.store.latestSeq(project) };
+      if (mode === undefined) {
+        const live = this.store.claimsForFiles(project, norm, ['active']);
+        const conflicts = live.filter((c) => c.holder !== agent && c.mode === 'exclusive').map((c) => toConflict(c, norm));
+        return { conflicts, now, seq: this.store.latestSeq(project) };
+      }
+      const me = agent ?? '';
+      const waitedFor = agent !== null && this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent }).length > 0;
+      const byClaim = new Map<string, ClaimConflict>();
+      let deadlock: string | null = null;
+      for (const file of norm) {
+        const { uncovered, blockers, waits } = this.standing(project, me, [file], mode, waitedFor);
+        for (const c of blockers) {
+          const seen = byClaim.get(c.id);
+          if (seen) seen.files = unique([...seen.files, ...toConflict(c, uncovered).files]);
+          else byClaim.set(c.id, toConflict(c, uncovered));
+        }
+        const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(c.holder, me));
+        deadlock ??= blockers.length ? denialDeadlock(waits, me, blockers, waitsForMe, waitsForMe ? waitCycle(waits().held, me, blockers) : null) : null;
+      }
+      return { conflicts: [...byClaim.values()], ...(deadlock ? { deadlock } : {}), now, seq: this.store.latestSeq(project) };
     });
   }
 
@@ -491,8 +530,9 @@ export class Hub {
     const rationale = cleanText(req.rationale, MAX_LONG_TEXT, true);
     const files = unique((req.files ?? []).map(normalizeRepoPath));
     const symbols = unique((req.symbols ?? []).map((s) => cleanText(s, 200)).filter(Boolean));
+    const requestedTask = idOf(req.task_id, 'task_id');
     return this.write(project, (now) => {
-      const taskId = req.task_id ? this.resolveTaskId(project, agent, req.task_id) : null;
+      const taskId = requestedTask ? this.resolveTaskId(project, agent, requestedTask) : null;
       const decision: Decision = { id: `D-${this.store.nextCounter(project, 'decision')}`, project, agent, summary, rationale, files, symbols, task_id: taskId, created_at: now };
       this.store.insertDecision(decision);
       this.emit(project, 'decision.recorded', agent, { decision_id: decision.id, agent, summary, files, symbols });
@@ -513,12 +553,13 @@ export class Hub {
    */
   land(project: string, agent: string, req: LandRequest): LandResult {
     assertAgent(agent);
+    const requestedTask = idOf(req.task_id, 'task_id');
     return this.write(project, (now) => {
       let task: Task | null = null;
       let unblocked: string[] = [];
-      if (req.task_id) {
-        const t = this.store.getTask(project, req.task_id);
-        if (!t) throw new HubError('not_found', `no task ${req.task_id}`, 404);
+      if (requestedTask) {
+        const t = this.store.getTask(project, requestedTask);
+        if (!t) throw new HubError('not_found', `no task ${requestedTask}`, 404);
         if (t.owner && t.owner !== agent) throw new HubError('forbidden', `${t.id} is owned by ${t.owner}`, 403);
         const owner = t.owner ?? agent;
         if (t.status !== 'done') {
@@ -1010,6 +1051,25 @@ export function leaseSettings(opts: Partial<LeaseSettings>, names: Partial<Recor
   return { leaseTtlMs, heartbeatIntervalMs, presenceTtlMs };
 }
 
+/**
+ * A task or claim id from a request body: a string, or a number taken as its
+ * digits; missing or empty means none. Anything else is refused with 400, not
+ * handed to the store (which would fail with a 500).
+ */
+function idOf(value: unknown, name: 'task_id' | 'claim_id'): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  throw new HubError('bad_request', `${name} must be an id such as ${name === 'task_id' ? 'T-3' : 'C-3'}`);
+}
+
+/** A list of claim ids from a request body (see idOf). */
+function idList(value: unknown, name: string): string[] {
+  const ids = Array.isArray(value) ? value.map((v) => (typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v)) ? String(v) : null)) : null;
+  if (!ids || ids.includes(null)) throw new HubError('bad_request', `${name} must be a list of claim ids such as C-3`);
+  return ids as string[];
+}
+
 function clampInt(value: unknown, fallback: number, min: number, max: number, name: string): number {
   if (value === undefined || value === null) return fallback;
   const n = Number(value);
@@ -1187,6 +1247,22 @@ function waitCycle(graph: WaitGraph, agent: string, blockers: Claim[]): { steps:
       : `${w.waiter.id} (${w.waiter.holder}) waits for ${w.blocker.holder === agent ? `your ${w.blocker.id}` : `${w.blocker.id} (${w.blocker.holder})`}`,
   );
   return { steps: steps.join(', '), release: chain[chain.length - 1].blocker.id };
+}
+
+/**
+ * For a request denied for `blockers` (see Hub.claim): why waiting for them
+ * outside the queue would never end, or null if it would. A holder in the way
+ * may wait, directly or not, for a claim of the requester's (`cycle`), or
+ * wait in line behind one; queued instead, the request would let the hub
+ * reorder that line (see waitGraph).
+ */
+function denialDeadlock(waits: () => Waits, agent: string, blockers: Claim[], waitsForMe: boolean, cycle: ReturnType<typeof waitCycle>): string | null {
+  const inLine = cycle || !waitsForMe ? null : waitCycle(waits().all, agent, blockers);
+  if (cycle) return `waiting for it would deadlock: ${cycle.steps}, so none of these claims could ever be granted. Release ${cycle.release}, or go on without this claim.`;
+  if (inLine) {
+    return `waiting for it outside the queue would deadlock: ${inLine.steps}. Ask again with queue: true and the hub reorders the line so this claim is granted in turn, or release ${inLine.release}, or go on without this claim.`;
+  }
+  return null;
 }
 
 function claimOrderBefore(a: Claim, b: Claim): boolean {

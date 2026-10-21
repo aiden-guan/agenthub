@@ -413,6 +413,32 @@ describe('push feed', () => {
     await f.waitFor((fr) => fr.type === 'hello');
     f.ws.close();
   });
+
+  it('keeps hub-server running when a client resets the connection while its feed upgrade is being refused, token or not', async () => {
+    const s = await startCli(['--token', 'sekrit']);
+    const refused = [
+      `/v1/p/demo/feed?agent=${A}\r\nOrigin: https://evil.example`, // 403 forbidden_origin, before the token is looked at
+      `/v1/p/demo/feed?agent=${A}`, // 401 unauthorized
+      '/v1/p/demo/nope', // 404 not_found
+    ];
+    for (let i = 0; i < 10; i++) {
+      for (const target of refused) {
+        const sock = connect(s.port, '127.0.0.1');
+        sock.on('error', () => {});
+        await once(sock, 'connect');
+        const [route, extra] = target.split('\r\n');
+        sock.write(
+          `GET ${route} HTTP/1.1\r\nHost: 127.0.0.1:${s.port}\r\n${extra ? `${extra}\r\n` : ''}Upgrade: websocket\r\nConnection: Upgrade\r\n` +
+            'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+        );
+        sock.resetAndDestroy(); // gone before the hub writes its refusal: EPIPE or ECONNRESET on the hub's side
+      }
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    expect(s.child.exitCode).toBe(null);
+    expect((await fetch(`${s.url}/healthz`)).status).toBe(200);
+    expect(await upgradeStatus(s.url, { authorization: 'Bearer sekrit' })).toBe(101);
+  });
 });
 
 describe('browser origins', () => {
@@ -790,6 +816,34 @@ describe('HTTP API', () => {
 
     await api(s.url, 'POST', `/tasks/${t1.id}/update`, { status: 'cancelled' }, A);
     expect(await api(s.url, 'POST', '/land', { task_id: t1.id }, B)).toMatchObject({ status: 409, json: { error: { code: 'task_closed' } } });
+  });
+
+  it('refuses a task_id, claim_id or claim_ids that is not an id with 400 bad_request instead of failing with 500, renewals included', async () => {
+    const s = await start();
+    const t1 = (await api(s.url, 'POST', '/tasks', { title: 'one' }, A)).json.task;
+    await api(s.url, 'POST', `/tasks/${t1.id}/take`, {}, A);
+    const first = (await api(s.url, 'POST', '/claims', { files: ['src/auth.ts'] }, A)).json.claim;
+    for (const bad of [{}, [], true]) {
+      for (const [route, body] of [
+        ['/claims', { files: ['src/auth.ts'], task_id: bad }], // a renewal: A holds the file
+        ['/claims', { files: ['src/new.ts'], task_id: bad }],
+        ['/decisions', { summary: 'x', task_id: bad }],
+        ['/land', { task_id: bad }],
+        ['/claims/release', { task_id: bad }],
+        ['/claims/release', { claim_id: bad }],
+        ['/heartbeat', { claim_ids: [bad] }],
+        ['/heartbeat', { claim_ids: { 0: 'C-1' } }],
+      ] as const) {
+        const res = await api(s.url, 'POST', route, body, A);
+        expect({ route, bad, status: res.status, code: res.json.error?.code }).toEqual({ route, bad, status: 400, code: 'bad_request' });
+      }
+    }
+    // Nothing was changed by the refusals, and well-formed ids still work.
+    const status = (await api(s.url, 'GET', '/status', undefined, A)).json;
+    expect(status.claims.map((c: { id: string }) => c.id)).toEqual([first.id]);
+    expect(status.landings).toEqual([]);
+    expect((await api(s.url, 'POST', '/claims', { files: ['src/auth.ts'], task_id: t1.id }, A)).json).toMatchObject({ status: 'granted', renewed: true });
+    expect((await api(s.url, 'POST', '/heartbeat', { claim_ids: [first.id] }, A)).json.renewed).toBe(1);
   });
 
   it('releases every claim for {all: true, files: []}, and only the named files of one claim for {claim_id, files}', async () => {

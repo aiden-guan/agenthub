@@ -43,9 +43,13 @@ function allowWithWarning(msg: string, max = 300): HookOutcome {
 
 const deny = (reason: string): HookOutcome => ({ stdout: denyJson(reason), stderr: '', exitCode: 0 });
 
-/** A hub failure for Claude: why the config withheld the token in full, the hub's own words capped. */
+/**
+ * A hub failure for Claude: why the config withheld the token in full, the
+ * hub's own words capped, long enough for a refusal that ends with the
+ * hub-server flag that fixes it (forbidden_host).
+ */
 function failureText(failure: HubFailure, cfg: HubConfig): string {
-  return inline(failure.message, 300 + (failure.kind === 'auth' ? (cfg.tokenWithheld?.length ?? 0) : 0));
+  return inline(failure.message, 700 + (failure.kind === 'auth' ? (cfg.tokenWithheld?.length ?? 0) : 0));
 }
 
 function hookClient(cfg: HubConfig): HubClient {
@@ -217,7 +221,8 @@ export async function preEditHook(io: HookIO): Promise<HookOutcome> {
       return ALLOW;
     }
     const conflict = res.conflicts[0];
-    return deny(denyReason(conflict.files[0] ?? target.files[0], conflict, res.now));
+    if (!conflict) return deny(`Edit blocked: the hub denied the claim on ${target.files.join(', ')} without naming a conflict. Tell your human.`);
+    return deny(denyReason(conflict.files[0] ?? target.files[0], conflict, res.now, res.deadlock));
   } catch (err) {
     const failure = classifyFailure(err, cfg);
     if (failure.kind !== 'unreachable') return deny(`Edit blocked: ${failureText(failure, cfg)}. Tell your human; edits stay blocked until the hub accepts the claim.`);
