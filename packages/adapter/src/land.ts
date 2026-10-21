@@ -11,6 +11,7 @@ import { AGENT_ID_RE, teamSections, type HubConfig, type TeamConfig } from './co
 import { Feed } from './feed.js';
 import {
   landConflictText,
+  landHubRefusedText,
   landingBrief,
   landPhase1HubText,
   landQueuedText,
@@ -75,8 +76,20 @@ export async function landWork(deps: LandDeps, opts: LandOptions): Promise<LandO
     return refused(landRefusal.config((err as Error).message));
   }
   try {
-    if (!team.sections.land) return await recordMode(deps, opts, team);
-    return await queueMode(deps, opts, team);
+    if (team.sections.land) return await queueMode(deps, opts, team, null);
+    // This checkout's copy of trunk may predate a land section: decide on trunk as it is now, which
+    // is what the lander reads, so record mode never marks a task done that should have been queued.
+    const g = gitops.open(root, { isolated: false });
+    const fetched: Fetched = { remote: team.remote, trunk: team.trunk, error: await fetchTrunk(g, team.remote, team.trunk) };
+    if (fetched.error === null) {
+      try {
+        team = teamSections(root, { strict: true });
+      } catch (err) {
+        return refused(landRefusal.config((err as Error).message));
+      }
+    }
+    if (team.sections.land) return await queueMode(deps, opts, team, fetched);
+    return await recordMode(deps, opts, fetched);
   } catch (err) {
     // A git command failed (not the push, whose outcome is classified): nothing was queued.
     if (err instanceof GitError) return refused(`git failed (${gitMessage(err)}); nothing was queued.`);
@@ -84,8 +97,19 @@ export async function landWork(deps: LandDeps, opts: LandOptions): Promise<LandO
   }
 }
 
-/** Phase 1: record the landing, mark the task done, release the claims. A project with a lander refuses that. */
-async function recordMode(deps: LandDeps, opts: LandOptions, team: TeamConfig): Promise<LandOutcome> {
+/** A fetch of trunk made before the mode was chosen: from where, and its error (null: it worked). */
+interface Fetched {
+  remote: string;
+  trunk: string;
+  error: string | null;
+}
+
+/**
+ * Phase 1: record the landing, mark the task done, release the claims. Only
+ * once trunk (fetched just before, when that worked) has no land section; a
+ * project with a lander refuses it.
+ */
+async function recordMode(deps: LandDeps, opts: LandOptions, fetched: Fetched): Promise<LandOutcome> {
   const { cfg, client } = deps;
   const root = cfg.root!;
   try {
@@ -98,21 +122,12 @@ async function recordMode(deps: LandDeps, opts: LandOptions, team: TeamConfig): 
     return { text: landRecordedText(res), error: false, landing: res.landing };
   } catch (err) {
     if (!(err instanceof HubApiError) || err.code !== 'landing_queue_active') throw err;
-    // The project lands through the queue: this checkout's copy of trunk may predate its land section.
-    const g = gitops.open(root, { isolated: false });
-    await fetchTrunk(g, team.remote, team.trunk);
-    let again: TeamConfig;
-    try {
-      again = teamSections(root, { strict: true });
-    } catch (e) {
-      return refused(landRefusal.config((e as Error).message));
-    }
-    if (again.sections.land) return queueMode(deps, opts, again);
-    return refused(landRefusal.queueActive());
+    // The project lands through the queue, but trunk as fetched has no land section this CLI reads.
+    return refused(landRefusal.queueActive(fetched.error));
   }
 }
 
-async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig): Promise<LandOutcome> {
+async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig, fetched: Fetched | null): Promise<LandOutcome> {
   const { cfg, client } = deps;
   const root = cfg.root!;
   const agent = cfg.agent!;
@@ -130,9 +145,10 @@ async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig): 
     return refused(landRefusal.untracked(status.untracked, opts.untrackedRetry ?? 'land again with allow_untracked: true'));
   }
 
-  // 3. Fetch trunk (bounded); on failure, go on with the last fetched copy and say the preview may be stale.
+  // 3. Fetch trunk (bounded; not again if the mode was chosen on a fetch of it just now); on failure,
+  // go on with the last fetched copy and say the preview may be stale.
   const warnings: string[] = [];
-  const fetchError = await fetchTrunk(g, remote, trunk);
+  const fetchError = fetched && fetched.remote === remote && fetched.trunk === trunk ? fetched.error : await fetchTrunk(g, remote, trunk);
   const trackRef = `refs/remotes/${remote}/${trunk}`;
   const trunkSha = await gitops.revParse(g, trackRef);
   if (!trunkSha) return refused(landRefusal.noTrunk(remote, trunk, fetchError ?? `${remote} has no branch ${trunk}`));
@@ -146,7 +162,7 @@ async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig): 
     } catch (err) {
       return refused(landRefusal.config((err as Error).message));
     }
-    if (!team.sections.land) return recordMode(deps, opts, team);
+    if (!team.sections.land) return recordMode(deps, opts, { remote, trunk, error: null });
   }
   const land = team.sections.land!;
 
@@ -198,17 +214,18 @@ async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig): 
       preview: { trunk_seen: trunkSha, conflicts: conflicts.map((c) => c.file), protected: protectedPaths },
     });
   } catch (err) {
-    if (err instanceof HubApiError && err.code === 'claim_conflict') {
-      const list = Array.isArray(err.details?.conflicts) ? (err.details.conflicts as ClaimConflict[]) : [];
-      if (list.length) return refused(landConflictText(list, Date.now()));
-    }
+    // Every refusal from here on says what to do, that nothing was queued, and that the pushed ref is harmless.
     if (err instanceof HubUnavailableError) {
       return refused(`${err.message}, so nothing was queued. Your commit is pushed (that is harmless); call land again once the hub is back: it is idempotent per commit.`);
     }
-    if (err instanceof HubApiError && err.code === 'too_late') {
-      return refused(`Not queued: ${err.message} Wait a few seconds for it (hub_wait on its landing_id), then land again on top of it. Your commit is pushed; nothing was queued.`);
+    if (!(err instanceof HubApiError)) throw err;
+    if (err.code === 'claim_conflict') {
+      const list = Array.isArray(err.details?.conflicts) ? (err.details.conflicts as ClaimConflict[]) : [];
+      if (list.length) return refused(landConflictText(list, Date.now()));
     }
-    throw err;
+    // A token the config withheld from this hub comes back as an auth error: say why, as the other tools do.
+    const why = err.status === 401 ? cfg.warnings.map((w) => ` ${w}`).join('') : '';
+    return refused(`${landHubRefusedText(err, files)}${why}`);
   }
   if (res.landing.status === 'recorded') return refused(landPhase1HubText(res, cfg.url));
   deps.feed?.noteClaims(res.held);
@@ -242,10 +259,16 @@ async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig): 
   return { text, error: false, landing: res.landing };
 }
 
-/** `git fetch <remote> +refs/heads/<trunk>:refs/remotes/<remote>/<trunk>`, bounded; the first line of the error, or null. */
+/**
+ * `git fetch <remote> +refs/heads/<trunk>:refs/remotes/<remote>/<trunk>`, bounded and never prompting
+ * for credentials (a helper still answers); the first line of the error, or null.
+ */
 async function fetchTrunk(g: Git, remote: string, trunk: string): Promise<string | null> {
   try {
-    await g.run(['fetch', '--quiet', '--no-tags', remote, `+refs/heads/${trunk}:refs/remotes/${remote}/${trunk}`], { timeoutMs: FETCH_TIMEOUT_MS });
+    await g.run(['fetch', '--quiet', '--no-tags', remote, `+refs/heads/${trunk}:refs/remotes/${remote}/${trunk}`], {
+      timeoutMs: FETCH_TIMEOUT_MS,
+      env: { GIT_TERMINAL_PROMPT: '0' },
+    });
     return null;
   } catch (err) {
     return gitMessage(err);

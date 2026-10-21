@@ -192,6 +192,39 @@ describe('land (queue mode)', () => {
     expect(landings()).toEqual([]);
   });
 
+  it('says what to do when the hub refuses the queue request after the push: a closed, a blocked and a carried task', async () => {
+    await lander.takeLease();
+    const maya = hubClient(A);
+    const closed = await task(A, 'Already done');
+    await maya.updateTask(closed, 'done');
+    const dep = (await maya.createTask({ title: 'First this' })).id;
+    const blocked = (await maya.createTask({ title: 'Then this', deps: [dep] })).id;
+    const carried = await task(B, 'Sam is landing it');
+    const sam = await connect(B, repo.b);
+    commit(repo.b, { 'src/auth.ts': 'export function login() {}\n' });
+    expect((await sam.call('land', { task_id: carried })).text).toMatch(/^Queued L-1/);
+
+    const a = await connect(A, repo.a);
+    const head = commit(repo.a, { 'src/users.ts': 'export const users = ["q"];\n' });
+    const pushed = 'Your commit is pushed (that is harmless); nothing was queued.';
+    expect(await a.call('land', { task_id: closed })).toEqual({
+      isError: true,
+      text: `Not queued: ${closed} is already done. Land with the task this change is for, or without task_id if it is follow-up work (reopen a cancelled task first if this change finishes it). ${pushed}`,
+    });
+    expect(await a.call('land', { task_id: blocked })).toEqual({
+      isError: true,
+      text: `Not queued: ${blocked} is blocked by ${dep} (open); it can be landed once those are done. Land again once they are, or ask your human whether this change really needs them. ${pushed}`,
+    });
+    expect(await a.call('land', { task_id: carried })).toEqual({
+      isError: true,
+      text:
+        `Not queued: ${carried} is being landed (L-1 by sam/claude-1): it is done when that lands and in progress again if it comes back; its author can cancel L-1 to get it back now. ` +
+        `Coordinate with that landing's author through hub_post, or land without task_id if your change is separate work. ${pushed}`,
+    });
+    expect(landings().map((l) => l.id)).toEqual(['L-1']);
+    expect(landRefs(repo.remote)[`refs/agenthub/land/${head}`]).toBe(head);
+  });
+
   it('tells the agent when no lander is running, and that its approval is for a human', async () => {
     const sam = await connect(B, repo.b);
     commit(repo.b, { 'migrations/0002_users.sql': 'alter table users add name text;\n' });
@@ -295,6 +328,26 @@ describe('land against hubs and projects without the queue', () => {
     });
     expect(landings()).toEqual([]);
     expect((await hubClient(A).tasks()).find((x) => x.id === t)?.status).toBe('in_progress');
+  });
+
+  it("fetches trunk before choosing record mode: a land section trunk gained since this checkout's last fetch queues the change", async () => {
+    const plain = makeLandingRepo({ project: PROJECT });
+    cleanups.push(() => plain.cleanup());
+    // Someone turns the queue on after this checkout last fetched, and no lander has started yet.
+    const other = path.join(plain.dir, 'other');
+    git(plain.dir, 'clone', '-q', plain.remote, other);
+    writeFileSync(path.join(other, 'agenthub.json'), `${JSON.stringify({ project: PROJECT, land: { check: 'node check.mjs' } }, null, 2)}\n`);
+    git(other, 'commit', '-q', '-am', 'land through the queue');
+    git(other, 'push', '-q', 'origin', 'main');
+    const t = await task(A, 'Queue me');
+    const head = commit(plain.a, { 'src/users.ts': 'export const users = ["z"];\n' });
+    const cfg = cfgFor(hub.url, plain.a);
+    const res = await landWork({ cfg, client: new HubClient(cfg), feed: null }, { task_id: t });
+    expect(res.error).toBe(false);
+    expect(res.text).toMatch(new RegExp(`^Queued L-1 for ${t} "Queue me", but no lander is running for demo`));
+    expect(landRefs(plain.remote)).toEqual({ [`refs/agenthub/land/${head}`]: head });
+    expect(landings().map((l) => [l.id, l.status])).toEqual([['L-1', 'submitted']]);
+    expect((await hubClient(A).tasks()).find((x) => x.id === t)?.status).toBe('landing');
   });
 
   it('records the landing as Phase 1 did in a project without a land section and without a lander', async () => {

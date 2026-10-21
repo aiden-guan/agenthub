@@ -14,7 +14,7 @@ import { gitops, type Git } from '@agenthub/gitops';
 import type { ApprovalRequirement, Landing } from '@agenthub/hub/protocol';
 import { HubApiError, type ApproverCredentials, type HubClient } from './client.js';
 import { teamSections, type HubConfig } from './config.js';
-import { landingLine, landerText, showNames } from './format.js';
+import { inline, landingLine, landerText, showNames, terminalSafe } from './format.js';
 
 /** The terminal a human types into. Tests can't fake it in-process: the CLI checks the real one. */
 export interface Terminal {
@@ -136,10 +136,16 @@ export async function decideCommand(
   try {
     shown = await fetchAndShow(g, cfg, landing);
   } catch (err) {
-    return refuse(`could not fetch what ${id} would land: ${(err as Error).message}`);
+    return refuse(`could not fetch what ${id} would land: ${inline((err as Error).message, 400)}`);
   }
+  // The diff is agent-written content: its control and invisible characters are shown, never sent to
+  // the terminal, where they could erase, overwrite or reorder what the human approves.
+  let escaped = 0;
   for (const s of shown) {
-    o.term.write(`\n=== ${s.req.kind} approval of ${showNames(s.req.paths)} (${describeKind(s.req.kind)})\n${s.diff || '(no textual difference)'}\n`);
+    const safe = terminalSafe(s.diff || '(no textual difference)');
+    escaped += safe.escaped;
+    const careful = safe.escaped ? `${escapedNote(safe.escaped)}\n` : '';
+    o.term.write(`\n=== ${s.req.kind} approval of ${showNames(s.req.paths)} (${describeKind(s.req.kind)})\n${careful}${safe.text}\n`);
   }
   const stale = shown.filter((s) => s.digest !== s.req.digest);
   if (stale.length) {
@@ -149,6 +155,7 @@ export async function decideCommand(
     );
   }
   o.term.write(`\n${landingLine(landing, Date.now())}, by ${landing.agent}.\n`);
+  if (escaped) o.term.write('Careful: the diff above holds control or invisible characters, shown escaped.\n');
   const typed = (await o.term.ask(`Type ${id} to ${verb} it as ${creds.name} (anything else cancels): `)).trim();
   if (typed !== id) return refuse(`not ${verb === 'approve' ? 'approved' : 'rejected'}: you typed ${JSON.stringify(typed)}, not ${id}. Nothing was sent.`);
 
@@ -180,6 +187,14 @@ export async function decideCommand(
   return refused.length ? { stdout: approved.length ? `${lines[0]}\n` : '', stderr: `hub: ${lines[lines.length - 1]}\n`, exitCode: 1 } : done(lines.join('\n'));
 }
 
+function escapedNote(n: number): string {
+  const what = n === 1 ? '1 control or invisible character. It is' : `${n} control or invisible characters. They are`;
+  return (
+    `Careful: this diff holds ${what} shown escaped (as \\x1b, \\r or \\u202e), not sent to your terminal, which would act on them or show nothing; ` +
+    'the files hold the characters themselves.'
+  );
+}
+
 function describeKind(kind: ApprovalRequirement['kind']): string {
   if (kind === 'protected') return "the agent's own change to protected paths";
   if (kind === 'merged') return 'the merged content: trunk changed these paths too';
@@ -206,7 +221,23 @@ async function fetchAndShow(g: Git, cfg: HubConfig, l: Landing): Promise<Shown[]
   await g.run(['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, ...refs], { timeoutMs: 60_000 });
 
   const blob = (rev: string | null, p: string) => (rev ? gitops.blobId(g, rev, p) : Promise.resolve(null));
-  const diff = async (a: string, b: string, paths: string[]) => (await g.run(['diff', '--no-color', '--no-ext-diff', a, b, '--', ...paths])).stdout;
+  // The blobs themselves, as the digest covers them: no external diff or textconv from this checkout's
+  // config or attributes, submodule changes always shown, and each path taken literally, not as a pattern.
+  const diff = async (a: string, b: string, paths: string[]) =>
+    (
+      await g.run([
+        'diff',
+        '--no-color',
+        '--no-ext-diff',
+        '--no-textconv',
+        '--ignore-submodules=none',
+        '--submodule=short',
+        a,
+        b,
+        '--',
+        ...paths.map((p) => `:(literal)${p}`),
+      ])
+    ).stdout;
   const out: Shown[] = [];
   for (const req of l.approval) {
     const paths = req.paths;
