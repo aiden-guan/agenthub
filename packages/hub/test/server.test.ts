@@ -596,6 +596,15 @@ describe('HTTP API', () => {
     expect(all.json.promoted.map((c: { id: string }) => c.id)).toEqual([waiter.id]);
   });
 
+  it('refuses a release whose files is not a list with 400 bad_request and releases nothing', async () => {
+    const s = await start();
+    await api(s.url, 'POST', '/claims', { files: ['a.ts', 'b.ts'] }, A);
+    for (const body of [{ all: true, files: {} }, { all: true, files: 'a.ts' }, { files: 'a.ts' }, { claim_id: 'C-1', files: { 0: 'a.ts' } }]) {
+      expect(await api(s.url, 'POST', '/claims/release', body, A)).toMatchObject({ status: 400, json: { error: { code: 'bad_request' } } });
+    }
+    expect((await api(s.url, 'GET', '/claims', undefined, A)).json.claims).toMatchObject([{ id: 'C-1', status: 'active', scope: [{ file: 'a.ts' }, { file: 'b.ts' }] }]);
+  });
+
   it('keeps the queue order against edit-hook requests and refuses a deadlocking upgrade with 409 deadlock', async () => {
     const s = await start();
     const C = 'lee/codex-1';

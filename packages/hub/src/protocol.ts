@@ -22,6 +22,7 @@ export interface Claim {
   id: string;
   project: string;
   holder: string;
+  /** The request's task_id, else the holder's one task in progress when the claim was made (or, if it had none, renewed). */
   task_id: string | null;
   scope: ScopeEntry[];
   mode: ClaimMode;

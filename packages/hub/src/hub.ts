@@ -134,6 +134,16 @@ export class Hub {
       const covering = mine.filter((c) => files.some((f) => covers(c, f)));
       const uncovered = files.filter((f) => !mine.some((c) => covers(c, f)));
       if (uncovered.length === 0) {
+        // A renewal ties the claims it renews that have no task to the task it is
+        // for, as a new claim would be, so landing that task releases them (see
+        // land). A task_id that names no task ties nothing; the renewal stands.
+        const untied = covering.filter((c) => c.task_id === null);
+        const known = !req.task_id || this.store.getTask(project, req.task_id) !== null;
+        const taskId = untied.length > 0 && known ? this.resolveTaskId(project, agent, req.task_id) : null;
+        for (const c of taskId ? untied : []) {
+          c.task_id = taskId;
+          this.store.updateClaim(project, c.id, { task_id: taskId });
+        }
         return { status: 'granted', claim: covering[0], claims: covering, renewed: true, conflicts: [], now, seq: this.store.latestSeq(project) };
       }
 
@@ -257,6 +267,7 @@ export class Hub {
   /** `claim_id`, `task_id` and `files` each narrow what is released; `all` alone names every claim of the agent's. */
   release(project: string, agent: string, req: ReleaseRequest): ReleaseResult {
     assertAgent(agent);
+    if (req.files != null && !Array.isArray(req.files)) throw new HubError('bad_request', 'files must be a list of repo paths');
     // An empty list names no files, so it narrows nothing.
     const files = req.files?.length ? unique(req.files.map(normalizeRepoPath)) : undefined;
     if (!req.claim_id && !files && !req.task_id && !req.all) {
@@ -503,11 +514,12 @@ export class Hub {
       this.emit(project, 'land.requested', agent, { landing_id: landing.id, agent, task_id: landing.task_id, branch: landing.branch, commit: landing.commit });
 
       // Unless the request named one, a claim is tied to a task only when it was
-      // made while that was the agent's one task in progress, so the edit hook's
-      // claims from before task_take, or from while two tasks were, are tied to
-      // none. Once no other task of the agent's is in progress, those can only be
-      // for this one, so they go too. A claim tied to another task stays for it.
-      const inProgress = task ? this.store.listTasks(project).filter((t) => t.owner === agent && t.status === 'in_progress').map((t) => t.id) : [];
+      // made or renewed while that was the agent's one task in progress, so the
+      // edit hook's claims from before task_take, or from while two tasks were,
+      // are tied to none. Once no other task of the agent's is in progress, those
+      // can only be for this one, so they go too. A claim tied to another task
+      // stays for it.
+      const inProgress = this.store.listTasks(project).filter((t) => t.owner === agent && t.status === 'in_progress').map((t) => t.id);
       const released: Claim[] = [];
       if (req.release_claims !== false) {
         const mine = this.store
@@ -1089,21 +1101,44 @@ function idNumber(id: string): number {
   return Number(id.split('-')[1] ?? 0);
 }
 
-/** What land did, for the agent: nothing merged, and which of its claims (ids only) it still holds and why. */
+/**
+ * What land did, for the agent: nothing merged, and which of its claims (ids
+ * only) it still holds, and which of its tasks in progress (`inProgress`)
+ * landing would release them: a claim tied to no task needs all of them landed,
+ * one tied to one of them that one, and one tied to any other task none.
+ */
 function landNote(task: Task | null, released: Claim[], held: Claim[], inProgress: string[]): string {
   const parts = ['Phase 1 records the landing request only; nothing was merged. Push or merge your branch the usual way.'];
   if (task) parts.push('The task is marked done.');
-  if (held.length === 0) {
-    parts.push(released.length > 0 ? 'Your claims are released.' : 'You held no claims.');
-  } else {
-    const them = held.length === 1 ? 'it' : 'them';
-    const claims = held.map((c) => `${c.id} (${c.task_id ? `task ${c.task_id}` : 'no task'})`);
-    const shown = claims.length > MAX_NOTE_CLAIMS ? [...claims.slice(0, MAX_NOTE_CLAIMS - 1), `${claims.length - MAX_NOTE_CLAIMS + 1} more`] : claims;
-    const tasks = andList(inProgress);
-    const why = inProgress.length > 0 ? ` while ${tasks} ${inProgress.length === 1 ? 'is' : 'are'} in progress` : '';
-    parts.push(`You still hold ${andList(shown)}${why}: release ${them} when you are done with ${them}${inProgress.length > 0 ? `, or land ${tasks}` : ''}.`);
+  if (held.length === 0) parts.push(released.length > 0 ? 'Your claims are released.' : 'You held no claims.');
+  const groups = new Map<string, { tasks: string[]; claims: string[] }>();
+  for (const c of held) {
+    const tasks = c.task_id === null ? inProgress : inProgress.includes(c.task_id) ? [c.task_id] : [];
+    const key = tasks.join(' ');
+    if (!groups.has(key)) groups.set(key, { tasks, claims: [] });
+    groups.get(key)!.claims.push(`${c.id} (${c.task_id ? `task ${c.task_id}` : 'no task'})`);
   }
+  let left = MAX_NOTE_CLAIMS;
+  let unnamed = 0;
+  for (const { tasks, claims } of groups.values()) {
+    if (left === 0) {
+      unnamed += claims.length;
+      continue;
+    }
+    const shown = capped(claims, left);
+    left -= Math.min(left, claims.length);
+    const them = claims.length === 1 ? 'it' : 'them';
+    const list = andList(capped(tasks, MAX_NOTE_CLAIMS));
+    const why = tasks.length > 0 ? ` while ${list} ${tasks.length === 1 ? 'is' : 'are'} in progress` : '';
+    parts.push(`You still hold ${andList(shown)}${why}: release ${them} when you are done with ${them}${tasks.length > 0 ? `, or land ${list}` : ''}.`);
+  }
+  if (unnamed > 0) parts.push(`You also hold ${unnamed} more claim${unnamed === 1 ? '' : 's'}.`);
   return parts.join(' ');
+}
+
+/** The first `max` items, and how many more there are. */
+function capped(items: string[], max: number): string[] {
+  return items.length > max ? [...items.slice(0, max), `${items.length - max} more`] : items;
 }
 
 function andList(items: string[]): string {

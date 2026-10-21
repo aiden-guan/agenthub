@@ -1008,6 +1008,67 @@ describe('tasks', () => {
     expect(r.note).toContain('You still hold C-1 (task T-2): release it when you are done with it.');
   });
 
+  it('the landing note only advises landing a task when landing it releases the claim', () => {
+    const { hub } = setup();
+    hub.createTask(P, A, { title: 'one' });
+    hub.createTask(P, A, { title: 'two' });
+    hub.createTask(P, C, { title: 'theirs' });
+    hub.createTask(P, A, { title: 'three' });
+    hub.createTask(P, A, { title: 'four' });
+    hub.takeTask(P, C, 'T-3');
+    hub.takeTask(P, A, 'T-4');
+    hub.claim(P, A, { files: ['old.ts'] }); // C-1, tied to T-4, which is then done
+    hub.updateTask(P, A, 'T-4', 'done');
+    hub.takeTask(P, A, 'T-1');
+    hub.takeTask(P, A, 'T-2');
+    hub.claim(P, A, { files: ['log.ts'], task_id: 'T-3' }); // C-2, for lee's task
+    hub.claim(P, A, { files: ['f.ts'] }); // C-3, no task
+    hub.claim(P, A, { files: ['g.ts'], task_id: 'T-2' }); // C-4
+
+    const first = hub.land(P, A, { task_id: 'T-1' });
+    expect(first.released).toEqual([]);
+    expect(first.note).toContain('You still hold C-1 (task T-4) and C-2 (task T-3): release them when you are done with them.');
+    expect(first.note).toContain('You still hold C-3 (no task) and C-4 (task T-2) while T-2 is in progress: release them when you are done with them, or land T-2.');
+
+    // Following the advice releases what it said it would, and the rest is still named.
+    const second = hub.land(P, A, { task_id: 'T-2' });
+    expect(second.released.map((c) => c.id)).toEqual(['C-3', 'C-4']);
+    expect(second.note).toContain('You still hold C-1 (task T-4) and C-2 (task T-3): release them when you are done with them.');
+    expect(second.note).not.toContain('or land');
+
+    // With two tasks still in progress, a claim tied to no task needs both landed.
+    hub.createTask(P, A, { title: 'five' });
+    hub.createTask(P, A, { title: 'six' });
+    hub.takeTask(P, A, 'T-5');
+    hub.takeTask(P, A, 'T-6');
+    hub.claim(P, A, { files: ['h.ts'] }); // C-5
+    hub.claim(P, A, { files: ['i.ts'], task_id: 'T-6' }); // C-6
+    const third = hub.land(P, A, { release_claims: false });
+    expect(third.note).toContain('You still hold C-5 (no task) while T-5 and T-6 are in progress: release it when you are done with it, or land T-5 and T-6.');
+    expect(third.note).toContain('You still hold C-6 (task T-6) while T-6 is in progress: release it when you are done with it, or land T-6.');
+  });
+
+  it('a renewal while one task is in progress ties the renewed claim to it, so landing that task releases it', () => {
+    const { hub } = setup();
+    hub.createTask(P, A, { title: 'one' });
+    hub.createTask(P, A, { title: 'two' });
+    const early = hub.claim(P, A, { files: ['src/auth.ts'], mode: 'auto' }).claim!;
+    const untouched = hub.claim(P, A, { files: ['src/other.ts'], mode: 'auto' }).claim!;
+    expect([early.task_id, untouched.task_id]).toEqual([null, null]);
+    hub.takeTask(P, A, 'T-1');
+    // What the edit hook sends on the next edit of the file.
+    expect(hub.claim(P, A, { files: ['src/auth.ts'], mode: 'auto' })).toMatchObject({ renewed: true, claim: { id: early.id, task_id: 'T-1' } });
+    hub.takeTask(P, A, 'T-2');
+    // A renewal while two tasks are in progress ties nothing, and never re-ties a claim.
+    expect(hub.claim(P, A, { files: ['src/other.ts'], mode: 'auto' }).claim!.task_id).toBeNull();
+    expect(hub.claim(P, A, { files: ['src/auth.ts'], mode: 'auto', task_id: 'T-2' }).claim!.task_id).toBe('T-1');
+
+    const r = hub.land(P, A, { task_id: 'T-1' });
+    expect(r.released.map((c) => c.id)).toEqual([early.id]);
+    expect(hub.claim(P, B, { files: ['src/auth.ts'], mode: 'auto' }).status).toBe('granted');
+    expect(hub.getClaim(P, untouched.id)).toMatchObject({ status: 'active', task_id: null });
+  });
+
   it('a task cannot be completed while a dependency is unfinished, through land or a status update', () => {
     const { hub, events } = setup();
     hub.createTask(P, A, { title: 'one' });
