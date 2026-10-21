@@ -837,6 +837,51 @@ describe('queueing and release', () => {
     expect(errorCode(() => hub.release(P, B, { claim_id: 'C-1' }))).toBe('forbidden');
     expect(hub.release(P, B, { files: ['a.ts'] }).released).toHaveLength(0);
   });
+
+  it('an empty files list next to all or task_id releases what they name, as without files', () => {
+    const { hub } = setup();
+    hub.createTask(P, A, { title: 'x' });
+    hub.takeTask(P, A, 'T-1');
+    hub.claim(P, A, { files: ['x.ts', 'y.ts'] });
+    expect(hub.claim(P, B, { files: ['x.ts'], queue: true }).status).toBe('queued');
+    const byTask = hub.release(P, A, { task_id: 'T-1', files: [] });
+    expect(byTask.released.map((c) => c.id)).toEqual(['C-1']);
+    expect(byTask.promoted.map((c) => c.id)).toEqual(['C-2']);
+
+    hub.claim(P, A, { files: ['z.ts'] });
+    expect(hub.release(P, A, { all: true, files: [] }).released.map((c) => c.id)).toEqual(['C-3']);
+    expect(hub.listClaims(P, { holder: A })).toEqual([]);
+    // With nothing else to go by, an empty list still says nothing.
+    expect(errorCode(() => hub.release(P, A, { files: [] }))).toBe('bad_request');
+  });
+
+  it('releasing some files of one claim by id keeps the rest of it, and waiters for the rest keep waiting', () => {
+    const { hub } = setup();
+    hub.createTask(P, A, { title: 'x' });
+    hub.claim(P, A, { files: ['src/auth.ts', 'src/users.ts'] });
+    hub.claim(P, A, { files: ['src/other.ts'] });
+    expect(hub.claim(P, B, { files: ['src/users.ts'], queue: true }).status).toBe('queued');
+
+    // Only the files named, and only from the claim named.
+    const r = hub.release(P, A, { claim_id: 'C-1', files: ['src/auth.ts', 'src/other.ts'] });
+    expect(r.released).toEqual([]);
+    expect(r.trimmed.map((c) => [c.id, c.scope])).toEqual([['C-1', [{ file: 'src/users.ts' }]]]);
+    expect(r.promoted).toEqual([]);
+    expect(hub.getClaim(P, 'C-2').status).toBe('active');
+    expect(hub.getClaim(P, 'C-3').status).toBe('queued');
+    expect(hub.claim(P, A, { files: ['src/users.ts'] })).toMatchObject({ status: 'granted', renewed: true, claim: { id: 'C-1' } });
+    expect(hub.claim(P, C, { files: ['src/auth.ts'] }).status).toBe('granted');
+
+    // Files the claim doesn't name, or a task it isn't tied to, match nothing.
+    expect(hub.release(P, A, { claim_id: 'C-1', files: ['zzz.ts'] })).toMatchObject({ released: [], trimmed: [], promoted: [] });
+    expect(hub.release(P, A, { claim_id: 'C-1', task_id: 'T-1' })).toMatchObject({ released: [], trimmed: [], promoted: [] });
+    expect(hub.getClaim(P, 'C-1')).toMatchObject({ status: 'active', scope: [{ file: 'src/users.ts' }] });
+
+    // Naming every file it has left releases the claim, which grants the waiter.
+    const rest = hub.release(P, A, { claim_id: 'C-1', files: ['src/users.ts'] });
+    expect(rest.released.map((c) => c.id)).toEqual(['C-1']);
+    expect(rest.promoted.map((c) => c.id)).toEqual(['C-3']);
+  });
 });
 
 describe('tasks', () => {
@@ -874,6 +919,112 @@ describe('tasks', () => {
     expect(r.released.map((c) => c.id)).toEqual([claim.id]);
     expect(r.landing).toMatchObject({ id: 'L-1', status: 'recorded', branch: 'agent-a' });
     expect(hub.claim(P, B, { files: ['src/auth.ts'] }).status).toBe('granted');
+  });
+
+  it('landing a task also releases what the edit hook claimed before the task was taken', () => {
+    const { hub, advance } = setup({ leaseTtlMs: 60_000 });
+    hub.createTask(P, A, { title: 'Migrate login to OAuth2' });
+    hub.createTask(P, A, { title: 'Rate-limit login attempts', deps: ['T-1'] });
+    const early = hub.claim(P, A, { files: ['src/auth.ts'], mode: 'auto' }).claim!;
+    expect(early.task_id).toBeNull();
+    hub.takeTask(P, A, 'T-1');
+    expect(hub.claim(P, A, { files: ['src/auth.ts'], mode: 'auto' }).renewed).toBe(true);
+    const later = hub.claim(P, A, { files: ['src/b.ts'], mode: 'auto' }).claim!;
+    expect(later.task_id).toBe('T-1');
+
+    const r = hub.land(P, A, { task_id: 'T-1' });
+    expect(r.released.map((c) => c.id)).toEqual([early.id, later.id]);
+    expect(r.unblocked).toEqual(['T-2']);
+    expect(r.note).toContain('nothing was merged');
+    expect(r.note).toContain('claims are released');
+    expect(hub.listClaims(P, { holder: A })).toEqual([]);
+    // A's session keeps heartbeating, and B's edit still goes through.
+    advance(30_000);
+    hub.heartbeat(P, A);
+    expect(hub.claim(P, B, { files: ['src/auth.ts'], mode: 'auto' }).status).toBe('granted');
+  });
+
+  it('landing one of two tasks keeps the claims that may be the other task’s, says so, and landing that one releases them', () => {
+    const { hub } = setup();
+    hub.createTask(P, A, { title: 'one' });
+    hub.createTask(P, A, { title: 'two' });
+    hub.takeTask(P, A, 'T-1');
+    hub.takeTask(P, A, 'T-2');
+    const untagged = hub.claim(P, A, { files: ['f.ts'] }).claim!;
+    expect(untagged.task_id).toBeNull();
+    const one = hub.claim(P, A, { files: ['g.ts'], task_id: 'T-1' }).claim!;
+    const two = hub.claim(P, A, { files: ['h.ts'], task_id: 'T-2' }).claim!;
+
+    const first = hub.land(P, A, { task_id: 'T-1' });
+    expect(first.released.map((c) => c.id)).toEqual([one.id]);
+    expect(first.note).not.toContain('claims are released');
+    expect(first.note).toContain(`You still hold ${untagged.id} (no task) and ${two.id} (task T-2) while T-2 is in progress`);
+    expect(hub.claim(P, B, { files: ['f.ts'], mode: 'auto' }).status).toBe('denied');
+
+    const second = hub.land(P, A, { task_id: 'T-2' });
+    expect(second.released.map((c) => c.id)).toEqual([untagged.id, two.id]);
+    expect(second.note).not.toContain('still hold');
+    expect(hub.claim(P, B, { files: ['f.ts'], mode: 'auto' }).status).toBe('granted');
+  });
+
+  it('the landing note says what happened to the claims, never that kept claims were released', () => {
+    const { hub } = setup();
+    hub.createTask(P, A, { title: 'one' });
+    hub.createTask(P, A, { title: 'two' });
+    hub.takeTask(P, A, 'T-1');
+    const kept = hub.land(P, A, { task_id: 'T-1', release_claims: false });
+    expect(kept.note).toContain('You held no claims.');
+    hub.takeTask(P, A, 'T-2');
+    hub.claim(P, A, { files: ['a.ts'] });
+    const r = hub.land(P, A, { task_id: 'T-2', release_claims: false });
+    expect(r.released).toEqual([]);
+    expect(r.note).not.toContain('claims are released');
+    expect(r.note).toContain('You still hold C-1 (task T-2): release it when you are done with it.');
+  });
+
+  it('a task cannot be completed while a dependency is unfinished, through land or a status update', () => {
+    const { hub, events } = setup();
+    hub.createTask(P, A, { title: 'one' });
+    hub.createTask(P, A, { title: 'two', deps: ['T-1'] });
+    hub.createTask(P, A, { title: 'three', deps: ['T-2'] });
+    hub.claim(P, B, { files: ['b.ts'] });
+    expect(errorCode(() => hub.takeTask(P, B, 'T-2'))).toBe('task_blocked');
+    expect(errorCode(() => hub.land(P, B, { task_id: 'T-2' }))).toBe('task_blocked');
+    expect(() => hub.land(P, B, { task_id: 'T-2' })).toThrow('T-2 is blocked by T-1 (open)');
+    expect(errorCode(() => hub.updateTask(P, C, 'T-2', 'done'))).toBe('task_blocked');
+
+    // Nothing changed: no landing, no release, T-2 still open and unowned, T-3 still blocked.
+    expect(events.filter((e) => ['land.requested', 'task.updated', 'task.unblocked', 'claim.released'].includes(e.type))).toEqual([]);
+    expect(hub.status(P, B).landings).toEqual([]);
+    expect(hub.getClaim(P, 'C-1').status).toBe('active');
+    expect(hub.listTasks(P).map((t) => [t.id, t.status, t.owner, t.blocked_by])).toEqual([
+      ['T-1', 'open', null, []],
+      ['T-2', 'open', null, ['T-1']],
+      ['T-3', 'open', null, ['T-2']],
+    ]);
+    expect(errorCode(() => hub.takeTask(P, C, 'T-3'))).toBe('task_blocked');
+
+    // An owner whose dependency was reopened can't complete it either.
+    hub.updateTask(P, A, 'T-1', 'done');
+    hub.takeTask(P, B, 'T-2');
+    hub.updateTask(P, A, 'T-1', 'open');
+    expect(errorCode(() => hub.land(P, B, { task_id: 'T-2' }))).toBe('task_blocked');
+    expect(errorCode(() => hub.updateTask(P, B, 'T-2', 'done'))).toBe('task_blocked');
+
+    hub.updateTask(P, A, 'T-1', 'done');
+    expect(hub.land(P, B, { task_id: 'T-2' })).toMatchObject({ task: { status: 'done', owner: B, blocked_by: [] }, unblocked: ['T-3'] });
+  });
+
+  it('a cancelled task has to be reopened before it can be marked done', () => {
+    const { hub } = setup();
+    hub.createTask(P, A, { title: 'x' });
+    hub.createTask(P, A, { title: 'y', deps: ['T-1'] });
+    hub.updateTask(P, A, 'T-1', 'cancelled');
+    expect(errorCode(() => hub.land(P, B, { task_id: 'T-1' }))).toBe('task_closed');
+    expect(errorCode(() => hub.updateTask(P, A, 'T-1', 'done'))).toBe('task_closed');
+    expect(hub.listTasks(P).find((t) => t.id === 'T-1')!.status).toBe('cancelled');
+    hub.updateTask(P, A, 'T-1', 'open');
+    expect(hub.updateTask(P, A, 'T-1', 'done')).toMatchObject({ task: { status: 'done' }, unblocked: ['T-2'] });
   });
 });
 

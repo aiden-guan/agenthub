@@ -63,9 +63,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 /** Past this many events since a wait graph was built, building a new one is cheaper than checking them. */
 const MAX_EVENTS_TO_REUSE = 100;
 
-const LAND_NOTE =
-  'Phase 1 records the landing request only; nothing was merged. Push or merge your branch the usual way. ' +
-  'The task is marked done and its claims are released.';
+/** At most this many claims are named in a landing note. */
+const MAX_NOTE_CLAIMS = 10;
 
 /**
  * The coordination core. Every state change goes through `write()`, which
@@ -255,10 +254,12 @@ export class Hub {
     return result;
   }
 
+  /** `claim_id`, `task_id` and `files` each narrow what is released; `all` alone names every claim of the agent's. */
   release(project: string, agent: string, req: ReleaseRequest): ReleaseResult {
     assertAgent(agent);
-    const files = req.files ? unique(req.files.map(normalizeRepoPath)) : undefined;
-    if (!req.claim_id && !files?.length && !req.task_id && !req.all) {
+    // An empty list names no files, so it narrows nothing.
+    const files = req.files?.length ? unique(req.files.map(normalizeRepoPath)) : undefined;
+    if (!req.claim_id && !files && !req.task_id && !req.all) {
       throw new HubError('bad_request', 'say what to release: claim_id, files, task_id or all');
     }
     return this.write(project, (now) => {
@@ -267,16 +268,16 @@ export class Hub {
         const c = this.store.getClaim(project, req.claim_id);
         if (!c) throw new HubError('not_found', `no claim ${req.claim_id}`, 404);
         if (c.holder !== agent) throw new HubError('forbidden', `${c.id} is held by ${c.holder}; only its holder can release it`, 403);
-        targets = c.status === 'active' || c.status === 'queued' ? [c] : [];
+        targets = (c.status === 'active' || c.status === 'queued') && (!req.task_id || c.task_id === req.task_id) ? [c] : [];
       } else {
         targets = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: req.task_id });
-        if (files) targets = targets.filter((c) => c.scope.some((s) => files.includes(s.file)));
       }
+      if (files) targets = targets.filter((c) => c.scope.some((s) => files.includes(s.file)));
 
       const released: Claim[] = [];
       const trimmed: Claim[] = [];
       for (const c of targets) {
-        const remaining = files && !req.claim_id ? c.scope.filter((s) => !files.includes(s.file)) : [];
+        const remaining = files ? c.scope.filter((s) => !files.includes(s.file)) : [];
         if (remaining.length > 0) {
           const removed = unique(c.scope.filter((s) => files!.includes(s.file)).map((s) => s.file));
           this.store.updateClaim(project, c.id, { scope: remaining });
@@ -370,11 +371,7 @@ export class Hub {
       if (task.owner === agent && task.status === 'in_progress') return this.withBlocked(project, task);
       if (task.status === 'done' || task.status === 'cancelled') throw new HubError('task_closed', `${id} is already ${task.status}`, 409);
       if (task.status === 'in_progress' && task.owner) throw new HubError('task_taken', `${id} is already taken by ${task.owner}`, 409);
-      const blockedBy = this.blockedBy(project, task);
-      if (blockedBy.length > 0) {
-        const detail = blockedBy.map((d) => `${d} (${this.store.getTask(project, d)?.status ?? 'missing'})`).join(', ');
-        throw new HubError('task_blocked', `${id} is blocked by ${detail}; it can be taken once those are done`, 409);
-      }
+      this.assertUnblocked(project, task, 'taken');
       this.store.updateTask(project, id, { owner: agent, status: 'in_progress', updated_at: now });
       this.emit(project, 'task.taken', agent, { task_id: id, title: task.title, owner: agent });
       return this.withBlocked(project, { ...task, owner: agent, status: 'in_progress', updated_at: now });
@@ -390,6 +387,7 @@ export class Hub {
       const task = this.store.getTask(project, id);
       if (!task) throw new HubError('not_found', `no task ${id}`, 404);
       if (task.owner && task.owner !== agent) throw new HubError('forbidden', `${id} is owned by ${task.owner}`, 403);
+      if (status === 'done' && task.status !== 'done') this.assertCompletable(project, task);
       const owner = status === 'open' ? null : task.owner;
       this.store.updateTask(project, id, { status, owner, updated_at: now });
       this.emit(project, 'task.updated', agent, { task_id: id, status, previous: task.status });
@@ -467,7 +465,10 @@ export class Hub {
 
   // --------------------------------------------------------------- landing
 
-  /** Phase 1 stub: records the request, marks the task done and releases its claims. */
+  /**
+   * Phase 1 stub: records the request, marks the task done and releases its
+   * claims, or all of the agent's once no other task of its is in progress.
+   */
   land(project: string, agent: string, req: LandRequest): LandResult {
     assertAgent(agent);
     return this.write(project, (now) => {
@@ -479,6 +480,7 @@ export class Hub {
         if (t.owner && t.owner !== agent) throw new HubError('forbidden', `${t.id} is owned by ${t.owner}`, 403);
         const owner = t.owner ?? agent;
         if (t.status !== 'done') {
+          this.assertCompletable(project, t);
           this.store.updateTask(project, t.id, { status: 'done', owner, updated_at: now });
           this.emit(project, 'task.updated', agent, { task_id: t.id, status: 'done', previous: t.status });
           unblocked = this.announceUnblocked(project, t.id, agent);
@@ -499,13 +501,20 @@ export class Hub {
       this.store.insertLanding(landing);
       this.emit(project, 'land.requested', agent, { landing_id: landing.id, agent, task_id: landing.task_id, branch: landing.branch, commit: landing.commit });
 
+      // Unless the request named one, a claim is tied to a task only when it was
+      // made while that was the agent's one task in progress, so the edit hook's
+      // claims from before task_take, or from while two tasks were, are tied to
+      // none. Once no other task of the agent's is in progress, none of its
+      // claims can be for another task, so they all go.
+      const inProgress = task ? this.store.listTasks(project).filter((t) => t.owner === agent && t.status === 'in_progress').map((t) => t.id) : [];
       const released: Claim[] = [];
       if (req.release_claims !== false) {
-        const mine = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: task?.id });
+        const mine = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: inProgress.length ? task!.id : undefined });
         for (const c of mine) released.push(this.endClaim(project, c, 'released', `landed ${landing.id}`, now));
         if (released.length) this.promoteQueued(project, now);
       }
-      return { landing, task, released, unblocked, note: LAND_NOTE, now, seq: this.store.latestSeq(project) };
+      const held = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent });
+      return { landing, task, released, unblocked, note: landNote(task, released, held, inProgress), now, seq: this.store.latestSeq(project) };
     });
   }
 
@@ -771,6 +780,20 @@ export class Hub {
 
   private blockedBy(project: string, task: Pick<Task, 'deps'>): string[] {
     return task.deps.filter((d) => this.store.getTask(project, d)?.status !== 'done');
+  }
+
+  /** A task with a dependency that isn't done can be neither taken nor completed. */
+  private assertUnblocked(project: string, task: Pick<Task, 'id' | 'deps'>, what: 'taken' | 'completed'): void {
+    const blockedBy = this.blockedBy(project, task);
+    if (blockedBy.length === 0) return;
+    const detail = blockedBy.map((d) => `${d} (${this.store.getTask(project, d)?.status ?? 'missing'})`).join(', ');
+    throw new HubError('task_blocked', `${task.id} is blocked by ${detail}; it can be ${what} once those are done`, 409);
+  }
+
+  /** Marking a task done needs it unblocked, and a cancelled one reopened first. */
+  private assertCompletable(project: string, task: Pick<Task, 'id' | 'deps' | 'status'>): void {
+    if (task.status === 'cancelled') throw new HubError('task_closed', `${task.id} is cancelled; reopen it before marking it done`, 409);
+    this.assertUnblocked(project, task, 'completed');
   }
 
   private withBlocked(project: string, task: Omit<Task, 'blocked_by'>): Task {
@@ -1061,6 +1084,27 @@ function claimOrderBefore(a: Claim, b: Claim): boolean {
 
 function idNumber(id: string): number {
   return Number(id.split('-')[1] ?? 0);
+}
+
+/** What land did, for the agent: nothing merged, and which of its claims (ids only) it still holds and why. */
+function landNote(task: Task | null, released: Claim[], held: Claim[], inProgress: string[]): string {
+  const parts = ['Phase 1 records the landing request only; nothing was merged. Push or merge your branch the usual way.'];
+  if (task) parts.push('The task is marked done.');
+  if (held.length === 0) {
+    parts.push(released.length > 0 ? 'Your claims are released.' : 'You held no claims.');
+  } else {
+    const them = held.length === 1 ? 'it' : 'them';
+    const claims = held.map((c) => `${c.id} (${c.task_id ? `task ${c.task_id}` : 'no task'})`);
+    const shown = claims.length > MAX_NOTE_CLAIMS ? [...claims.slice(0, MAX_NOTE_CLAIMS - 1), `${claims.length - MAX_NOTE_CLAIMS + 1} more`] : claims;
+    const tasks = andList(inProgress);
+    const why = inProgress.length > 0 ? ` while ${tasks} ${inProgress.length === 1 ? 'is' : 'are'} in progress` : '';
+    parts.push(`You still hold ${andList(shown)}${why}: release ${them} when you are done with ${them}${inProgress.length > 0 ? `, or land ${tasks}` : ''}.`);
+  }
+  return parts.join(' ');
+}
+
+function andList(items: string[]): string {
+  return items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
 }
 
 function toConflict(c: Claim, files: string[]): ClaimConflict {

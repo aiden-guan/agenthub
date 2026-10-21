@@ -563,6 +563,39 @@ describe('HTTP API', () => {
     expect((await api(s.url, 'GET', '/nope', undefined, A)).status).toBe(404);
   });
 
+  it('refuses to land or complete a task with unfinished dependencies with 409 task_blocked, and to complete a cancelled one', async () => {
+    const s = await start();
+    const t1 = (await api(s.url, 'POST', '/tasks', { title: 'one' }, A)).json.task;
+    const t2 = (await api(s.url, 'POST', '/tasks', { title: 'two', deps: [t1.id] }, A)).json.task;
+    const t3 = (await api(s.url, 'POST', '/tasks', { title: 'three', deps: [t2.id] }, A)).json.task;
+    for (const [route, body] of [
+      ['/land', { task_id: t2.id }],
+      [`/tasks/${t2.id}/update`, { status: 'done' }],
+    ] as const) {
+      const res = await api(s.url, 'POST', route, body, B);
+      expect(res).toMatchObject({ status: 409, json: { error: { code: 'task_blocked' } } });
+      expect(res.json.error.message).toContain(`${t2.id} is blocked by ${t1.id} (open)`);
+    }
+    expect((await api(s.url, 'POST', `/tasks/${t3.id}/take`, {}, B)).json.error.code).toBe('task_blocked');
+    const tasks = (await api(s.url, 'GET', '/tasks', undefined, A)).json.tasks;
+    expect(tasks.map((t: { status: string }) => t.status)).toEqual(['open', 'open', 'open']);
+    expect((await api(s.url, 'GET', '/status', undefined, A)).json.landings).toEqual([]);
+
+    await api(s.url, 'POST', `/tasks/${t1.id}/update`, { status: 'cancelled' }, A);
+    expect(await api(s.url, 'POST', '/land', { task_id: t1.id }, B)).toMatchObject({ status: 409, json: { error: { code: 'task_closed' } } });
+  });
+
+  it('releases every claim for {all: true, files: []}, and only the named files of one claim for {claim_id, files}', async () => {
+    const s = await start();
+    await api(s.url, 'POST', '/claims', { files: ['src/auth.ts', 'src/users.ts'] }, A);
+    const waiter = (await api(s.url, 'POST', '/claims', { files: ['src/users.ts'], queue: true }, B)).json.claim;
+    const trim = await api(s.url, 'POST', '/claims/release', { claim_id: 'C-1', files: ['src/auth.ts'] }, A);
+    expect(trim.json).toMatchObject({ released: [], trimmed: [{ id: 'C-1', scope: [{ file: 'src/users.ts' }] }], promoted: [] });
+    const all = await api(s.url, 'POST', '/claims/release', { all: true, files: [] }, A);
+    expect(all.json.released.map((c: { id: string }) => c.id)).toEqual(['C-1']);
+    expect(all.json.promoted.map((c: { id: string }) => c.id)).toEqual([waiter.id]);
+  });
+
   it('keeps the queue order against edit-hook requests and refuses a deadlocking upgrade with 409 deadlock', async () => {
     const s = await start();
     const C = 'lee/codex-1';

@@ -86,6 +86,7 @@ export interface ClaimResult {
   seq: number;
 }
 
+/** `claim_id`, `task_id` and `files` narrow each other (`files` drops just those files from a claim); `all` alone names every claim of yours. */
 export interface ReleaseRequest {
   claim_id?: string;
   files?: string[];
@@ -138,7 +139,7 @@ export interface Task {
   created_by: string | null;
   created_at: number;
   updated_at: number;
-  /** Dependencies that are not done yet. A task with any is blocked and can't be taken. */
+  /** Dependencies that are not done yet. A task with any is blocked: it can't be taken or completed (409 `task_blocked`). */
   blocked_by: string[];
 }
 
@@ -203,7 +204,7 @@ export interface LandRequest {
   branch?: string;
   commit?: string;
   summary?: string;
-  /** Release the claims tied to the task (default true). */
+  /** Release the claims tied to the task, or all of yours once no other task of yours is in progress (default true). */
   release_claims?: boolean;
 }
 
@@ -212,6 +213,7 @@ export interface LandResult {
   task: Task | null;
   released: Claim[];
   unblocked: string[];
+  /** For the agent: nothing was merged, and which of its claims it still holds, if any. */
   note: string;
   now: number;
   seq: number;
