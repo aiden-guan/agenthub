@@ -967,6 +967,32 @@ describe('tasks', () => {
     expect(hub.claim(P, B, { files: ['f.ts'], mode: 'auto' }).status).toBe('granted');
   });
 
+  it('landing the last task in progress still keeps the claims made for another task', () => {
+    const { hub } = setup();
+    hub.createTask(P, A, { title: 'Migrate login to OAuth2' });
+    hub.createTask(P, A, { title: 'Rate-limit login attempts', deps: ['T-1'] });
+    hub.createTask(P, C, { title: 'Audit logging' });
+    hub.takeTask(P, C, 'T-3');
+    const early = hub.claim(P, A, { files: ['early.ts'], mode: 'auto' }).claim!;
+    hub.takeTask(P, A, 'T-1');
+    const now = hub.claim(P, A, { files: ['a.ts'], mode: 'auto' }).claim!;
+    // Pre-claimed for the follow-up that T-1 blocks, and for someone else's task.
+    const followUp = hub.claim(P, A, { files: ['later.ts'], task_id: 'T-2' }).claim!;
+    const theirs = hub.claim(P, A, { files: ['log.ts'], task_id: 'T-3' }).claim!;
+    expect([early.task_id, now.task_id, followUp.task_id, theirs.task_id]).toEqual([null, 'T-1', 'T-2', 'T-3']);
+
+    const r = hub.land(P, A, { task_id: 'T-1' });
+    expect(r.released.map((c) => c.id)).toEqual([early.id, now.id]);
+    expect(r.note).not.toContain('claims are released');
+    expect(r.note).toContain(`You still hold ${followUp.id} (task T-2) and ${theirs.id} (task T-3): release them when you are done with them.`);
+    expect(hub.claim(P, B, { files: ['later.ts'], mode: 'auto' }).status).toBe('denied');
+    expect(hub.claim(P, B, { files: ['early.ts'], mode: 'auto' }).status).toBe('granted');
+
+    hub.takeTask(P, A, 'T-2');
+    expect(hub.land(P, A, { task_id: 'T-2' }).released.map((c) => c.id)).toEqual([followUp.id]);
+    expect(hub.listClaims(P, { holder: A }).map((c) => c.id)).toEqual([theirs.id]);
+  });
+
   it('the landing note says what happened to the claims, never that kept claims were released', () => {
     const { hub } = setup();
     hub.createTask(P, A, { title: 'one' });

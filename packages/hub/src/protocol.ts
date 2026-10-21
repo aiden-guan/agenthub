@@ -204,7 +204,11 @@ export interface LandRequest {
   branch?: string;
   commit?: string;
   summary?: string;
-  /** Release the claims tied to the task, or all of yours once no other task of yours is in progress (default true). */
+  /**
+   * Release the claims tied to the task, and those tied to no task once no other
+   * task of yours is in progress; claims tied to another task stay. With no
+   * task_id, release all of yours (default true).
+   */
   release_claims?: boolean;
 }
 

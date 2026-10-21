@@ -467,7 +467,8 @@ export class Hub {
 
   /**
    * Phase 1 stub: records the request, marks the task done and releases its
-   * claims, or all of the agent's once no other task of its is in progress.
+   * claims, and those tied to no task once no other task of the agent's is in
+   * progress. With no task, it releases all of the agent's claims.
    */
   land(project: string, agent: string, req: LandRequest): LandResult {
     assertAgent(agent);
@@ -504,12 +505,14 @@ export class Hub {
       // Unless the request named one, a claim is tied to a task only when it was
       // made while that was the agent's one task in progress, so the edit hook's
       // claims from before task_take, or from while two tasks were, are tied to
-      // none. Once no other task of the agent's is in progress, none of its
-      // claims can be for another task, so they all go.
+      // none. Once no other task of the agent's is in progress, those can only be
+      // for this one, so they go too. A claim tied to another task stays for it.
       const inProgress = task ? this.store.listTasks(project).filter((t) => t.owner === agent && t.status === 'in_progress').map((t) => t.id) : [];
       const released: Claim[] = [];
       if (req.release_claims !== false) {
-        const mine = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: inProgress.length ? task!.id : undefined });
+        const mine = this.store
+          .listClaims(project, { statuses: ['active', 'queued'], holder: agent })
+          .filter((c) => !task || c.task_id === task.id || (c.task_id === null && inProgress.length === 0));
         for (const c of mine) released.push(this.endClaim(project, c, 'released', `landed ${landing.id}`, now));
         if (released.length) this.promoteQueued(project, now);
       }
