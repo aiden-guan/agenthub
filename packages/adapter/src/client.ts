@@ -200,8 +200,12 @@ export class HubClient {
   land(req: LandRequest): Promise<LandResult> {
     return this.request('POST', '/land', req);
   }
-  /** Long-poll: events after `since`, waiting up to `waitMs` for the first one. */
-  events(since: number, waitMs = 0): Promise<{ events: HubEvent[]; seq: number }> {
+  /**
+   * Long-poll: events after `since`, waiting up to `waitMs` for the first one.
+   * Newer hubs add `epoch` (their database's id) and `next_since` (the cursor
+   * for the next call, past events this agent can't see).
+   */
+  events(since: number, waitMs = 0): Promise<{ events: HubEvent[]; seq: number; epoch?: string; next_since?: number }> {
     return this.request('GET', `/events?since=${since}&wait_ms=${waitMs}`, undefined, waitMs + this.cfg.timeoutMs + 5000);
   }
 

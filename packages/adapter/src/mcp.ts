@@ -70,11 +70,16 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
       return p;
     });
   };
+  // What the feed learned about this agent's claims (a lease that ran out, a hub that lost them) rides on the next tool result.
+  const noted = (text: string): string => {
+    const notices = feed?.takeNotices() ?? [];
+    return notices.length ? `${text}\n\n${notices.map((n) => `Note: ${n}`).join('\n')}` : text;
+  };
   const tool = <A>(fn: (args: A) => Promise<string>) => async (args: A): Promise<ToolResult> => {
     try {
-      return { content: [{ type: 'text', text: await fn(args) }] };
+      return { content: [{ type: 'text', text: noted(await fn(args)) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: errorText(err, cfg) }], isError: true };
+      return { content: [{ type: 'text', text: noted(errorText(err, cfg)) }], isError: true };
     }
   };
 
@@ -168,6 +173,7 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         base_commit: cfg.root ? (headCommit(cfg.root) ?? undefined) : undefined,
       });
       adoptClaims(cfg.root, res.claims);
+      feed?.noteClaims(res.claim ? [res.claim, ...res.claims] : res.claims);
       return describeClaimResult(res);
     }),
   );
