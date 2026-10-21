@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { AGENT_ID_RE, CONFIG_FILE_NAME, TEAM_CONFIG_FILE_NAME, readConfigFile, type ConfigFile } from './config.js';
-import { deriveProject, git, recordedSettings } from './git.js';
+import { AGENT_ID_RE, CONFIG_FILE_NAME, TEAM_CONFIG_FILE_NAME, parseConfigFile, readConfigFile, type ConfigFile } from './config.js';
+import { deriveProject, git, gitRaw, recordedSettings } from './git.js';
 
 export interface InitOptions {
   cwd: string;
@@ -61,18 +61,26 @@ export function init(opts: InitOptions): string[] {
   const teamExisting = readConfigFile(teamPath);
   const recorded = recordedSettings(root);
   const team: ConfigFile = { ...teamExisting };
+  const notes: string[] = [];
   if (!teamExisting || opts.project || opts.url) {
-    // Set up by an older `hub init` that recorded nothing: another worktree's file says what the team uses.
-    const sibling = !teamExisting && !opts.project && !recorded.project ? siblingTeamConfig(root) : null;
-    team.project = opts.project ?? team.project ?? recorded.project ?? sibling?.project ?? deriveProject(root) ?? 'default';
+    // Nothing recorded: another worktree's file says what the team uses (a repository set up by an
+    // older `hub init`), or else the one committed upstream (a fresh clone, on a branch that predates it).
+    const found = !teamExisting && !opts.project && !recorded.project ? (siblingTeamConfig(root) ?? upstreamTeamConfig(root)) : null;
+    const known = opts.project ?? team.project ?? recorded.project ?? found?.project;
+    team.project = known ?? deriveProject(root) ?? 'default';
+    if (!known) {
+      notes.push(
+        `note: project ${team.project} was derived from the repository: there is no ${TEAM_CONFIG_FILE_NAME} in this checkout, in the other worktrees or on origin's default branch, and none recorded in the repository's git config. ` +
+          'If your team already coordinates this repository under another project id, run `hub init --project ID` with that id.',
+      );
+    }
     if (opts.url) team.url = opts.url.replace(/\/+$/, '');
-    else if (!teamExisting && (recorded.url ?? sibling?.url)) team.url = recorded.url ?? sibling?.url;
+    else if (!teamExisting && (recorded.url ?? found?.url)) team.url = recorded.url ?? found?.url;
     if (JSON.stringify(team) !== JSON.stringify(teamExisting)) {
       writeJson(teamPath, team);
       report.push(`wrote ${TEAM_CONFIG_FILE_NAME} (project ${team.project}${team.url ? `, hub ${team.url}` : ''}); commit it so every clone and worktree agrees`);
     }
   }
-  const notes: string[] = [];
 
   // 1b. the same, recorded in the git config every worktree shares. What another
   // checkout recorded is only replaced on purpose (--project, --url).
@@ -179,6 +187,25 @@ function siblingTeamConfig(root: string): ConfigFile | null {
   return found.find((f) => f.url) ?? found[0] ?? null;
 }
 
+/**
+ * agenthub.json as committed on origin's default branch. A fresh clone has
+ * none of the repository's git config, so this is all that tells `hub init`,
+ * run first on a branch made before the setup commit, what the team uses.
+ */
+function upstreamTeamConfig(root: string): ConfigFile | null {
+  for (const ref of ['refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master']) {
+    const text = gitRaw(root, ['cat-file', 'blob', `${ref}:${TEAM_CONFIG_FILE_NAME}`]);
+    if (text === null) continue;
+    try {
+      const f = parseConfigFile(text, `${TEAM_CONFIG_FILE_NAME} on ${ref}`);
+      if (f.project) return f;
+    } catch {
+      // unreadable there: keep looking, then derive (and say so)
+    }
+  }
+  return null;
+}
+
 /** Write a guard hook; a hook of the user's already there is kept and chained after it. */
 function installGitHook(hooksDir: string, name: string, script: string, report: string[]): void {
   const hookPath = path.join(hooksDir, name);
@@ -254,12 +281,15 @@ ${chainSh('pre-commit')}`;
  * prepare-commit-msg: git revert, cherry-pick and rebase commit without running
  * pre-commit (in process, or through `git commit -n -e` when the message is
  * edited, as it is by default on a terminal), with MERGE_MSG in the git dir and
- * no MERGE_HEAD. A commit whose pre-commit ran was checked there: pre-commit
- * leaves the pid of its git process. Any other commit in the middle of one of
- * those operations is checked here, including a `git commit --no-verify` that
- * finishes a conflicted pick, which looks the same to the hooks as git's own
- * `git commit -n -e`. Plain commits are left to pre-commit (and --no-verify),
- * and merge commits, which carry other branches' work, are left alone.
+ * no MERGE_HEAD. At a rebase stop (`edit`, say) only rebase-merge/ is there (or
+ * rebase-apply/, for git am), and `git rebase --continue` commits what was
+ * staged at it through `git commit -n` too. A commit whose pre-commit ran was
+ * checked there: pre-commit leaves the pid of its git process. Any other commit
+ * in the middle of one of those operations is checked here, including a
+ * `git commit --no-verify` that finishes a conflicted pick, which looks the
+ * same to the hooks as git's own `git commit -n -e`. Plain commits are left to
+ * pre-commit (and --no-verify), and merge commits, which carry other branches'
+ * work, are left alone.
  */
 export function sequencerGuardScript(command: string): string {
   return `#!/bin/sh
@@ -276,7 +306,8 @@ if [ -n "$gitdir" ] && [ -f "$gitdir/${CHECKED_FILE}" ]; then
   checked="$(cat "$gitdir/${CHECKED_FILE}" 2>/dev/null)"
   rm -f "$gitdir/${CHECKED_FILE}"
 fi
-if [ -n "$gitdir" ] && [ "$checked" != "$PPID" ] && [ -f "$gitdir/MERGE_MSG" ] && [ ! -f "$gitdir/MERGE_HEAD" ]; then
+if [ -n "$gitdir" ] && [ "$checked" != "$PPID" ] && [ ! -f "$gitdir/MERGE_HEAD" ] &&
+  { [ -f "$gitdir/MERGE_MSG" ] || [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; }; then
 ${runGuardSh(command, ' --sequencer').replace(/^/gm, '  ')}
 fi
 ${chainSh('prepare-commit-msg')}`;

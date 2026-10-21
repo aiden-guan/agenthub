@@ -131,6 +131,11 @@ export function readConfigFile(file: string): ConfigFile | null {
   } catch {
     return null;
   }
+  return parseConfigFile(text, file);
+}
+
+/** Check a config file's contents (`file` names it in errors). */
+export function parseConfigFile(text: string, file: string): ConfigFile {
   let value: Record<string, unknown>;
   try {
     value = JSON.parse(text);

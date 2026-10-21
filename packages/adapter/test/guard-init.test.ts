@@ -426,6 +426,29 @@ describe('hub guard: commits git makes without running pre-commit', () => {
     expect(unchecked.code).toBe(0);
     expect(unchecked.stderr.match(/claims not checked/g)).toHaveLength(1); // pre-commit ran, so prepare-commit-msg did not ask again
   });
+
+  it('checks a change staged at a rebase -i edit stop, which git rebase --continue amends in through git commit -n', async () => {
+    const editStop = async () => {
+      // stops at HEAD itself; git leaves rebase-merge/ in the git dir, and no MERGE_MSG
+      expect((await gitB(['rebase', '-i', 'HEAD~1'], { GIT_SEQUENCE_EDITOR: 'sed -i.bak -e 1s/^pick/edit/' })).code).toBe(0);
+    };
+    const before = git(r.wtB, 'rev-parse', 'HEAD').trim();
+    await editStop();
+    writeFileSync(path.join(r.wtB, 'src', 'auth.ts'), 'export const login = () => "amended in";\n');
+    git(r.wtB, 'add', 'src/auth.ts');
+    const res = await gitB(['rebase', '--continue'], { GIT_EDITOR: 'true' });
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/hub guard: commit blocked[\s\S]*src\/auth\.ts — claimed by maya\/claude-1 \(C-1\)/);
+    expect(git(r.wtB, 'show', 'HEAD:src/auth.ts')).not.toContain('amended in');
+    git(r.wtB, 'rebase', '--abort');
+    expect(git(r.wtB, 'rev-parse', 'HEAD').trim()).toBe(before);
+
+    await editStop();
+    writeFileSync(path.join(r.wtB, 'src', 'users.ts'), 'export const users = ["amended in"];\n');
+    git(r.wtB, 'add', 'src/users.ts');
+    expect((await gitB(['rebase', '--continue'], { GIT_EDITOR: 'true' })).code).toBe(0); // free files go through
+    expect(git(r.wtB, 'show', 'HEAD:src/users.ts')).toContain('amended in');
+  });
 });
 
 describe('a worktree on a branch made before agenthub.json was committed', () => {
@@ -483,5 +506,34 @@ describe('a worktree on a branch made before agenthub.json was committed', () =>
     const report = init({ cwd: r.wtA, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
     expect(report[0]).toBe(`wrote agenthub.json (project ${PROJECT}, hub ${hub.url}); commit it so every clone and worktree agrees`);
     expect(git(r.main, 'config', '--local', 'agenthub.project').trim()).toBe(PROJECT);
+  });
+
+  it("makes hub init in a fresh clone, on a branch made before the setup commit, take the project from origin's default branch", async () => {
+    // A new clone has none of the repository's git config and no other worktree: only origin/HEAD has agenthub.json.
+    const clone = path.join(r.dir, 'lee');
+    git(r.dir, 'clone', '-q', r.main, clone);
+    git(clone, 'checkout', '-q', 'agent-b');
+    expect(existsSync(path.join(clone, 'agenthub.json'))).toBe(false);
+    const report = init({ cwd: clone, agent: 'lee/claude-1', url: hub.url, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+    expect(report[0]).toBe(`wrote agenthub.json (project ${PROJECT}, hub ${hub.url}); commit it so every clone and worktree agrees`);
+    expect(report.join('\n')).not.toMatch(/derived/);
+    expect(git(clone, 'config', '--local', 'agenthub.project').trim()).toBe(PROJECT);
+
+    writeFileSync(path.join(clone, 'src', 'auth.ts'), 'export const login = () => "lee";\n');
+    git(clone, 'add', 'src/auth.ts');
+    const res = await run('git', ['commit', '-q', '-m', 'lee: auth'], { cwd: clone, env: testEnv() });
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/src\/auth\.ts — claimed by maya\/claude-1 \(C-1\)/);
+  });
+
+  it('says so when hub init has to derive the project, with nothing found anywhere to take it from', () => {
+    const fresh = makeRepo();
+    try {
+      const report = init({ cwd: fresh.wtA, agent: A, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+      expect(report[0]).toMatch(/^wrote agenthub\.json \(project sample\)/);
+      expect(report.join('\n')).toMatch(/note: project sample was derived from the repository[\s\S]*hub init --project/);
+    } finally {
+      fresh.cleanup();
+    }
   });
 });
