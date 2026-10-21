@@ -18,7 +18,7 @@ How Phases 2 and 3 of `docs/design-phase2-3.md` are being built, so the build ca
 | 2 | `stage2.json` | `cp1a` | hub H4, lander L2–L3, adapter A1–A2 | `cp1` |
 | 3 | `stage3.json` | `cp1` | hub H5, lander L4–L5, adapter A5 (Phase 2 scenarios) | `cp2` (Phase 2 complete, plus CP3a) |
 | 4 | `stage4.json` | `cp2` | hub H6, lander L6, adapter A3, A4, A5 (Phase 3), A6 | `cp3` (Phase 3 complete) |
-| 5 | (write it) | `cp3` | adversarial review of `fix/phase1-review..phase23`, fixes, re-verification | then push `phase23` and open a PR against `fix/phase1-review` |
+| 5 | `stage5.js` (its own script; args below) | `cp3` | adversarial review of `fix/phase1-review..phase23`: find, reproduce, refute, fix by lane, re-verify, integrate, regression review | `cp3r`; then push `phase23` and open a PR against `fix/phase1-review` |
 
 ## Running a stage
 
@@ -28,8 +28,12 @@ How Phases 2 and 3 of `docs/design-phase2-3.md` are being built, so the build ca
 3. Run the Workflow tool with `scriptPath: docs/build/stage.js` and the args file's contents as `args`.
 4. When it finishes, check the result, run `npm test` yourself, and check plan usage before the next stage.
 
+Stage 5 runs `stage5.js` directly with args `{repo, scratch, base: "origin/fix/phase1-review", head: "phase23", from: "cp3", tag: "cp3r", lanes: {<lane>: {wt, branch}}}`, reusing the four lane worktrees.
+
 ## Things learned the hard way
 
 - An agent that dies on an API error returns null; `stage.js` retries each agent up to 3 times.
 - Don't resume a stopped parallel workflow with `resumeFromRunId`: its cache matches by call order, so with parallel lanes it re-runs finished agents on top of later commits. Write a continuation that skips finished steps instead.
 - A brief "usage limit" API error can show up even with plenty of quota left; check the usage card before assuming the limit is real.
+- On Linux, `npm install` rewrites `package-lock.json` (it drops the `libc` fields). Lanes install with `npm ci`; only the integrator commits lockfile changes, and only for a dependency request.
+- The cloud session's git proxy accepts branch pushes but refuses tag pushes (HTTP 403). Checkpoint tags stay local; their commits are on `phase23` with the checkpoint name at the start of the message.
