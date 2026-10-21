@@ -240,12 +240,34 @@ function eventData(json: string): Record<string, unknown> {
 
 const CLAIM_PATCH_COLUMNS = ['status', 'granted_at', 'expires_at', 'ended_at', 'end_reason', 'task_id', 'intent'] as const;
 
+/**
+ * Statements compiled once per SQL text. Every request renews each lease its
+ * agent holds, and a statement prepared per call keeps its native memory until
+ * its JS wrapper is collected: gigabytes for an agent with a long queue.
+ */
+class StatementCache {
+  private readonly db: Database.Database;
+  private readonly byText = new Map<string, Database.Statement>();
+
+  constructor(db: Database.Database) {
+    this.db = db;
+  }
+
+  prepare(text: string): Database.Statement {
+    let stmt = this.byText.get(text);
+    if (!stmt) this.byText.set(text, (stmt = this.db.prepare(text)));
+    return stmt;
+  }
+}
+
 /** `Store` on better-sqlite3. Pass `':memory:'` for tests. */
 export class SqliteStore implements Store {
   readonly db: Database.Database;
+  private readonly statements: StatementCache;
 
   constructor(filename = ':memory:') {
     this.db = new Database(filename);
+    this.statements = new StatementCache(this.db);
     // busy_timeout first, so a second process opening the same file waits instead of failing.
     this.db.pragma('busy_timeout = 5000');
     this.db.pragma('journal_mode = WAL');
@@ -284,15 +306,15 @@ export class SqliteStore implements Store {
   }
 
   ensureProject(project: string, now: number): void {
-    this.db.prepare('INSERT OR IGNORE INTO projects (id, created_at) VALUES (?, ?)').run(project, now);
+    this.statements.prepare('INSERT OR IGNORE INTO projects (id, created_at) VALUES (?, ?)').run(project, now);
   }
 
   listProjects(): string[] {
-    return this.db.prepare('SELECT id FROM projects ORDER BY id').pluck().all() as string[];
+    return this.statements.prepare('SELECT id FROM projects ORDER BY id').pluck().all() as string[];
   }
 
   nextCounter(project: string, kind: string): number {
-    return this.db
+    return this.statements
       .prepare(
         `INSERT INTO counters (project, kind, value) VALUES (?, ?, 1)
          ON CONFLICT (project, kind) DO UPDATE SET value = value + 1
@@ -303,10 +325,10 @@ export class SqliteStore implements Store {
   }
 
   touchAgent(project: string, agent: string, now: number, info: AgentTouch = {}): { previous_last_seen: number | null } {
-    const prev = this.db.prepare('SELECT last_seen FROM agents WHERE project = ? AND agent = ?').pluck().get(project, agent) as
+    const prev = this.statements.prepare('SELECT last_seen FROM agents WHERE project = ? AND agent = ?').pluck().get(project, agent) as
       | number
       | undefined;
-    this.db
+    this.statements
       .prepare(
         `INSERT INTO agents (project, agent, client, branch, worktree, first_seen, last_seen)
          VALUES (@project, @agent, @client, @branch, @worktree, @now, @now)
@@ -321,12 +343,12 @@ export class SqliteStore implements Store {
   }
 
   listAgents(project: string): AgentRow[] {
-    return this.db.prepare('SELECT * FROM agents WHERE project = ? ORDER BY agent').all(project) as AgentRow[];
+    return this.statements.prepare('SELECT * FROM agents WHERE project = ? ORDER BY agent').all(project) as AgentRow[];
   }
 
   insertTask(task: Omit<Task, 'blocked_by'>): void {
     const seq = this.nextCounter(task.project, 'task-order');
-    this.db
+    this.statements
       .prepare(
         `INSERT INTO tasks (project, id, title, description, deps, owner, status, created_by, created_at, updated_at, seq)
          VALUES (@project, @id, @title, @description, @deps, @owner, @status, @created_by, @created_at, @updated_at, @seq)`,
@@ -335,7 +357,7 @@ export class SqliteStore implements Store {
   }
 
   getTask(project: string, id: string): Omit<Task, 'blocked_by'> | null {
-    const row = this.db.prepare('SELECT * FROM tasks WHERE project = ? AND id = ?').get(project, id) as TaskRowDb | undefined;
+    const row = this.statements.prepare('SELECT * FROM tasks WHERE project = ? AND id = ?').get(project, id) as TaskRowDb | undefined;
     return row ? toTask(row) : null;
   }
 
@@ -349,16 +371,16 @@ export class SqliteStore implements Store {
       }
     }
     if (sets.length === 0) return;
-    this.db.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE project = @project AND id = @id`).run(params);
+    this.statements.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE project = @project AND id = @id`).run(params);
   }
 
   listTasks(project: string): Omit<Task, 'blocked_by'>[] {
-    return (this.db.prepare('SELECT * FROM tasks WHERE project = ? ORDER BY seq').all(project) as TaskRowDb[]).map(toTask);
+    return (this.statements.prepare('SELECT * FROM tasks WHERE project = ? ORDER BY seq').all(project) as TaskRowDb[]).map(toTask);
   }
 
   insertClaim(claim: Claim): void {
     const order = this.nextCounter(claim.project, 'claim-order');
-    this.db
+    this.statements
       .prepare(
         `INSERT INTO claims (project, id, holder, task_id, scope, mode, intent, base_commit, status, created_at, granted_at,
                              expires_at, ttl_ms, heartbeat_interval_ms, ended_at, end_reason, queue_order)
@@ -370,13 +392,13 @@ export class SqliteStore implements Store {
   }
 
   private writeClaimFiles(project: string, claimId: string, scope: Claim['scope']): void {
-    this.db.prepare('DELETE FROM claim_files WHERE project = ? AND claim_id = ?').run(project, claimId);
-    const insert = this.db.prepare('INSERT OR IGNORE INTO claim_files (project, claim_id, file, symbol) VALUES (?, ?, ?, ?)');
+    this.statements.prepare('DELETE FROM claim_files WHERE project = ? AND claim_id = ?').run(project, claimId);
+    const insert = this.statements.prepare('INSERT OR IGNORE INTO claim_files (project, claim_id, file, symbol) VALUES (?, ?, ?, ?)');
     for (const entry of scope) insert.run(project, claimId, entry.file, entry.symbol ?? '');
   }
 
   getClaim(project: string, id: string): Claim | null {
-    const row = this.db.prepare('SELECT * FROM claims WHERE project = ? AND id = ?').get(project, id) as ClaimRowDb | undefined;
+    const row = this.statements.prepare('SELECT * FROM claims WHERE project = ? AND id = ?').get(project, id) as ClaimRowDb | undefined;
     return row ? toClaim(row) : null;
   }
 
@@ -395,7 +417,7 @@ export class SqliteStore implements Store {
       this.writeClaimFiles(project, id, patch.scope);
     }
     if (sets.length === 0) return;
-    this.db.prepare(`UPDATE claims SET ${sets.join(', ')} WHERE project = @project AND id = @id`).run(params);
+    this.statements.prepare(`UPDATE claims SET ${sets.join(', ')} WHERE project = @project AND id = @id`).run(params);
   }
 
   listClaims(project: string, filter: ClaimFilter): Claim[] {
@@ -413,7 +435,7 @@ export class SqliteStore implements Store {
       where.push('expires_at <= @expires');
       params.expires = filter.expiresAtOrBefore;
     }
-    const rows = this.db.prepare(`SELECT * FROM claims WHERE ${where.join(' AND ')} ORDER BY queue_order`).all(params) as ClaimRowDb[];
+    const rows = this.statements.prepare(`SELECT * FROM claims WHERE ${where.join(' AND ')} ORDER BY queue_order`).all(params) as ClaimRowDb[];
     return rows.map(toClaim);
   }
 
@@ -421,7 +443,7 @@ export class SqliteStore implements Store {
     if (files.length === 0) return [];
     // `+f.file` makes the file list a lookup set instead of one index probe per
     // listed file for every live claim, which grew with files x claims.
-    const rows = this.db
+    const rows = this.statements
       .prepare(
         `SELECT c.* FROM claims c
          WHERE c.project = @project
@@ -438,14 +460,14 @@ export class SqliteStore implements Store {
   }
 
   projectsWithDueClaims(now: number): string[] {
-    return this.db
+    return this.statements
       .prepare(`SELECT DISTINCT project FROM claims WHERE status IN ('active', 'queued') AND expires_at <= ?`)
       .pluck()
       .all(now) as string[];
   }
 
   insertMessage(message: Omit<Message, 'id'>): number {
-    const info = this.db
+    const info = this.statements
       .prepare(
         `INSERT INTO messages (project, from_agent, to_agent, channel, body, created_at)
          VALUES (@project, @from, @to, @channel, @body, @created_at)`,
@@ -455,7 +477,7 @@ export class SqliteStore implements Store {
   }
 
   messagesFor(project: string, agent: string, afterId: number, limit: number): Message[] {
-    const rows = this.db
+    const rows = this.statements
       .prepare(
         `SELECT * FROM messages
          WHERE project = @project AND id > @afterId
@@ -467,7 +489,7 @@ export class SqliteStore implements Store {
   }
 
   countMessagesFor(project: string, agent: string, afterId: number): number {
-    return this.db
+    return this.statements
       .prepare(
         `SELECT COUNT(*) FROM messages
          WHERE project = @project AND id > @afterId
@@ -478,12 +500,12 @@ export class SqliteStore implements Store {
   }
 
   getInboxCursor(project: string, agent: string): number {
-    const v = this.db.prepare('SELECT last_read FROM inbox_cursors WHERE project = ? AND agent = ?').pluck().get(project, agent);
+    const v = this.statements.prepare('SELECT last_read FROM inbox_cursors WHERE project = ? AND agent = ?').pluck().get(project, agent);
     return (v as number | undefined) ?? 0;
   }
 
   setInboxCursor(project: string, agent: string, lastRead: number): void {
-    this.db
+    this.statements
       .prepare(
         `INSERT INTO inbox_cursors (project, agent, last_read) VALUES (?, ?, ?)
          ON CONFLICT (project, agent) DO UPDATE SET last_read = MAX(last_read, excluded.last_read)`,
@@ -493,7 +515,7 @@ export class SqliteStore implements Store {
 
   insertDecision(d: Decision): void {
     const seq = this.nextCounter(d.project, 'decision-order');
-    this.db
+    this.statements
       .prepare(
         `INSERT INTO decisions (project, id, agent, summary, rationale, files, symbols, task_id, created_at, seq)
          VALUES (@project, @id, @agent, @summary, @rationale, @files, @symbols, @task_id, @created_at, @seq)`,
@@ -502,7 +524,7 @@ export class SqliteStore implements Store {
   }
 
   listDecisions(project: string, limit: number): Decision[] {
-    const rows = this.db.prepare('SELECT * FROM decisions WHERE project = ? ORDER BY seq DESC LIMIT ?').all(project, limit) as Array<
+    const rows = this.statements.prepare('SELECT * FROM decisions WHERE project = ? ORDER BY seq DESC LIMIT ?').all(project, limit) as Array<
       Omit<Decision, 'files' | 'symbols'> & { files: string; symbols: string }
     >;
     return rows.map((r) => ({
@@ -520,7 +542,7 @@ export class SqliteStore implements Store {
 
   insertLanding(l: Landing): void {
     const seq = this.nextCounter(l.project, 'landing-order');
-    this.db
+    this.statements
       .prepare(
         `INSERT INTO landings (project, id, agent, task_id, branch, commit_sha, summary, status, created_at, seq)
          VALUES (@project, @id, @agent, @task_id, @branch, @commit, @summary, @status, @created_at, @seq)`,
@@ -529,21 +551,21 @@ export class SqliteStore implements Store {
   }
 
   listLandings(project: string, limit: number): Landing[] {
-    const rows = this.db.prepare('SELECT * FROM landings WHERE project = ? ORDER BY seq DESC LIMIT ?').all(project, limit) as Array<
+    const rows = this.statements.prepare('SELECT * FROM landings WHERE project = ? ORDER BY seq DESC LIMIT ?').all(project, limit) as Array<
       Omit<Landing, 'commit'> & { commit_sha: string | null }
     >;
     return rows.map(({ commit_sha, ...rest }) => ({ ...rest, commit: commit_sha }));
   }
 
   appendEvent(e: Omit<HubEvent, 'seq'>): number {
-    const info = this.db
+    const info = this.statements
       .prepare('INSERT INTO events (project, type, actor, at, data, targets) VALUES (?, ?, ?, ?, ?, ?)')
       .run(e.project, e.type, e.actor, e.at, JSON.stringify(e.data), e.targets ? JSON.stringify(e.targets) : null);
     return Number(info.lastInsertRowid);
   }
 
   eventsSince(project: string, afterSeq: number, limit: number): HubEvent[] {
-    const rows = this.db
+    const rows = this.statements
       .prepare('SELECT * FROM events WHERE project = ? AND seq > ? ORDER BY seq LIMIT ?')
       .all(project, afterSeq, limit) as Array<{
       seq: number;
@@ -566,7 +588,7 @@ export class SqliteStore implements Store {
   }
 
   latestSeq(project: string): number {
-    const v = this.db.prepare('SELECT MAX(seq) FROM events WHERE project = ?').pluck().get(project);
+    const v = this.statements.prepare('SELECT MAX(seq) FROM events WHERE project = ?').pluck().get(project);
     return (v as number | null) ?? 0;
   }
 }

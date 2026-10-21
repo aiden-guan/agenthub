@@ -60,6 +60,8 @@ const MAX_TITLE = 200;
 const MAX_LONG_TEXT = 4000;
 const MAX_SUMMARY = 300;
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** Past this many events since a wait graph was built, building a new one is cheaper than checking them. */
+const MAX_EVENTS_TO_REUSE = 100;
 
 const LAND_NOTE =
   'Phase 1 records the landing request only; nothing was merged. Push or merge your branch the usual way. ' +
@@ -81,6 +83,8 @@ export class Hub {
   private readonly listeners = new Set<(event: HubEvent) => void>();
   private pending: HubEvent[] | null = null;
   private txNow = 0;
+  /** Each project's last wait graph, with the event seq it was built at (see waitGraph). */
+  private readonly waitGraphs = new Map<string, { seq: number; waits: Waits }>();
 
   constructor(opts: HubOptions) {
     this.store = opts.store;
@@ -144,8 +148,7 @@ export class Hub {
       // Nobody can wait for an agent that holds nothing, so its requests need no graph.
       const waitedFor = held.length > 0;
       const theirs = queuedOnFiles.filter((q) => q.holder !== agent);
-      const behindMe = waitedFor && theirs.length > 0 ? waitingFor(waits(), agent) : new Set<string>();
-      const waiters = theirs.filter((q) => !behindMe.has(q.holder));
+      const waiters = theirs.filter((q) => !(waitedFor && waits().reach.has(q.holder, agent)));
       const blocking = [...others.filter((c) => uncovered.some((f) => hasFile(c, f))), ...waiters];
       const effectiveMode: ClaimMode =
         mode === 'auto' ? (blocking.length > 0 && blocking.every((c) => c.mode === 'shared') ? 'shared' : 'exclusive') : mode;
@@ -153,13 +156,14 @@ export class Hub {
       const conflicts = blockers.map((c) => toConflict(c, uncovered));
       // A holder in the way that waits, directly or not, for a claim this agent holds
       // would wait forever, and so would this request. That can't be queued.
-      const cycle = waitedFor && conflicts.length > 0 ? waitCycle(waits().held, agent, blockers) : null;
+      const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(c.holder, agent));
+      const cycle = waitsForMe ? waitCycle(waits().held, agent, blockers) : null;
 
       if (conflicts.length > 0 && !req.queue) {
         // Waiting outside the queue also never ends when a holder in the way waits in
         // line behind a claim of this agent's. Queued instead, the request would let
         // the hub reorder that line (see waitGraph).
-        const inLine = cycle || !waitedFor ? null : waitCycle(waits().all, agent, blockers);
+        const inLine = cycle || !waitsForMe ? null : waitCycle(waits().all, agent, blockers);
         const deadlock = cycle
           ? `waiting for it would deadlock: ${cycle.steps}, so none of these claims could ever be granted. Release ${cycle.release}, or go on without this claim.`
           : inLine
@@ -569,6 +573,11 @@ export class Hub {
         this.expireDue(project, now);
         return fn(now);
       });
+    } catch (err) {
+      // A wait graph built in a transaction that rolled back describes claims that
+      // never were, at an event seq that the next commit reuses.
+      this.waitGraphs.delete(project);
+      throw err;
     } finally {
       this.pending = null;
     }
@@ -664,7 +673,8 @@ export class Hub {
           task_id: q.task_id,
           from_queue: true,
         });
-        promoted.push({ ...q, status: 'active', granted_at: now });
+        // As stored: a graph from an earlier request can predate the waiter's last heartbeat.
+        promoted.push(this.store.getClaim(project, q.id)!);
       }
     }
   }
@@ -681,32 +691,41 @@ export class Hub {
    * the waits for active claims (`held`) don't already have, and claim() never
    * queues a claim that closes one there. So the graph stays acyclic, and some
    * claim can always go next.
+   *
+   * Whatever changes which claims are queued or active, or the files they name,
+   * emits an event in the same transaction. So a graph still holds, even after
+   * another process wrote, while the events since it was built queue, promote or
+   * end no waiter and grant or end no claim on a file a waiter names. Requests
+   * then reuse it instead of going over the whole queue again.
    */
   private waitGraph(project: string): Waits {
-    const queue = this.store.listClaims(project, { statuses: ['queued'] });
-    const waits: Waits = { queue, blocked: new Set(), held: new Map(), all: new Map(), waitedForBy: new Map() };
-    if (queue.length === 0) return waits;
-    const add = (waiter: Claim, blocker: Claim, held: boolean) => {
-      waits.blocked.add(waiter.id);
-      for (const graph of held ? [waits.held, waits.all] : [waits.all]) {
-        const out = graph.get(waiter.holder) ?? graph.set(waiter.holder, new Map()).get(waiter.holder)!;
-        if (!out.has(blocker.holder)) out.set(blocker.holder, { waiter, blocker });
-      }
-      (waits.waitedForBy.get(blocker.holder) ?? waits.waitedForBy.set(blocker.holder, new Set()).get(blocker.holder)!).add(waiter.holder);
-    };
-    const active = byFile(this.store.claimsForFiles(project, unique(queue.flatMap(claimFiles)), ['active']));
-    for (const q of queue) for (const a of near(active, q)) if (clash(a, q)) add(q, a, true);
-    const earlier = new Map<string, Claim[]>();
-    for (const q of queue) {
-      const ahead = near(earlier, q).filter((e) => clash(e, q));
-      const behind = ahead.length > 0 ? waitingFor(waits, q.holder) : new Set<string>();
-      for (const e of ahead) {
-        if (behind.has(e.holder)) add(e, q, false);
-        else add(q, e, false);
-      }
-      for (const f of claimFiles(q)) (earlier.get(f) ?? earlier.set(f, []).get(f)!).push(q);
+    const seq = this.store.latestSeq(project);
+    const cached = this.waitGraphs.get(project);
+    if (cached && (cached.seq === seq || this.leftAlone(project, cached.seq, cached.waits))) {
+      cached.seq = seq;
+      return cached.waits;
     }
+    const queue = this.store.listClaims(project, { statuses: ['queued'] });
+    const files = new Set(queue.flatMap(claimFiles));
+    const waits = buildWaits(queue, files, this.store.claimsForFiles(project, [...files], ['active']));
+    this.waitGraphs.set(project, { seq, waits });
     return waits;
+  }
+
+  /** Whether the events after `seq` leave `waits` as they are (see waitGraph). */
+  private leftAlone(project: string, seq: number, waits: Waits): boolean {
+    const events = this.store.eventsSince(project, seq, MAX_EVENTS_TO_REUSE + 1);
+    if (events.length > MAX_EVENTS_TO_REUSE) return false;
+    return events.every((e) => {
+      if (!e.type.startsWith('claim.')) return true;
+      const { claim_id: id, files } = e.data;
+      return (
+        e.type !== 'claim.queued' &&
+        !waits.ids.has(id as string) &&
+        Array.isArray(files) &&
+        !files.some((f) => waits.files.has(f as string))
+      );
+    });
   }
 
   private newClaim(
@@ -910,28 +929,92 @@ type WaitGraph = Map<string, Map<string, Wait>>;
 interface Waits {
   /** Queued claims in queue order. */
   queue: Claim[];
+  /** Their ids. */
+  ids: Set<string>;
+  /** The files they name. */
+  files: Set<string>;
   /** Ids of the queued claims that wait for something. */
   blocked: Set<string>;
   /** Only the waits for active claims. */
   held: WaitGraph;
   /** All waits, for active claims and in line. */
   all: WaitGraph;
-  /** `all` reversed: who waits for each agent. */
-  waitedForBy: Map<string, Set<string>>;
+  /** Who waits for whom in `all`, directly or through others. */
+  reach: Reach;
 }
 
-/** The agents that wait, directly or through others, for `agent`. */
-function waitingFor(waits: Waits, agent: string): Set<string> {
-  const found = new Set<string>();
-  const todo = [agent];
-  for (let next = todo.pop(); next !== undefined; next = todo.pop()) {
-    for (const waiter of waits.waitedForBy.get(next) ?? []) {
-      if (found.has(waiter)) continue;
-      found.add(waiter);
-      todo.push(waiter);
+/** See Hub.waitGraph: `queue` in queue order, `files` the files it names, `active` the active claims on them. */
+function buildWaits(queue: Claim[], files: Set<string>, active: Claim[]): Waits {
+  const waits: Waits = {
+    queue,
+    ids: new Set(queue.map((q) => q.id)),
+    files,
+    blocked: new Set(),
+    held: new Map(),
+    all: new Map(),
+    reach: new Reach([...queue, ...active].map((c) => c.holder)),
+  };
+  const add = (waiter: Claim, blocker: Claim, held: boolean) => {
+    waits.blocked.add(waiter.id);
+    if (held) link(waits.held, waiter, blocker);
+    if (link(waits.all, waiter, blocker)) waits.reach.add(waiter.holder, blocker.holder);
+  };
+  const activeByFile = byFile(active);
+  for (const q of queue) for (const a of near(activeByFile, q)) if (clash(a, q)) add(q, a, true);
+  const earlier = new Map<string, Claim[]>();
+  for (const q of queue) {
+    const ahead = near(earlier, q).filter((e) => clash(e, q));
+    // Each decided against the waits before this claim's own are added.
+    const goesBehind = ahead.map((e) => waits.reach.has(e.holder, q.holder));
+    ahead.forEach((e, i) => (goesBehind[i] ? add(e, q, false) : add(q, e, false)));
+    for (const f of claimFiles(q)) (earlier.get(f) ?? earlier.set(f, []).get(f)!).push(q);
+  }
+  return waits;
+}
+
+/** Record that `waiter`'s agent waits for `blocker`'s; false if `graph` already had them waiting directly. */
+function link(graph: WaitGraph, waiter: Claim, blocker: Claim): boolean {
+  const out = graph.get(waiter.holder) ?? graph.set(waiter.holder, new Map()).get(waiter.holder)!;
+  if (out.has(blocker.holder)) return false;
+  out.set(blocker.holder, { waiter, blocker });
+  return true;
+}
+
+/** For each agent, a row of bits: the agents it waits for, directly or through others. */
+class Reach {
+  private readonly index = new Map<string, number>();
+  private readonly rows: Uint32Array[] = [];
+
+  constructor(agents: string[]) {
+    for (const a of agents) if (!this.index.has(a)) this.index.set(a, this.index.size);
+    for (let i = 0; i < this.index.size; i++) this.rows.push(new Uint32Array((this.index.size + 31) >>> 5));
+  }
+
+  /** Whether `waiter` waits, directly or through others, for `blocker`. */
+  has(waiter: string, blocker: string): boolean {
+    const w = this.index.get(waiter);
+    const b = this.index.get(blocker);
+    return w !== undefined && b !== undefined && bit(this.rows[w], b);
+  }
+
+  /** `waiter` now waits for `blocker` directly: so whoever waits for `waiter` waits for `blocker`, and for everyone it waits for. */
+  add(waiter: string, blocker: string): void {
+    const w = this.index.get(waiter)!;
+    const b = this.index.get(blocker)!;
+    if (bit(this.rows[w], b)) return;
+    const beyond = this.rows[b];
+    for (let s = 0; s < this.rows.length; s++) {
+      const row = this.rows[s];
+      // Whoever already waits for the blocker already waits for everyone it waits for.
+      if ((s !== w && !bit(row, w)) || bit(row, b)) continue;
+      row[b >>> 5] |= 1 << (b & 31);
+      for (let k = 0; k < row.length; k++) row[k] |= beyond[k];
     }
   }
-  return found;
+}
+
+function bit(row: Uint32Array, i: number): boolean {
+  return (row[i >>> 5] & (1 << (i & 31))) !== 0;
 }
 
 /** Breadth-first from `start`: the shortest chain of waits that leads to `agent`, or null if none does. */

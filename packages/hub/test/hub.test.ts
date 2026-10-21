@@ -333,6 +333,27 @@ describe('leases', () => {
     expect(hub.heartbeat(P, A).renewed).toBe(0);
     expect(hub.getClaim(P, 'C-1').status).toBe('expired');
   });
+
+  it('renewing many leases on every request compiles no SQL once warmed up', () => {
+    const { hub, store } = setup();
+    for (let i = 0; i < 30; i++) hub.claim(P, A, { files: [`a${i}.ts`] });
+    for (let i = 0; i < 30; i++) hub.claim(P, B, { files: [`a${i}.ts`, `b${i}.ts`], queue: true });
+    const round = (i: number) => {
+      hub.claim(P, A, { files: [`new${i}.ts`], mode: 'auto' });
+      hub.claim(P, B, { files: [`a${i}.ts`], mode: 'auto' });
+      hub.claim(P, C, { files: [`a${i}.ts`, `c${i}.ts`], queue: true });
+      hub.heartbeat(P, B);
+      hub.release(P, A, { files: [`a${i}.ts`] });
+      hub.status(P, C);
+    };
+    round(0);
+    let prepared = 0;
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = ((text: string) => (prepared++, prepare(text))) as typeof store.db.prepare;
+    // Each request renews B's 30 queued leases; a statement prepared per update held native memory until GC.
+    for (let i = 1; i < 10; i++) round(i);
+    expect(prepared).toBe(0);
+  });
 });
 
 describe('queueing and release', () => {
@@ -592,6 +613,85 @@ describe('queueing and release', () => {
     reads = 0;
     expect(hub.release(P, 'holder3/a', { all: true }).promoted.map((c) => c.holder)).toEqual(['w0/a']);
     expect(reads).toBeLessThan(10);
+  });
+
+  it('an edit reads only the claims on its own files while nothing changed for the waiters, however long the queue is', () => {
+    const { hub, store } = setup();
+    const files = Array.from({ length: 10 }, (_, i) => `f${i}.ts`);
+    files.forEach((f, i) => hub.claim(P, `holder${i}/a`, { files: [f] }));
+    for (let i = 0; i < 300; i++) hub.claim(P, `w${i}/a`, { files: [files[i % 10], `g${i}.ts`], queue: true });
+    hub.claim(P, 'editor/a', { files: ['own.ts'] });
+    let rows = 0;
+    for (const m of ['listClaims', 'claimsForFiles'] as const) {
+      const real = store[m].bind(store) as (...args: unknown[]) => unknown[];
+      (store as unknown as Record<string, unknown>)[m] = (...args: unknown[]) => {
+        const out = real(...args);
+        rows += out.length;
+        return out;
+      };
+    }
+    // The first edit after a change may look at the whole queue once.
+    expect(hub.claim(P, 'editor/a', { files: ['f0.ts'], mode: 'auto' }).status).toBe('denied');
+    for (let i = 0; i < 20; i++) {
+      // Changes no waiter is affected by: files nobody waits for, a message.
+      expect(hub.claim(P, 'other/a', { files: [`fresh${i}.ts`], mode: 'auto' }).status).toBe('granted');
+      if (i > 0) hub.release(P, 'other/a', { files: [`fresh${i - 1}.ts`] });
+      hub.post(P, 'other/a', { to: '#general', body: `took fresh${i}.ts` });
+      rows = 0;
+      expect(hub.claim(P, 'editor/a', { files: [files[i % 10]], mode: 'auto' }).status).toBe('denied');
+      // The file's holder and its 30 waiters, and the editor's own claim: not the 300 waiters.
+      expect(rows).toBeLessThan(100);
+    }
+    // A change a waiter is affected by is seen at once: w0 waits for f0.ts and g0.ts.
+    expect(hub.release(P, 'holder0/a', { all: true }).promoted.map((c) => c.holder)).toEqual(['w0/a']);
+    expect(hub.claim(P, 'editor/a', { files: ['f0.ts'], mode: 'auto' })).toMatchObject({
+      status: 'denied',
+      conflicts: [expect.objectContaining({ holder: 'w0/a', status: 'active' }), ...Array(29).fill(expect.objectContaining({ status: 'queued' }))],
+    });
+  });
+
+  it('a second hub on the same database file sees waits the other one changed', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'agenthub-'));
+    try {
+      const clock = { t: Date.UTC(2026, 9, 20, 9, 0, 0) };
+      const open = () => {
+        const store = new SqliteStore(path.join(dir, 'hub.db'));
+        return { store, hub: new Hub({ store, now: () => clock.t, leaseTtlMs: 60_000 }) };
+      };
+      const one = open();
+      const two = open();
+      one.hub.claim(P, A, { files: ['e.ts'] });
+      one.hub.claim(P, C, { files: ['y.ts'] });
+      one.hub.claim(P, B, { files: ['x.ts', 'y.ts'], queue: true }); // B keeps the free x.ts while it waits for y.ts
+      expect(one.hub.claim(P, A, { files: ['x.ts'], mode: 'auto' }).status).toBe('denied');
+      // Through the other hub B comes to wait for A too, so B can't be granted before A lets go.
+      expect(two.hub.claim(P, B, { files: ['e.ts'], queue: true }).status).toBe('queued');
+      expect(one.hub.claim(P, A, { files: ['x.ts'], mode: 'auto' }).status).toBe('granted');
+      one.store.close();
+      two.store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a request that fails after expiring leases leaves nothing behind that later promotions trust', () => {
+    const { hub, advance } = setup({ leaseTtlMs: 60_000 });
+    hub.claim(P, A, { files: ['x.ts'] });
+    const b = hub.claim(P, B, { files: ['x.ts'], queue: true }).claim!;
+    advance(10_000);
+    hub.claim(P, C, { files: ['k.ts'] });
+    const d = hub.claim(P, 'dan/claude-1', { files: ['k.ts'], queue: true }).claim!;
+    advance(45_000);
+    hub.heartbeat(P, B);
+    hub.heartbeat(P, 'dan/claude-1');
+    advance(10_000); // A's lease is overdue, C's not yet
+    // This request expires A and promotes B, then fails, so all of that is rolled back.
+    expect(errorCode(() => hub.release(P, C, { claim_id: 'C-99' }))).toBe('not_found');
+    advance(10_000); // now C's lease is overdue too
+    expect(hub.listClaims(P).map((c) => [c.id, c.status])).toEqual([
+      [b.id, 'active'],
+      [d.id, 'active'],
+    ]);
   });
 
   it('random workloads never grant conflicting claims or leave a queue that can never move', () => {
