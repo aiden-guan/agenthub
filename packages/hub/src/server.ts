@@ -495,8 +495,8 @@ function safeDecode(s: string): string {
   }
 }
 
-function toApiError(err: unknown): { status: number; code: string; message: string } {
-  if (err instanceof HubError) return { status: err.status, code: err.code, message: err.message };
+function toApiError(err: unknown): { status: number; code: string; message: string; details?: Record<string, unknown> } {
+  if (err instanceof HubError) return { status: err.status, code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) };
   console.error('[hub] internal error:', err);
   return { status: 500, code: 'internal', message: 'internal error' };
 }
@@ -504,7 +504,7 @@ function toApiError(err: unknown): { status: number; code: string; message: stri
 function sendError(res: ServerResponse, err: unknown): void {
   const e = toApiError(err);
   if (res.headersSent) return void res.end();
-  sendJson(res, e.status, { error: { code: e.code, message: e.message } });
+  sendJson(res, e.status, { error: { code: e.code, message: e.message, ...(e.details ? { details: e.details } : {}) } });
 }
 
 function sendJson(res: ServerResponse, status: number, value: unknown): void {

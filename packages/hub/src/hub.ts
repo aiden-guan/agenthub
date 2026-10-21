@@ -1,7 +1,54 @@
+import { LANDER_LEASE_KEY, RESERVED_PREFIX } from '@agenthub/contract';
+import { HubError, NO_AUTH, capText, claimFiles, cleanText, idOf, normalizeRepoPath, toConflict, unique, type HubAuth, type HubInternals } from './common.js';
+import {
+  parseAdmit,
+  parseAdvance,
+  parseApprove,
+  parseCancel,
+  parseDays,
+  parseLease,
+  parsePause,
+  parseReject,
+  parseResolve,
+  parseResume,
+  parseTrunkReport,
+} from './landing-requests.js';
+import {
+  assertLander,
+  expireLandings,
+  isLeaseClaim,
+  landingDue,
+  onLeaseEnded,
+  pauseLander,
+  reportTrunk,
+  requireApprover,
+  requireLander,
+  resumeLander,
+} from './lander-control.js';
+import {
+  LIVE_LANDING_STATUSES,
+  admitLanding,
+  advanceLanding,
+  approveLanding,
+  cancelLanding,
+  landerInfo,
+  landingStats,
+  mustGetLanding,
+  nextLanding,
+  parseQueueRequest,
+  queueLanding,
+  queueView,
+  rejectLanding,
+  resolveLanding,
+  shownLanding,
+  taskLandingError,
+  withEstimates,
+  withoutSeq,
+  type Transition,
+} from './landings.js';
 import {
   AGENT_ID_RE,
   CHANNEL_RE,
-  PATH_FORBIDDEN_RE,
   PROJECT_RE,
   type AgentInfo,
   type CheckResult,
@@ -21,6 +68,24 @@ import {
   type Landing,
   type LandRequest,
   type LandResult,
+  type LanderControl,
+  type LanderInfo,
+  type LanderNextRequest,
+  type LanderNextResult,
+  type LanderPauseRequest,
+  type LanderResumeRequest,
+  type LandingAdmitRequest,
+  type LandingAdmitResult,
+  type LandingAdvanceRequest,
+  type LandingAdvanceResult,
+  type LandingResolveRequest,
+  type LandingStats,
+  type LandingStatus,
+  type ApproveRequest,
+  type CancelRequest,
+  type RejectRequest,
+  type TrunkReportRequest,
+  type LanderAuth,
   type Message,
   type ReleaseRequest,
   type ReleaseResult,
@@ -32,6 +97,8 @@ import {
 } from './protocol.js';
 import { phase1Landing } from './landing-row.js';
 import type { AgentTouch, Store } from './store.js';
+
+export { HubError, NO_AUTH, cleanText, normalizeRepoPath, type HubAuth } from './common.js';
 
 export interface HubOptions {
   store: Store;
@@ -46,17 +113,6 @@ export interface HubOptions {
 }
 
 export type LeaseSettings = Required<Pick<HubOptions, 'leaseTtlMs' | 'heartbeatIntervalMs' | 'presenceTtlMs'>>;
-
-export class HubError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-    readonly status = 400,
-  ) {
-    super(message);
-    this.name = 'HubError';
-  }
-}
 
 const MAX_FILES_PER_CLAIM = 200;
 const MAX_INTENT = 300;
@@ -83,6 +139,8 @@ const MAX_EVENTS_SCANNED = 5000;
 /** At most this many claims are named in a landing note. */
 const MAX_NOTE_CLAIMS = 10;
 
+const ALL_LANDING_STATUSES: readonly LandingStatus[] = ['recorded', 'submitted', 'queued', 'needs_approval', 'running', 'landed', 'failed', 'cancelled', 'superseded'];
+
 /**
  * The coordination core. Every state change goes through `write()`, which
  * runs synchronously inside one store transaction and is not re-entrant, so
@@ -105,6 +163,8 @@ export class Hub {
   private txNow = 0;
   /** Each project's last wait graph, with the event seq it was built at (see waitGraph). */
   private readonly waitGraphs = new Map<string, { seq: number; waits: Waits }>();
+  /** What landings.ts and holds.ts may use of this hub, inside write(). */
+  private readonly ix: HubInternals;
 
   constructor(opts: HubOptions) {
     this.store = opts.store;
@@ -115,6 +175,19 @@ export class Hub {
     this.presenceTtlMs = lease.presenceTtlMs;
     this.epoch = this.store.epoch();
     this.publishedSeq = this.store.lastSeq();
+    this.ix = {
+      store: this.store,
+      leaseTtlMs: this.leaseTtlMs,
+      heartbeatIntervalMs: this.heartbeatIntervalMs,
+      emit: (project, type, actor, data, targets) => this.emit(project, type, actor, data, targets),
+      endClaim: (project, c, status, reason, now) => this.endClaim(project, c, status, reason, now),
+      promoteQueued: (project, now) => this.promoteQueued(project, now),
+      breakWaitCycles: (project, agent, now, reason) => this.breakWaitCycles(project, agent, now, reason),
+      announceUnblocked: (project, doneId, actor) => this.announceUnblocked(project, doneId, actor),
+      touch: (project, agent, now) => this.touch(project, agent, now),
+      withBlocked: (project, task) => this.withBlocked(project, task),
+      assertUnblocked: (project, task, what) => this.assertUnblocked(project, task, what),
+    };
   }
 
   now(): number {
@@ -143,12 +216,22 @@ export class Hub {
 
   // ---------------------------------------------------------------- claims
 
-  claim(project: string, agent: string, req: ClaimRequest): ClaimResult {
+  /**
+   * `auth` matters only for the reserved key: a claim under RESERVED_PREFIX
+   * needs lander credentials and must be exactly [LANDER_LEASE_KEY],
+   * exclusive (403 forbidden otherwise). That claim is the lander lease.
+   */
+  claim(project: string, agent: string, req: ClaimRequest, auth: HubAuth = NO_AUTH): ClaimResult {
     assertAgent(agent);
     const scope = normalizeScope(req);
     const mode = req.mode ?? 'exclusive';
     if (mode !== 'exclusive' && mode !== 'shared' && mode !== 'auto') {
       throw new HubError('bad_request', 'mode must be exclusive, shared or auto');
+    }
+    if (scope.some((s) => s.file.startsWith(RESERVED_PREFIX))) {
+      if (!auth.lander) throw new HubError('forbidden', `${RESERVED_PREFIX} is reserved for the lander lease: only a lander, with lander credentials, may claim it`, 403);
+      const lease = scope.length === 1 && scope[0].file === LANDER_LEASE_KEY && scope[0].symbol === undefined && mode === 'exclusive';
+      if (!lease) throw new HubError('forbidden', `a lander claims exactly ${LANDER_LEASE_KEY}, exclusive, and nothing else in that claim`, 403);
     }
     const ttl = clampInt(req.ttl_ms, this.leaseTtlMs, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS, 'ttl_ms');
     // Heartbeats for a claim come before its lease runs out, by default three times per lease.
@@ -184,8 +267,9 @@ export class Hub {
 
       const conflicts = blockers.map((c) => toConflict(c, uncovered));
       // A holder in the way that waits, directly or not, for a claim this agent holds
-      // would wait forever, and so would this request. That can't be queued.
-      const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(c.holder, agent));
+      // would wait forever, and so would this request. That can't be queued. (A
+      // landing's hold waits for nobody: it ends when the landing does.)
+      const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(nodeOf(c), agent));
       const cycle = waitsForMe ? waitCycle(waits().held, agent, blockers) : null;
 
       if (conflicts.length > 0 && !req.queue) {
@@ -239,6 +323,8 @@ export class Hub {
             mode: effectiveMode,
             intent,
             waiting_for: unique(conflicts.map((c) => c.holder)),
+            landing_id: null,
+            scope: claimScope,
           });
           // Now that this agent waits for others, a claim queued before this one
           // may have to let a waiter go first, which may grant that waiter. (A
@@ -262,7 +348,16 @@ export class Hub {
 
       const claim = this.newClaim(project, agent, { taskId, scope: claimScope, mode: effectiveMode, intent, baseCommit, status: 'active', now, ttl, heartbeat });
       this.store.insertClaim(claim);
-      this.emit(project, 'claim.granted', agent, { claim_id: claim.id, holder: agent, files: uncovered, mode: effectiveMode, intent, task_id: taskId });
+      this.emit(project, 'claim.granted', agent, {
+        claim_id: claim.id,
+        holder: agent,
+        files: uncovered,
+        mode: effectiveMode,
+        intent,
+        task_id: taskId,
+        landing_id: null,
+        scope: claimScope,
+      });
       return {
         status: 'granted',
         claim,
@@ -283,10 +378,14 @@ export class Hub {
    * files they don't (`uncovered`) and, for those, the other agents' claims in
    * the way (`blockers`) and the mode a grant would have. `waitedFor`: the
    * agent holds a claim, active or queued, so others may wait for it.
+   *
+   * The agent's own landing holds are neither: a hold never covers a new
+   * request of its holder's (that gets its own lease, which outlives the
+   * landing), and it is no conflict for its holder.
    */
   private standing(project: string, agent: string, files: string[], mode: ClaimRequestMode, waitedFor: boolean) {
     const live = this.store.claimsForFiles(project, files, ['active']);
-    const mine = live.filter((c) => c.holder === agent);
+    const mine = live.filter((c) => c.holder === agent && c.landing_id === null);
     const others = live.filter((c) => c.holder !== agent);
     let graph: Waits | undefined;
     const waits = () => (graph ??= this.waitGraph(project));
@@ -305,7 +404,7 @@ export class Hub {
     // so this request goes ahead of it, queued or not (see waitGraph).
     const queuedOnFiles = this.store.claimsForFiles(project, uncovered, ['queued']);
     const theirs = queuedOnFiles.filter((q) => q.holder !== agent);
-    const waiters = theirs.filter((q) => !(waitedFor && waits().reach.has(q.holder, agent)));
+    const waiters = theirs.filter((q) => !(waitedFor && waits().reach.has(nodeOf(q), agent)));
     const blocking = [...others.filter((c) => uncovered.some((f) => hasFile(c, f))), ...waiters];
     const effectiveMode: ClaimMode =
       mode === 'auto' ? (blocking.length > 0 && blocking.every((c) => c.mode === 'shared') ? 'shared' : 'exclusive') : mode;
@@ -313,7 +412,11 @@ export class Hub {
     return { covering, uncovered, queuedOnFiles, waiters, blockers, effectiveMode, waits };
   }
 
-  /** `claim_id`, `task_id` and `files` each narrow what is released; `all` alone names every claim of the agent's. */
+  /**
+   * `claim_id`, `task_id` and `files` each narrow what is released; `all` alone
+   * names every claim of the agent's. Landing holds aren't the agent's to
+   * release: naming one is 409 held_by_landing, and the others skip them.
+   */
   release(project: string, agent: string, req: ReleaseRequest): ReleaseResult {
     assertAgent(agent);
     if (req.files != null && !Array.isArray(req.files)) throw new HubError('bad_request', 'files must be a list of repo paths');
@@ -330,9 +433,16 @@ export class Hub {
         const c = this.store.getClaim(project, claimId);
         if (!c) throw new HubError('not_found', `no claim ${claimId}`, 404);
         if (c.holder !== agent) throw new HubError('forbidden', `${c.id} is held by ${c.holder}; only its holder can release it`, 403);
+        if (c.landing_id !== null && c.status === 'active') {
+          throw new HubError(
+            'held_by_landing',
+            `${c.id} holds your change while ${c.landing_id} lands, so it can't be released; it is released when ${c.landing_id} lands, and yours again if it comes back. Cancel ${c.landing_id} to get the files back now.`,
+            409,
+          );
+        }
         targets = (c.status === 'active' || c.status === 'queued') && (!taskId || c.task_id === taskId) ? [c] : [];
       } else {
-        targets = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: taskId });
+        targets = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: taskId, landing_id: null });
       }
       if (files) targets = targets.filter((c) => c.scope.some((s) => files.includes(s.file)));
 
@@ -341,10 +451,11 @@ export class Hub {
       for (const c of targets) {
         const remaining = files ? c.scope.filter((s) => !files.includes(s.file)) : [];
         if (remaining.length > 0) {
-          const removed = unique(c.scope.filter((s) => files!.includes(s.file)).map((s) => s.file));
+          const removedEntries = c.scope.filter((s) => files!.includes(s.file));
+          const removed = unique(removedEntries.map((s) => s.file));
           this.store.updateClaim(project, c.id, { scope: remaining });
           trimmed.push({ ...c, scope: remaining });
-          this.emit(project, 'claim.released', agent, { claim_id: c.id, holder: c.holder, files: removed, partial: true });
+          this.emit(project, 'claim.released', agent, { claim_id: c.id, holder: c.holder, files: removed, partial: true, landing_id: c.landing_id, scope: removedEntries });
         } else {
           released.push(this.endClaim(project, c, 'released', 'released by holder', now));
         }
@@ -372,7 +483,9 @@ export class Hub {
 
   /**
    * Without `mode`: active exclusive claims by anyone other than `agent` on
-   * these files (for the pre-commit guard). With it: for each file, what a
+   * these files (for the pre-commit guard), and other agents' landing holds,
+   * shared or not, since a commit to a file being landed would go around the
+   * landing. With it: for each file, what a
    * claim request of `agent`'s for that file alone in `mode`, with queue
    * false, would be denied for right now, so a wait for the files (hub_wait)
    * ends exactly when the edit hook's request would be granted. Changes nothing.
@@ -386,7 +499,7 @@ export class Hub {
     return this.read(project, (now) => {
       if (mode === undefined) {
         const live = this.store.claimsForFiles(project, norm, ['active']);
-        const conflicts = live.filter((c) => c.holder !== agent && c.mode === 'exclusive').map((c) => toConflict(c, norm));
+        const conflicts = live.filter((c) => c.holder !== agent && (c.mode === 'exclusive' || c.landing_id !== null)).map((c) => toConflict(c, norm));
         return { conflicts, now, seq: this.store.latestSeq(project) };
       }
       const me = agent ?? '';
@@ -403,7 +516,7 @@ export class Hub {
             seen.scope = c.scope.filter((s) => seen.files.includes(s.file));
           } else byClaim.set(c.id, toConflict(c, uncovered));
         }
-        const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(c.holder, me));
+        const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(nodeOf(c), me));
         deadlock ??= blockers.length ? denialDeadlock(waits, me, blockers, waitsForMe, waitsForMe ? waitCycle(waits().held, me, blockers) : null) : null;
       }
       return { conflicts: [...byClaim.values()], ...(deadlock ? { deadlock } : {}), now, seq: this.store.latestSeq(project) };
@@ -430,7 +543,7 @@ export class Hub {
 
   /** Expire every lease whose heartbeat stopped, across all projects. Returns the projects touched. */
   sweep(): string[] {
-    const projects = this.store.projectsWithDueClaims(this.clock());
+    const projects = this.store.projectsWithDueWork(this.clock());
     for (const project of projects) this.write(project, () => undefined);
     return projects;
   }
@@ -460,6 +573,7 @@ export class Hub {
     return this.write(project, (now) => {
       const task = this.store.getTask(project, id);
       if (!task) throw new HubError('not_found', `no task ${id}`, 404);
+      if (task.status === 'landing') throw taskLandingError(this.store, project, task);
       if (task.owner === agent && task.status === 'in_progress') return this.withBlocked(project, task);
       if (task.status === 'done' || task.status === 'cancelled') throw new HubError('task_closed', `${id} is already ${task.status}`, 409);
       if (task.status === 'in_progress' && task.owner) throw new HubError('task_taken', `${id} is already taken by ${task.owner}`, 409);
@@ -478,6 +592,8 @@ export class Hub {
     return this.write(project, (now) => {
       const task = this.store.getTask(project, id);
       if (!task) throw new HubError('not_found', `no task ${id}`, 404);
+      // A live landing carries it: it is done when that lands, back in progress when it doesn't.
+      if (task.status === 'landing') throw taskLandingError(this.store, project, task);
       if (task.owner && task.owner !== agent) throw new HubError('forbidden', `${id} is owned by ${task.owner}`, 403);
       if (status === 'done' && task.status !== 'done') this.assertCompletable(project, task);
       const owner = status === 'open' ? null : task.owner;
@@ -559,19 +675,32 @@ export class Hub {
   // --------------------------------------------------------------- landing
 
   /**
-   * Phase 1 stub: records the request, marks the task done and releases its
-   * claims, and those tied to no task once no other task of the agent's is in
-   * progress. With no task, it releases all of the agent's claims.
+   * With `queue: true`, queues the commit for the lander (see queueLanding in
+   * landings.ts). Without it, Phase 1's record mode: records the request,
+   * marks the task done and releases its claims, and those tied to no task
+   * once no other task of the agent's is in progress (with no task, all of the
+   * agent's claims; landing holds never). Record mode is refused (409
+   * landing_queue_active) once the project has ever had a lander lease claim,
+   * so an old adapter can't mark tasks done around the queue.
    */
   land(project: string, agent: string, req: LandRequest): LandResult {
     assertAgent(agent);
+    if (req.queue !== undefined && req.queue !== null && typeof req.queue !== 'boolean') throw new HubError('bad_request', 'queue must be true or false');
+    if (req.queue) {
+      const queued = parseQueueRequest(req);
+      return this.write(project, (now) => queueLanding(this.ix, project, agent, queued, now), { durable: true });
+    }
     const requestedTask = idOf(req.task_id, 'task_id');
     return this.write(project, (now) => {
+      if (this.store.claimsForFiles(project, [LANDER_LEASE_KEY], ['active', 'queued', 'released', 'expired']).length > 0) {
+        throw new HubError('landing_queue_active', 'This project lands through the queue; update the hub CLI (hub land), which queues your commit for the lander.', 409);
+      }
       let task: Task | null = null;
       let unblocked: string[] = [];
       if (requestedTask) {
         const t = this.store.getTask(project, requestedTask);
         if (!t) throw new HubError('not_found', `no task ${requestedTask}`, 404);
+        if (t.status === 'landing') throw taskLandingError(this.store, project, t);
         if (t.owner && t.owner !== agent) throw new HubError('forbidden', `${t.id} is owned by ${t.owner}`, 403);
         const owner = t.owner ?? agent;
         if (t.status !== 'done') {
@@ -606,12 +735,12 @@ export class Hub {
       const released: Claim[] = [];
       if (req.release_claims !== false) {
         const mine = this.store
-          .listClaims(project, { statuses: ['active', 'queued'], holder: agent })
+          .listClaims(project, { statuses: ['active', 'queued'], holder: agent, landing_id: null })
           .filter((c) => !task || c.task_id === task.id || (c.task_id === null && inProgress.length === 0));
         for (const c of mine) released.push(this.endClaim(project, c, 'released', `landed ${landing.id}`, now));
         if (released.length) this.promoteQueued(project, now);
       }
-      const held = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent });
+      const held = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, landing_id: null });
       return {
         landing,
         task,
@@ -628,6 +757,135 @@ export class Hub {
         seq: this.store.latestSeq(project),
       };
     });
+  }
+
+  // ------------------------------------------------------- lander protocol
+  // Lander writes (design §1.4, §1.5) are durable, need lander credentials
+  // (403 forbidden) and are fenced by the lease after the expiry pre-step (409
+  // not_lander). Approver writes need an approver (403 not_approver).
+
+  /** POST /lander/next (T4): an in-doubt or this lease's running landing first, else the next queued one starts. */
+  nextLanding(project: string, agent: string, req: LanderNextRequest, auth: HubAuth = NO_AUTH): LanderNextResult {
+    assertAgent(agent);
+    requireLander(auth);
+    const lease = parseLease(req?.lease);
+    return this.landerWrite(project, agent, lease, (now, claim) => {
+      const next = nextLanding(this.ix, project, agent, claim, now);
+      return {
+        landing: next.landing && shownLanding(this.store, project, next.landing, now),
+        resolve: next.resolve,
+        control: this.store.getLanderControl(project),
+        now,
+        seq: this.store.latestSeq(project),
+      };
+    });
+  }
+
+  /** POST /landings/:id/admit (T2, T3). */
+  admitLanding(project: string, agent: string, id: string, req: LandingAdmitRequest, auth: HubAuth = NO_AUTH): LandingAdmitResult {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parseAdmit(req);
+    return this.landerWrite(project, agent, input.lease, (now) => {
+      const r = admitLanding(this.ix, project, agent, id, input, now);
+      return { landing: shownLanding(this.store, project, r.landing, now), conflicts: r.conflicts, now, seq: this.store.latestSeq(project) };
+    });
+  }
+
+  /** POST /landings/:id/advance (T3, T5, T6, T9, T11, T13), attempt-fenced, with replay detection. */
+  advanceLanding(project: string, agent: string, id: string, req: LandingAdvanceRequest, auth: HubAuth = NO_AUTH): LandingAdvanceResult {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parseAdvance(req);
+    return this.landerWrite(project, agent, input.lease, (now, claim) => this.advanced(project, advanceLanding(this.ix, project, agent, id, input, claim, now), now));
+  }
+
+  /** POST /landings/:id/resolve (T11, T12): an in-doubt or this lease's landing in pushing, after the remote was inspected. */
+  resolveLanding(project: string, agent: string, id: string, req: LandingResolveRequest, auth: HubAuth = NO_AUTH): LandingAdvanceResult {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parseResolve(req);
+    return this.landerWrite(project, agent, input.lease, (now, claim) => this.advanced(project, resolveLanding(this.ix, project, agent, id, input, claim, now), now));
+  }
+
+  /** POST /lander/trunk: policy, trunk tip, reconcile (T16), foreign commits, rewrite pause. */
+  reportTrunk(project: string, agent: string, req: TrunkReportRequest, auth: HubAuth = NO_AUTH): { control: LanderControl } {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parseTrunkReport(req);
+    return this.landerWrite(project, agent, input.lease, (now) => ({ control: reportTrunk(this.ix, project, agent, input, now) }));
+  }
+
+  /** POST /lander/pause. */
+  pauseLander(project: string, agent: string, req: LanderPauseRequest, auth: HubAuth = NO_AUTH): { control: LanderControl } {
+    assertAgent(agent);
+    requireLander(auth);
+    const input = parsePause(req);
+    return this.landerWrite(project, agent, input.lease, (now) => ({ control: pauseLander(this.ix, project, agent, input, now) }));
+  }
+
+  /** POST /lander/resume (approver). */
+  resumeLander(project: string, req: LanderResumeRequest, auth: HubAuth = NO_AUTH): { control: LanderControl } {
+    const approver = requireApprover(auth);
+    const input = parseResume(req);
+    return this.write(project, (now) => ({ control: resumeLander(this.ix, project, approver, input, now) }), { durable: true });
+  }
+
+  /** POST /landings/:id/approve (T7). */
+  approveLanding(project: string, id: string, req: ApproveRequest, auth: HubAuth = NO_AUTH): { landing: Landing } {
+    const approver = requireApprover(auth);
+    const input = parseApprove(req);
+    return this.write(project, (now) => ({ landing: shownLanding(this.store, project, approveLanding(this.ix, project, id, input, approver, now), now) }), { durable: true });
+  }
+
+  /** POST /landings/:id/reject (T8). */
+  rejectLanding(project: string, id: string, req: RejectRequest, auth: HubAuth = NO_AUTH): { landing: Landing } {
+    const approver = requireApprover(auth);
+    const input = parseReject(req);
+    return this.write(project, (now) => ({ landing: shownLanding(this.store, project, rejectLanding(this.ix, project, id, input, approver, now), now) }), { durable: true });
+  }
+
+  /** POST /landings/:id/cancel (T14): its author (`agent`) or an approver. */
+  cancelLanding(project: string, agent: string | null, id: string, req: CancelRequest = {}, auth: HubAuth = NO_AUTH): { landing: Landing } {
+    if (agent !== null) assertAgent(agent);
+    const approver = auth.approver === null ? null : requireApprover(auth);
+    parseCancel(req);
+    return this.write(project, (now) => ({ landing: shownLanding(this.store, project, cancelLanding(this.ix, project, id, agent, approver, now), now) }), { durable: true });
+  }
+
+  /** GET /lander: the lease and the control. */
+  landerStatus(project: string): { lease: LanderInfo | null; control: LanderControl } {
+    return this.read(project, () => ({ lease: landerInfo(this.store, project), control: this.store.getLanderControl(project) }));
+  }
+
+  /** GET /landings: live landings first, in queue order, then the most recent; at most `limit` (default 50). */
+  listLandings(project: string, filter: { statuses?: LandingStatus[]; agent?: string; task_id?: string; limit?: number } = {}): Landing[] {
+    const limit = clampInt(filter.limit, 50, 1, 500, 'limit');
+    const statuses = filter.statuses ?? ALL_LANDING_STATUSES;
+    if (!Array.isArray(statuses) || statuses.some((st) => !ALL_LANDING_STATUSES.includes(st))) {
+      throw new HubError('bad_request', `status must be among ${ALL_LANDING_STATUSES.join(', ')}`);
+    }
+    const agent = filter.agent || undefined;
+    const taskId = filter.task_id || undefined;
+    return this.read(project, (now) => {
+      const view = queueView(this.store, project, now);
+      const live = statuses.filter((st) => LIVE_LANDING_STATUSES.includes(st));
+      const rest = statuses.filter((st) => !LIVE_LANDING_STATUSES.includes(st));
+      const first = live.length > 0 ? this.store.listLandings(project, { statuses: live, agent, task_id: taskId, order: 'queue', limit }) : [];
+      const then = rest.length > 0 && first.length < limit ? this.store.listLandings(project, { statuses: rest, agent, task_id: taskId, order: 'recent', limit: limit - first.length }) : [];
+      return [...first, ...then].map((l) => withEstimates(view, withoutSeq(l)));
+    });
+  }
+
+  /** GET /landings/:id. */
+  getLanding(project: string, id: string): Landing {
+    return this.read(project, (now) => shownLanding(this.store, project, mustGetLanding(this.store, project, id), now));
+  }
+
+  /** GET /landings/stats?days=7. */
+  landingStats(project: string, days?: number | string): LandingStats {
+    const window = parseDays(days);
+    return this.read(project, (now) => landingStats(this.store, project, window, now));
   }
 
   // ------------------------------------------------------- status & events
@@ -657,14 +915,10 @@ export class Hub {
         tasks,
         unread: agent ? this.store.countMessagesFor(project, agent, this.store.getInboxCursor(project, agent)) : 0,
         decisions: this.store.listDecisions(project, 10),
-        landings: this.store.listLandings(project, 5),
-        queue: [],
-        lander: null,
-        control: {
-          paused: null,
-          trunk: null,
-          policy: { keep_place_retries: 2, sendback_grace_min: 30, approval_timeout_hours: 24, claim_gate: 'fail' },
-        },
+        landings: this.store.listLandings(project, { order: 'recent', limit: 5 }),
+        queue: this.queue(project, now),
+        lander: landerInfo(this.store, project),
+        control: this.store.getLanderControl(project),
       };
     });
   }
@@ -716,25 +970,45 @@ export class Hub {
 
   // -------------------------------------------------------------- internals
 
+  /** A lander write: durable, with the lease fenced after the expiry pre-step (409 not_lander). */
+  private landerWrite<T>(project: string, agent: string, lease: LanderAuth, fn: (now: number, lease: Claim) => T): T {
+    return this.write(project, (now) => fn(now, assertLander(this.store, project, agent, lease, now)), { durable: true });
+  }
+
+  private advanced(project: string, t: Transition, now: number): LandingAdvanceResult {
+    return { landing: shownLanding(this.store, project, t.landing, now), released: t.released, unblocked: t.unblocked, replayed: t.replayed, now, seq: this.store.latestSeq(project) };
+  }
+
+  /** Live landings in queue order, with positions and ETAs. */
+  private queue(project: string, now: number): Landing[] {
+    const view = queueView(this.store, project, now);
+    return this.store.listLandings(project, { statuses: [...LIVE_LANDING_STATUSES], order: 'queue' }).map((l) => withEstimates(view, withoutSeq(l)));
+  }
+
   /**
    * The single serialized write path. Runs `fn` synchronously in one store
    * transaction after expiring overdue leases; refuses re-entry; publishes the
-   * events `fn` emitted only once the transaction has committed.
+   * events `fn` emitted only once the transaction has committed. `durable`
+   * (landing and control writes) commits so it survives a power loss too.
    */
-  private write<T>(project: string, fn: (now: number) => T): T {
+  private write<T>(project: string, fn: (now: number) => T, opts: { durable?: boolean } = {}): T {
     assertProject(project);
     if (this.pending) throw new Error('Hub.write is not re-entrant');
     const pending: HubEvent[] = [];
     this.pending = pending;
     let result: T;
     try {
-      result = this.store.transaction(() => {
-        const now = this.clock();
-        this.txNow = now;
-        this.store.ensureProject(project, now);
-        this.expireDue(project, now);
-        return fn(now);
-      });
+      result = this.store.transaction(
+        () => {
+          const now = this.clock();
+          this.txNow = now;
+          this.store.ensureProject(project, now);
+          this.expireDue(project, now);
+          expireLandings(this.ix, project, now);
+          return fn(now);
+        },
+        { durable: opts.durable === true },
+      );
     } catch (err) {
       // A wait graph built in a transaction that rolled back describes claims that
       // never were, at an event seq that the next commit reuses.
@@ -776,14 +1050,19 @@ export class Hub {
     }
   }
 
-  /** Reads go through `write` only when a lease is overdue, so they never see a dead claim. */
+  /**
+   * Reads go through `write` only when a lease or a landing deadline is
+   * overdue, so they never see a dead claim or a landing the hub should have
+   * moved on.
+   */
   private read<T>(project: string, fn: (now: number) => T): T {
     assertProject(project);
     if (this.pending) return fn(this.txNow);
     const now = this.clock();
-    if (this.store.listClaims(project, { statuses: ['active', 'queued'], expiresAtOrBefore: now }).length > 0) {
-      this.write(project, () => undefined);
-    }
+    const due =
+      this.store.listClaims(project, { statuses: ['active', 'queued'], expiresAtOrBefore: now }).length > 0 ||
+      this.store.listLandings(project, { statuses: ['running', 'needs_approval'], order: 'queue' }).some((l) => landingDue(l, now));
+    if (due) this.write(project, () => undefined);
     return fn(this.clock());
   }
 
@@ -802,13 +1081,20 @@ export class Hub {
     }
   }
 
-  /** Push out the expiry of the agent's active and queued claims (all, or just `claimIds`). */
+  /**
+   * Push out the expiry of the agent's active and queued claims (all, or just
+   * `claimIds`) to a lease TTL from now, never pulling one in. That changes
+   * nothing for a landing hold (whose expiry is HOLD_EXPIRES) or a lease in its
+   * send-back grace, which stay in the list, so heartbeats count them as renewed.
+   */
   private renewLeases(project: string, agent: string, now: number, claimIds?: string[]): Claim[] {
     let claims = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent });
     if (claimIds?.length) claims = claims.filter((c) => claimIds.includes(c.id));
     for (const c of claims) {
-      c.expires_at = now + c.ttl_ms;
-      this.store.updateClaim(project, c.id, { expires_at: c.expires_at });
+      const expires = Math.max(c.expires_at, now + c.ttl_ms);
+      if (expires === c.expires_at) continue;
+      c.expires_at = expires;
+      this.store.updateClaim(project, c.id, { expires_at: expires });
     }
     return claims;
   }
@@ -816,10 +1102,20 @@ export class Hub {
   private expireDue(project: string, now: number): void {
     const due = this.store.listClaims(project, { statuses: ['active', 'queued'], expiresAtOrBefore: now });
     if (due.length === 0) return;
-    for (const c of due) this.endClaim(project, c, 'expired', 'lease expired: heartbeats stopped', now);
+    for (const { id } of due) {
+      // As it is now: a lander lease that ends can fail its landing, whose effects end or extend other claims.
+      const c = this.store.getClaim(project, id);
+      if (!c || (c.status !== 'active' && c.status !== 'queued') || c.expires_at > now) continue;
+      this.endClaim(project, c, 'expired', 'lease expired: heartbeats stopped', now);
+    }
     this.promoteQueued(project, now);
   }
 
+  /**
+   * The single place a claim ends: release, expiry, land, holds. A lander
+   * lease that ends takes its running landing with it (onLeaseEnded: requeued,
+   * or in doubt when it was pushing), in the same transaction.
+   */
   private endClaim(project: string, c: Claim, status: 'released' | 'expired', reason: string, now: number): Claim {
     this.store.updateClaim(project, c.id, { status, ended_at: now, end_reason: reason });
     this.emit(project, status === 'expired' ? 'claim.expired' : 'claim.released', status === 'expired' ? null : c.holder, {
@@ -828,8 +1124,12 @@ export class Hub {
       files: claimFiles(c),
       was: c.status,
       reason,
+      landing_id: c.landing_id,
+      scope: c.scope,
     });
-    return { ...c, status, ended_at: now, end_reason: reason };
+    const ended = { ...c, status, ended_at: now, end_reason: reason };
+    if (c.status === 'active' && isLeaseClaim(c)) onLeaseEnded(this.ix, project, ended, now);
+    return ended;
   }
 
   /**
@@ -854,12 +1154,37 @@ export class Hub {
           mode: q.mode,
           intent: q.intent,
           task_id: q.task_id,
+          landing_id: q.landing_id,
+          scope: q.scope,
           from_queue: true,
         });
         // As stored: a graph from an earlier request can predate the waiter's last heartbeat.
         promoted.push(this.store.getClaim(project, q.id)!);
       }
     }
+  }
+
+  /**
+   * Ends `agent`'s queued claims that wait, directly or through others, for
+   * `agent` itself, then promotes what that frees. claim() never queues such a
+   * claim. But a landing's hold is a node that waits for nobody, so the agent
+   * may queue for a file held by someone who waits for the hold; when the
+   * landing comes back and the hold is the agent's lease again, the two would
+   * wait for each other until one lets go. Ending the agent's claim keeps the
+   * graph acyclic; asked again, it is refused with the deadlock explained.
+   */
+  private breakWaitCycles(project: string, agent: string, now: number, reason: string): Claim[] {
+    const ended: Claim[] = [];
+    for (;;) {
+      const waits = this.waitGraph(project);
+      if (!waits.reach.has(agent, agent)) break;
+      // The cycle leaves the agent through one of its waits in `all` (the others are implied by those).
+      const closing = [...(waits.all.get(agent)?.entries() ?? [])].find(([node]) => node === agent || waits.reach.has(node, agent))?.[1].waiter;
+      if (!closing || closing.holder !== agent || closing.status !== 'queued') break;
+      ended.push(this.endClaim(project, closing, 'released', reason, now));
+    }
+    if (ended.length > 0) this.promoteQueued(project, now);
+    return ended;
   }
 
   /**
@@ -960,7 +1285,7 @@ export class Hub {
   }
 
   /** A task with a dependency that isn't done can be neither taken nor completed. */
-  private assertUnblocked(project: string, task: Pick<Task, 'id' | 'deps'>, what: 'taken' | 'completed'): void {
+  private assertUnblocked(project: string, task: Pick<Task, 'id' | 'deps'>, what: 'taken' | 'completed' | 'landed'): void {
     const blockedBy = this.blockedBy(project, task);
     if (blockedBy.length === 0) return;
     const detail = blockedBy.map((d) => `${d} (${this.store.getTask(project, d)?.status ?? 'missing'})`).join(', ');
@@ -1007,45 +1332,6 @@ export function assertProject(project: unknown): asserts project is string {
   }
 }
 
-const MAX_PATH = 4096;
-
-/**
- * The claim key for a repo-relative POSIX path: the NFC form of the path as
- * sent, nothing else changed, so every client names a file the same way.
- * Refuses PATH_FORBIDDEN_RE characters, absolute paths (`/x`, or a Windows
- * drive root like `C:/x`) and `.`, `..` or empty segments. `a:b.md` and
- * `..env` are legal.
- */
-export function normalizeRepoPath(input: unknown): string {
-  if (typeof input !== 'string') throw new HubError('invalid_path', 'file paths must be strings');
-  const p = input.normalize('NFC');
-  const bad = PATH_FORBIDDEN_RE.exec(p);
-  if (bad) throw invalidPath(p, `contains ${codePoint(bad[0])}; control, line-separator and bidi characters and unpaired surrogates are not allowed`);
-  if (p.length > MAX_PATH) throw invalidPath(p, `is longer than ${MAX_PATH} characters`);
-  if (p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)) throw invalidPath(p, 'is absolute; use a path relative to the repository root');
-  if (p.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) {
-    throw invalidPath(p, 'has a ".", ".." or empty segment');
-  }
-  return p;
-}
-
-function invalidPath(p: string, reason: string): HubError {
-  return new HubError('invalid_path', `invalid path ${escapePath(p)}: ${reason}`);
-}
-
-/** JSON-quote a path for a message with every invisible or line-breaking character escaped; long paths are cut short. */
-function escapePath(p: string): string {
-  const shown = p.length > 200 ? `${p.slice(0, 200)}…` : p;
-  return JSON.stringify(shown).replace(/[\u007F-\u009F\p{Cf}\p{Zl}\p{Zp}]/gu, (ch) => {
-    const cp = ch.codePointAt(0)!;
-    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`;
-  });
-}
-
-function codePoint(ch: string): string {
-  return `U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}`;
-}
-
 function normalizeScope(req: ClaimRequest): ScopeEntry[] {
   const raw: ScopeEntry[] = [...(req.scope ?? []), ...(req.files ?? []).map((file) => ({ file }))];
   if (raw.length === 0) throw new HubError('bad_request', 'a claim needs at least one file');
@@ -1064,23 +1350,6 @@ function normalizeScope(req: ClaimRequest): ScopeEntry[] {
     throw new HubError('bad_request', `a claim may cover at most ${MAX_FILES_PER_CLAIM} files`);
   }
   return out;
-}
-
-/** Strip control and bidi-override characters, collapse whitespace unless multiline, cap length. */
-export function cleanText(value: unknown, max: number, multiline = false): string {
-  if (value === undefined || value === null) return '';
-  if (typeof value !== 'string') throw new HubError('bad_request', 'expected a string');
-  let s = value.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000B-\u001F\u007F​-‏‪-‮⁦-⁩]/g, '');
-  s = multiline ? s.replace(/\n{3,}/g, '\n\n') : s.replace(/\s+/g, ' ');
-  return capText(s.trim(), max);
-}
-
-/** `s`, cut to at most `max` characters with a trailing ellipsis, never between the halves of a surrogate pair. */
-function capText(s: string, max: number): string {
-  if (s.length <= max) return s;
-  let end = max - 1;
-  if (/[\uD800-\uDBFF]/.test(s[end - 1] ?? '')) end--;
-  return `${s.slice(0, end)}…`;
 }
 
 /**
@@ -1105,18 +1374,6 @@ export function leaseSettings(opts: Partial<LeaseSettings>, names: Partial<Recor
   return { leaseTtlMs, heartbeatIntervalMs, presenceTtlMs };
 }
 
-/**
- * A task or claim id from a request body: a string, or a number taken as its
- * digits; missing or empty means none. Anything else is refused with 400, not
- * handed to the store (which would fail with a 500).
- */
-function idOf(value: unknown, name: 'task_id' | 'claim_id'): string | undefined {
-  if (value === undefined || value === null || value === '') return undefined;
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  throw new HubError('bad_request', `${name} must be an id such as ${name === 'task_id' ? 'T-3' : 'C-3'}`);
-}
-
 /** A list of claim ids from a request body (see idOf). */
 function idList(value: unknown, name: string): string[] {
   const ids = Array.isArray(value) ? value.map((v) => (typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v)) ? String(v) : null)) : null;
@@ -1129,14 +1386,6 @@ function clampInt(value: unknown, fallback: number, min: number, max: number, na
   const n = Number(value);
   if (!Number.isFinite(n)) throw new HubError('bad_request', `${name} must be a number`);
   return Math.min(max, Math.max(min, Math.round(n)));
-}
-
-function unique<T>(xs: T[]): T[] {
-  return [...new Set(xs)];
-}
-
-function claimFiles(c: Claim): string[] {
-  return unique(c.scope.map((s) => s.file));
 }
 
 function hasFile(c: Claim, file: string): boolean {
@@ -1179,7 +1428,7 @@ function inLine(line: Map<string, number[]>, files: string[]): number[] {
 
 /** `waiter` (a queued claim, or null for the request being decided) waits for `blocker`. */
 type Wait = { waiter: Claim | null; blocker: Claim };
-/** For each agent, one wait for each agent its queued claims wait for. */
+/** For each agent, one wait for each node (an agent, or a landing for its holds: see nodeOf) its queued claims wait for. */
 type WaitGraph = Map<string, Map<string, Wait>>;
 
 interface Waits {
@@ -1199,11 +1448,21 @@ interface Waits {
   reach: Reach;
 }
 
+/**
+ * A claim's node in the wait graph: its holder, except for a landing hold,
+ * whose node is `landing:<id>`. A landing waits for nobody, so a wait for a
+ * hold never closes a cycle: an agent that waits for a file while its own
+ * landing holds another one is no deadlock for those who wait for the landing.
+ */
+function nodeOf(c: Claim): string {
+  return c.landing_id === null ? c.holder : `landing:${c.landing_id}`;
+}
+
 /** See Hub.waitGraph: `queue` in queue order, `files` the files it names, `active` the active claims on them. */
 function buildWaits(queue: Claim[], files: Set<string>, active: Claim[]): Waits {
-  const reach = new Reach([...queue, ...active].map((c) => c.holder));
+  const reach = new Reach([...queue, ...active].map(nodeOf));
   const waits: Waits = { queue, ids: new Set(queue.map((q) => q.id)), files, blocked: new Set(), held: new Map(), all: new Map(), reach };
-  const who = queue.map((q) => reach.at(q.holder));
+  const who = queue.map((q) => reach.at(nodeOf(q)));
   // A wait the others already imply (its agent waits for that one through someone
   // else) changes nothing about who waits for whom, so `all` and `reach` skip it:
   // a line of n waiters for one file then takes about n links, not n²/2.
@@ -1218,7 +1477,7 @@ function buildWaits(queue: Claim[], files: Set<string>, active: Claim[]): Waits 
       if (!clash(a, q)) continue;
       waits.blocked.add(q.id);
       link(waits.held, q, a);
-      held.push({ waiter: q, w: who[i], blocker: a, b: reach.at(a.holder) });
+      held.push({ waiter: q, w: who[i], blocker: a, b: reach.at(nodeOf(a)) });
     }
   });
   // Agents that wait for nobody first, then those that wait only for them, and so
@@ -1289,11 +1548,13 @@ function sinksFirst(held: HeldWait[], agents: number): { ordered: HeldWait[]; ac
   return { ordered, acyclic };
 }
 
-/** Record that `waiter`'s agent waits for `blocker`'s; false if `graph` already had them waiting directly. */
+/** Record that `waiter`'s node waits for `blocker`'s (see nodeOf); false if `graph` already had them waiting directly. */
 function link(graph: WaitGraph, waiter: Claim, blocker: Claim): boolean {
-  const out = graph.get(waiter.holder) ?? graph.set(waiter.holder, new Map()).get(waiter.holder)!;
-  if (out.has(blocker.holder)) return false;
-  out.set(blocker.holder, { waiter, blocker });
+  const from = nodeOf(waiter);
+  const to = nodeOf(blocker);
+  const out = graph.get(from) ?? graph.set(from, new Map()).get(from)!;
+  if (out.has(to)) return false;
+  out.set(to, { waiter, blocker });
   return true;
 }
 
@@ -1373,9 +1634,10 @@ function waitChain(graph: WaitGraph, start: Wait[], agent: string): Wait[] | nul
   const reachedBy = new Map<string, Wait>();
   const todo: string[] = [];
   const visit = (w: Wait) => {
-    if (reachedBy.has(w.blocker.holder)) return;
-    reachedBy.set(w.blocker.holder, w);
-    todo.push(w.blocker.holder);
+    const node = nodeOf(w.blocker);
+    if (reachedBy.has(node)) return;
+    reachedBy.set(node, w);
+    todo.push(node);
   };
   start.forEach(visit);
   for (let next = todo.shift(); next !== undefined; next = todo.shift()) {
@@ -1384,7 +1646,7 @@ function waitChain(graph: WaitGraph, start: Wait[], agent: string): Wait[] | nul
       continue;
     }
     const chain = [reachedBy.get(agent)!];
-    while (!start.includes(chain[0])) chain.unshift(reachedBy.get(chain[0].waiter!.holder)!);
+    while (!start.includes(chain[0])) chain.unshift(reachedBy.get(nodeOf(chain[0].waiter!))!);
     return chain;
   }
   return null;
@@ -1472,19 +1734,4 @@ function capped(items: string[], max: number): string[] {
 
 function andList(items: string[]): string {
   return items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
-}
-
-function toConflict(c: Claim, files: string[]): ClaimConflict {
-  return {
-    claim_id: c.id,
-    holder: c.holder,
-    mode: c.mode,
-    status: c.status,
-    intent: c.intent,
-    task_id: c.task_id,
-    files: claimFiles(c).filter((f) => files.includes(f)),
-    expires_at: c.expires_at,
-    scope: c.scope.filter((s) => files.includes(s.file)),
-    landing_id: null,
-  };
 }
