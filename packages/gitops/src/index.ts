@@ -1,36 +1,47 @@
-// Step 0 stub: every function throws until lane L implements @agenthub/gitops
-// here (design §6.5 L1). The interface is frozen in ./types.ts.
+// @agenthub/gitops: git plumbing for the lander and the adapter (design §6.5
+// L1). The interface is frozen in ./types.ts; everything here runs real git
+// through node:child_process, with no npm dependencies.
 
+import { approvalDigest } from './digest.js';
+import { commitTree, forecastConflicts, mergeTrees, spliceTree } from './merge.js';
+import { lsRemote, pushRef, pushTrunk } from './push.js';
+import { blobId, diffNames, features, isAncestor, mergeBase, revParse, showBlob } from './queries.js';
+import { replay, stashCreate } from './replay.js';
+import { open } from './run.js';
+import { findLandingCommit, landedBase, sanitizeMessageText, trunkTrailers } from './trailers.js';
 import type { GitOps } from './types.js';
 
 export type * from './types.js';
+export type { MergeMessage, MergeTreesResult, ParsedMergeTree } from './merge.js';
+export { GitError } from './run.js';
+export { classifyPush, porcelainLines } from './push.js';
+export { conflictedNames, conflictsOf, parseMergeTree, spliceOids } from './merge.js';
+export { TRAILER_KEYS } from './trailers.js';
 
-function notImplemented(): never {
-  throw new Error('not implemented');
-}
-
-export const open: GitOps['open'] = notImplemented;
-export const features: GitOps['features'] = notImplemented;
-export const revParse: GitOps['revParse'] = notImplemented;
-export const isAncestor: GitOps['isAncestor'] = notImplemented;
-export const mergeBase: GitOps['mergeBase'] = notImplemented;
-export const diffNames: GitOps['diffNames'] = notImplemented;
-export const showBlob: GitOps['showBlob'] = notImplemented;
-export const blobId: GitOps['blobId'] = notImplemented;
-export const mergeTrees: GitOps['mergeTrees'] = notImplemented;
-export const spliceTree: GitOps['spliceTree'] = notImplemented;
-export const commitTree: GitOps['commitTree'] = notImplemented;
-export const landedBase: GitOps['landedBase'] = notImplemented;
-export const trunkTrailers: GitOps['trunkTrailers'] = notImplemented;
-export const findLandingCommit: GitOps['findLandingCommit'] = notImplemented;
-export const sanitizeMessageText: GitOps['sanitizeMessageText'] = notImplemented;
-export const replay: GitOps['replay'] = notImplemented;
-export const forecastConflicts: GitOps['forecastConflicts'] = notImplemented;
-export const stashCreate: GitOps['stashCreate'] = notImplemented;
-export const pushTrunk: GitOps['pushTrunk'] = notImplemented;
-export const pushRef: GitOps['pushRef'] = notImplemented;
-export const lsRemote: GitOps['lsRemote'] = notImplemented;
-export const approvalDigest: GitOps['approvalDigest'] = notImplemented;
+export {
+  open,
+  features,
+  revParse,
+  isAncestor,
+  mergeBase,
+  diffNames,
+  showBlob,
+  blobId,
+  mergeTrees,
+  spliceTree,
+  commitTree,
+  landedBase,
+  trunkTrailers,
+  findLandingCommit,
+  sanitizeMessageText,
+  replay,
+  forecastConflicts,
+  stashCreate,
+  pushTrunk,
+  pushRef,
+  lsRemote,
+  approvalDigest,
+};
 
 export const gitops: GitOps = {
   open,
