@@ -1,0 +1,111 @@
+{
+  "landing": {
+    "project": "acme/web",
+    "branch": "maya/login-opts",
+    "commit": "3f2a9c1e5b7d4a6c8e0f1a2b3c4d5e6f7a8b9c0d",
+    "summary": "login() takes an options object; the remember flag becomes opts.sessionDays, stored by the new migration.",
+    "queue_seq": 5,
+    "position": null,
+    "eta_ms": 250000,
+    "phase": "merging",
+    "phase_at": 1792572840000,
+    "attempt": 1,
+    "lander": "lander/build1-48213-9f3c",
+    "lease_claim_id": "C-12",
+    "in_doubt": false,
+    "deadline_at": 1792573440000,
+    "base_sha": "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807",
+    "first_base": null,
+    "trunk_base": null,
+    "candidate": null,
+    "candidate_ref": null,
+    "candidate_checked": false,
+    "trunk_sha": null,
+    "files": [
+      "migrations/0042_login_options.sql",
+      "src/auth.ts",
+      "src/routes.ts"
+    ],
+    "scope": [
+      {
+        "file": "migrations/0042_login_options.sql"
+      },
+      {
+        "file": "src/auth.ts",
+        "symbol": "login"
+      },
+      {
+        "file": "src/routes.ts",
+        "symbol": "handleLogin"
+      }
+    ],
+    "mapper": "sym1;vtsw0.3.1;wts0.27.0;4be1c2d9",
+    "protected": [
+      "migrations/0042_login_options.sql"
+    ],
+    "approval": [
+      {
+        "kind": "protected",
+        "digest": "2c0c16c3025564058c6cb19167011763864f3056d6066b8cec2ee067e161f00e",
+        "paths": [
+          "migrations/0042_login_options.sql"
+        ],
+        "rules": [
+          {
+            "paths": [
+              "migrations/**"
+            ],
+            "approvers": null,
+            "distinct": true
+          }
+        ],
+        "candidate": null,
+        "candidate_ref": null,
+        "trunk_base": null
+      }
+    ],
+    "approvals": [],
+    "hold_ids": [
+      "C-37"
+    ],
+    "report": null,
+    "failure": null,
+    "retries": {
+      "trunk_moved": 0,
+      "lander_lost": 0,
+      "step_timeout": 0
+    },
+    "retry_of": "L-6",
+    "retry": 1,
+    "supersedes": null,
+    "superseded_by": null,
+    "waits_for": null,
+    "landed_with": null,
+    "reconciled": false,
+    "started_at": 1792572840000,
+    "ended_at": null,
+    "id": "L-7",
+    "agent": "maya/claude-1",
+    "task_id": "T-3",
+    "status": "running",
+    "created_at": 1792572600000,
+    "updated_at": 1792572840000
+  },
+  "resolve": false,
+  "control": {
+    "paused": null,
+    "trunk": {
+      "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      "landing_id": "L-5",
+      "at": 1792570320000
+    },
+    "policy": {
+      "keep_place_retries": 2,
+      "sendback_grace_min": 30,
+      "approval_timeout_hours": 24,
+      "claim_gate": "fail"
+    }
+  },
+  "now": 1792572840000,
+  "seq": 421
+}

@@ -30,6 +30,7 @@ import {
   type TaskCreateRequest,
   type TaskStatus,
 } from './protocol.js';
+import { phase1Landing } from './landing-row.js';
 import type { AgentTouch, Store } from './store.js';
 
 export interface HubOptions {
@@ -578,7 +579,7 @@ export class Hub {
         }
         task = this.withBlocked(project, { ...t, status: 'done', owner, updated_at: now });
       }
-      const landing: Landing = {
+      const landing: Landing = phase1Landing({
         id: `L-${this.store.nextCounter(project, 'landing')}`,
         project,
         agent,
@@ -588,7 +589,7 @@ export class Hub {
         summary: cleanText(req.summary, MAX_LONG_TEXT, true),
         status: 'recorded',
         created_at: now,
-      };
+      });
       this.store.insertLanding(landing);
       this.emit(project, 'land.requested', agent, { landing_id: landing.id, agent, task_id: landing.task_id, branch: landing.branch, commit: landing.commit });
 
@@ -608,7 +609,21 @@ export class Hub {
         if (released.length) this.promoteQueued(project, now);
       }
       const held = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent });
-      return { landing, task, released, unblocked, note: landNote(task, released, held, inProgress), now, seq: this.store.latestSeq(project) };
+      return {
+        landing,
+        task,
+        released,
+        unblocked,
+        held: [],
+        superseded: [],
+        replayed: false,
+        position: null,
+        eta_ms: null,
+        lander: null,
+        note: landNote(task, released, held, inProgress),
+        now,
+        seq: this.store.latestSeq(project),
+      };
     });
   }
 
@@ -640,6 +655,13 @@ export class Hub {
         unread: agent ? this.store.countMessagesFor(project, agent, this.store.getInboxCursor(project, agent)) : 0,
         decisions: this.store.listDecisions(project, 10),
         landings: this.store.listLandings(project, 5),
+        queue: [],
+        lander: null,
+        control: {
+          paused: null,
+          trunk: null,
+          policy: { keep_place_retries: 2, sendback_grace_min: 30, approval_timeout_hours: 24, claim_gate: 'fail' },
+        },
       };
     });
   }
@@ -908,6 +930,8 @@ export class Hub {
       heartbeat_interval_ms: o.heartbeat,
       ended_at: null,
       end_reason: null,
+      landing_id: null,
+      mapper: null,
     };
   }
 
@@ -1457,5 +1481,7 @@ function toConflict(c: Claim, files: string[]): ClaimConflict {
     task_id: c.task_id,
     files: claimFiles(c).filter((f) => files.includes(f)),
     expires_at: c.expires_at,
+    scope: c.scope.filter((s) => files.includes(s.file)),
+    landing_id: null,
   };
 }

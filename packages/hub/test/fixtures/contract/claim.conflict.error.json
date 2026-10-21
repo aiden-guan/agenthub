@@ -1,0 +1,29 @@
+{
+  "error": {
+    "code": "claim_conflict",
+    "message": "Your change touches code another agent holds: src/auth.ts#login is being landed by L-7 (maya/claude-1, position 1).",
+    "details": {
+      "conflicts": [
+        {
+          "claim_id": "C-37",
+          "holder": "maya/claude-1",
+          "mode": "exclusive",
+          "status": "active",
+          "intent": "landing L-7: Let login take an options object",
+          "task_id": "T-3",
+          "files": [
+            "src/auth.ts"
+          ],
+          "expires_at": 8640000000000000,
+          "scope": [
+            {
+              "file": "src/auth.ts",
+              "symbol": "login"
+            }
+          ],
+          "landing_id": "L-7"
+        }
+      ]
+    }
+  }
+}

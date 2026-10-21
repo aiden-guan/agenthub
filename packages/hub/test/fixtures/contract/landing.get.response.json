@@ -1,0 +1,162 @@
+{
+  "landing": {
+    "project": "acme/web",
+    "branch": "maya/login-opts",
+    "commit": "b5e1d2c3a4f5061728394a5b6c7d8e9f00112233",
+    "summary": "login() takes an options object; the remember flag becomes opts.sessionDays.",
+    "queue_seq": 5,
+    "position": null,
+    "eta_ms": null,
+    "phase": null,
+    "phase_at": 1792571140000,
+    "attempt": 1,
+    "lander": "lander/build1-48213-9f3c",
+    "lease_claim_id": "C-12",
+    "in_doubt": false,
+    "deadline_at": null,
+    "base_sha": "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807",
+    "first_base": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+    "trunk_base": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+    "candidate": "6a5b4c3d2e1f00ff11ee22dd33cc44bb55aa6677",
+    "candidate_ref": "refs/agenthub/cand/1b4e28ba/L-6/6a5b4c3d2e1f",
+    "candidate_checked": false,
+    "trunk_sha": null,
+    "files": [
+      "src/auth.ts",
+      "src/routes.ts"
+    ],
+    "scope": [
+      {
+        "file": "src/auth.ts",
+        "symbol": "login"
+      },
+      {
+        "file": "src/routes.ts",
+        "symbol": "handleLogin"
+      }
+    ],
+    "mapper": "sym1;vtsw0.3.1;wts0.27.0;4be1c2d9",
+    "protected": [],
+    "approval": [],
+    "approvals": [],
+    "hold_ids": [],
+    "report": {
+      "message": "L-6 was sent back. src/auth.ts conflicted with L-5 (sam/claude-1, T-2). The AI resolver merged the conflict in login, but the checks failed on the result, so nothing reached main.",
+      "resolved_by": "ai",
+      "files_via": [
+        {
+          "file": "src/auth.ts",
+          "via": "ai"
+        },
+        {
+          "file": "src/routes.ts",
+          "via": "clean"
+        }
+      ],
+      "conflicts": [
+        {
+          "file": "src/auth.ts",
+          "kind": "content",
+          "hunks": [
+            {
+              "start_line": 14,
+              "end_line": 31,
+              "symbols": [
+                "login"
+              ],
+              "base": "export async function login(user: string, password: string, remember: boolean): Promise<Session> {\n  const ok = await verify(user, password);\n",
+              "trunk": "export async function login(user: string, password: string, remember: boolean): Promise<Session> {\n  if (await isLocked(user)) throw new LockedError(user);\n  const ok = await verify(user, password);\n",
+              "yours": "export async function login(user: string, password: string, opts: LoginOptions = {}): Promise<Session> {\n  const ok = await verify(user, password);\n"
+            }
+          ],
+          "trunk_changes": [
+            {
+              "commit": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+              "landing_id": "L-5",
+              "agent": "sam/claude-1",
+              "task_id": "T-2",
+              "summary": "Rate-limit login attempts per user",
+              "decisions": [
+                {
+                  "id": "D-7",
+                  "summary": "Lock an account for 15 minutes after 5 failed logins"
+                }
+              ]
+            }
+          ],
+          "tried": [
+            "clean",
+            "structural",
+            "ai"
+          ],
+          "ai_eligible": true,
+          "explanation": null
+        }
+      ],
+      "check": {
+        "command_hash": "fc21ee81dccb",
+        "exit_code": 1,
+        "signal": null,
+        "timed_out": false,
+        "duration_ms": 198004,
+        "log_tail": " FAIL  test/auth.test.ts > login > locks the account after 5 failures\nAssertionError: expected 200 to be 423\n FAIL  test/auth.test.ts > login > keeps the session length option\n Test Files  1 failed | 11 passed (12)\n      Tests  2 failed | 314 passed (316)\n",
+        "failed_tests": [
+          "test/auth.test.ts > login > locks the account after 5 failures",
+          "test/auth.test.ts > login > keeps the session length option"
+        ],
+        "passes_on_trunk": true,
+        "reproduce": "git fetch origin refs/agenthub/cand/1b4e28ba/L-6/6a5b4c3d2e1f && git worktree add --detach ../web-L-6 FETCH_HEAD && cd ../web-L-6 && CI=1 sh -c 'npm ci && npm test'"
+      },
+      "resolver": {
+        "model": "claude-opus-5-5",
+        "outcome": "resolved",
+        "files": [
+          "src/auth.ts"
+        ],
+        "novel_lines": 2,
+        "input_tokens": 6120,
+        "output_tokens": 840,
+        "explanations": {
+          "src/auth.ts": "Kept the lock check from main and the options parameter from the incoming change."
+        }
+      },
+      "next_steps": [
+        "Run `hub sync` (or the hub_sync tool) to bring main into your worktree.",
+        "Reproduce the failure: git fetch origin refs/agenthub/cand/1b4e28ba/L-6/6a5b4c3d2e1f && git worktree add --detach ../web-L-6 FETCH_HEAD && cd ../web-L-6 && CI=1 sh -c 'npm ci && npm test'",
+        "Fix test/auth.test.ts > login, commit, and call land again: the re-land keeps its place in the queue."
+      ],
+      "warnings": [],
+      "foreign_commits": [],
+      "timings": {
+        "queued_ms": 41000,
+        "merge_ms": 63500,
+        "check_ms": 198004,
+        "push_ms": 0
+      }
+    },
+    "failure": {
+      "code": "resolver_failed",
+      "summary": "The checks failed on the AI-resolved merge of src/auth.ts."
+    },
+    "retries": {
+      "trunk_moved": 0,
+      "lander_lost": 0,
+      "step_timeout": 0
+    },
+    "retry_of": null,
+    "retry": 0,
+    "supersedes": null,
+    "superseded_by": null,
+    "waits_for": null,
+    "landed_with": "L-7",
+    "reconciled": false,
+    "started_at": 1792570841000,
+    "ended_at": 1792571340000,
+    "id": "L-6",
+    "agent": "maya/claude-1",
+    "task_id": "T-3",
+    "status": "failed",
+    "created_at": 1792570800000,
+    "updated_at": 1792571340000
+  }
+}

@@ -27,6 +27,7 @@
     "start": "node dist/cli.js"
   },
   "dependencies": {
+    "@agenthub/contract": "0.1.0",
     "better-sqlite3": "^13.0.3",
     "ws": "^8.22.0"
   },

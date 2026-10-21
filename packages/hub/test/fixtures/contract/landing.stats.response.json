@@ -1,0 +1,19 @@
+{
+  "days": 7,
+  "landed": 23,
+  "median_to_trunk_ms": 612000,
+  "p90_to_trunk_ms": 1490000,
+  "first_try_rate": 0.74,
+  "sendbacks": {
+    "conflict": 3,
+    "checks_failed": 4,
+    "resolver_failed": 1
+  },
+  "median_check_ms": 241000,
+  "median_queue_wait_ms": 95000,
+  "resolved_by": {
+    "clean": 18,
+    "structural": 3,
+    "ai": 2
+  }
+}

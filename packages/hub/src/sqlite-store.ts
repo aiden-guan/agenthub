@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
+import { phase1Landing, type Phase1LandingRow } from './landing-row.js';
 import { PATH_FORBIDDEN_RE, type Claim, type ClaimStatus, type Decision, type HubEvent, type Landing, type Message, type Task } from './protocol.js';
 import type { AgentRow, AgentTouch, ClaimFilter, ClaimPatch, Store } from './store.js';
 
@@ -192,6 +193,8 @@ function toClaim(r: ClaimRowDb): Claim {
     heartbeat_interval_ms: r.heartbeat_interval_ms,
     ended_at: r.ended_at,
     end_reason: r.end_reason,
+    landing_id: null,
+    mapper: null,
   };
 }
 
@@ -575,14 +578,25 @@ export class SqliteStore implements Store {
         `INSERT INTO landings (project, id, agent, task_id, branch, commit_sha, summary, status, created_at, seq)
          VALUES (@project, @id, @agent, @task_id, @branch, @commit, @summary, @status, @created_at, @seq)`,
       )
-      .run({ ...l, seq });
+      .run({
+        project: l.project,
+        id: l.id,
+        agent: l.agent,
+        task_id: l.task_id,
+        branch: l.branch,
+        commit: l.commit,
+        summary: l.summary,
+        status: l.status,
+        created_at: l.created_at,
+        seq,
+      });
   }
 
   listLandings(project: string, limit: number): Landing[] {
     const rows = this.statements.prepare('SELECT * FROM landings WHERE project = ? ORDER BY seq DESC LIMIT ?').all(project, limit) as Array<
-      Omit<Landing, 'commit'> & { commit_sha: string | null }
+      Omit<Phase1LandingRow, 'commit'> & { commit_sha: string | null }
     >;
-    return rows.map(({ commit_sha, ...rest }) => ({ ...rest, commit: commit_sha }));
+    return rows.map(({ commit_sha, ...rest }) => phase1Landing({ ...rest, commit: commit_sha }));
   }
 
   appendEvent(e: Omit<HubEvent, 'seq'>): number {

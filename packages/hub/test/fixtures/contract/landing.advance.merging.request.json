@@ -1,0 +1,11 @@
+{
+  "lease": {
+    "lease_claim_id": "C-12",
+    "epoch": "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+  },
+  "attempt": 1,
+  "to": "running",
+  "phase": "merging",
+  "deadline_ms": 600000,
+  "trunk_base": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+}

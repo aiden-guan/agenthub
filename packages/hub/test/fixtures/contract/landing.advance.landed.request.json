@@ -1,0 +1,68 @@
+{
+  "lease": {
+    "lease_claim_id": "C-12",
+    "epoch": "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+  },
+  "attempt": 1,
+  "to": "landed",
+  "trunk_sha": "5d4c3b2a1908f7e6d5c4b3a2918f7e6d5c4b3a29",
+  "base_sha": "9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807",
+  "files": [
+    "migrations/0042_login_options.sql",
+    "src/auth.ts",
+    "src/routes.ts"
+  ],
+  "report": {
+    "message": "L-7 landed on main as 5d4c3b2a1908. It merged cleanly onto 1a2b3c4d5e6f and passed the checks.",
+    "resolved_by": "clean",
+    "files_via": [
+      {
+        "file": "migrations/0042_login_options.sql",
+        "via": "clean"
+      },
+      {
+        "file": "src/auth.ts",
+        "via": "clean"
+      },
+      {
+        "file": "src/routes.ts",
+        "via": "clean"
+      }
+    ],
+    "conflicts": [],
+    "check": {
+      "command_hash": "fc21ee81dccb",
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "duration_ms": 241337,
+      "log_tail": " Test Files  12 passed (12)\n      Tests  318 passed (318)\n   Duration  3m 58s\n",
+      "failed_tests": [],
+      "passes_on_trunk": true,
+      "reproduce": "git fetch origin refs/agenthub/cand/1b4e28ba/L-7/5d4c3b2a1908 && git worktree add --detach ../web-L-7 FETCH_HEAD && cd ../web-L-7 && CI=1 sh -c 'npm ci && npm test'"
+    },
+    "resolver": null,
+    "next_steps": [],
+    "warnings": [],
+    "foreign_commits": [],
+    "timings": {
+      "queued_ms": 240000,
+      "merge_ms": 2100,
+      "check_ms": 241337,
+      "push_ms": 1850
+    }
+  },
+  "also_landed": [
+    "L-6"
+  ],
+  "symbol_changes": [
+    {
+      "file": "src/auth.ts",
+      "symbol": "login",
+      "kind": "signature",
+      "before": "login(user: string, password: string, remember: boolean): Promise<Session>",
+      "after": "login(user: string, password: string, opts?: LoginOptions): Promise<Session>",
+      "task_id": "T-3"
+    }
+  ]
+}

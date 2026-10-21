@@ -1,0 +1,5 @@
+{
+  "kind": "protected",
+  "digest": "2c0c16c3025564058c6cb19167011763864f3056d6066b8cec2ee067e161f00e",
+  "note": "Additive column with a default; safe to run before the deploy."
+}

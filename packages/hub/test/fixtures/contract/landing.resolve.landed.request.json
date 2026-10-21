@@ -1,0 +1,18 @@
+{
+  "lease": {
+    "lease_claim_id": "C-13",
+    "epoch": "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+  },
+  "outcome": "landed",
+  "trunk_sha": "5d4c3b2a1908f7e6d5c4b3a2918f7e6d5c4b3a29",
+  "symbol_changes": [
+    {
+      "file": "src/auth.ts",
+      "symbol": "login",
+      "kind": "signature",
+      "before": "login(user: string, password: string, remember: boolean): Promise<Session>",
+      "after": "login(user: string, password: string, opts?: LoginOptions): Promise<Session>",
+      "task_id": "T-3"
+    }
+  ]
+}

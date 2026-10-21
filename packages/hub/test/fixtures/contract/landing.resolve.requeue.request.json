@@ -1,0 +1,8 @@
+{
+  "lease": {
+    "lease_claim_id": "C-13",
+    "epoch": "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+  },
+  "outcome": "requeue",
+  "trunk_sha": "8c7b6a5948372615f4e3d2c1b0a9988776655443"
+}

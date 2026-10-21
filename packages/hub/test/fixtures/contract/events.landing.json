@@ -1,0 +1,391 @@
+{
+  "events": [
+    {
+      "seq": 413,
+      "project": "acme/web",
+      "type": "claim.released",
+      "actor": "maya/claude-1",
+      "at": 1792572600000,
+      "data": {
+        "claim_id": "C-31",
+        "holder": "maya/claude-1",
+        "files": [
+          "src/auth.ts",
+          "src/routes.ts"
+        ],
+        "was": "active",
+        "reason": "moved to landing L-7",
+        "landing_id": null,
+        "scope": [
+          {
+            "file": "src/auth.ts",
+            "symbol": "login"
+          },
+          {
+            "file": "src/routes.ts",
+            "symbol": "handleLogin"
+          }
+        ]
+      },
+      "targets": null
+    },
+    {
+      "seq": 414,
+      "project": "acme/web",
+      "type": "claim.granted",
+      "actor": "maya/claude-1",
+      "at": 1792572600000,
+      "data": {
+        "claim_id": "C-37",
+        "holder": "maya/claude-1",
+        "files": [
+          "migrations/0042_login_options.sql",
+          "src/auth.ts",
+          "src/routes.ts"
+        ],
+        "mode": "exclusive",
+        "intent": "landing L-7: Let login take an options object",
+        "task_id": "T-3",
+        "landing_id": "L-7",
+        "scope": [
+          {
+            "file": "migrations/0042_login_options.sql"
+          },
+          {
+            "file": "src/auth.ts",
+            "symbol": "login"
+          },
+          {
+            "file": "src/routes.ts",
+            "symbol": "handleLogin"
+          }
+        ]
+      },
+      "targets": null
+    },
+    {
+      "seq": 415,
+      "project": "acme/web",
+      "type": "task.updated",
+      "actor": "maya/claude-1",
+      "at": 1792572600000,
+      "data": {
+        "task_id": "T-3",
+        "status": "landing",
+        "previous": "in_progress"
+      },
+      "targets": null
+    },
+    {
+      "seq": 416,
+      "project": "acme/web",
+      "type": "landing.created",
+      "actor": "maya/claude-1",
+      "at": 1792572600000,
+      "data": {
+        "landing_id": "L-7",
+        "agent": "maya/claude-1",
+        "task_id": "T-3",
+        "commit": "3f2a9c1e5b7d4a6c8e0f1a2b3c4d5e6f7a8b9c0d",
+        "position": null,
+        "supersedes": null,
+        "retry_of": "L-6"
+      },
+      "targets": null
+    },
+    {
+      "seq": 417,
+      "project": "acme/web",
+      "type": "landing.updated",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792572604000,
+      "data": {
+        "landing_id": "L-7",
+        "agent": "maya/claude-1",
+        "task_id": "T-3",
+        "status": "queued",
+        "phase": null,
+        "attempt": 0,
+        "reason": "admitted",
+        "position": 1
+      },
+      "targets": null
+    },
+    {
+      "seq": 418,
+      "project": "acme/web",
+      "type": "landing.needs_approval",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792572604000,
+      "data": {
+        "landing_id": "L-7",
+        "agent": "maya/claude-1",
+        "task_id": "T-3",
+        "kinds": [
+          "protected"
+        ],
+        "paths": [
+          "migrations/0042_login_options.sql"
+        ],
+        "approvers": null,
+        "parked": false
+      },
+      "targets": null
+    },
+    {
+      "seq": 419,
+      "project": "acme/web",
+      "type": "landing.updated",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792572840000,
+      "data": {
+        "landing_id": "L-7",
+        "agent": "maya/claude-1",
+        "task_id": "T-3",
+        "status": "running",
+        "phase": "merging",
+        "attempt": 1,
+        "reason": "picked",
+        "position": null
+      },
+      "targets": null
+    },
+    {
+      "seq": 420,
+      "project": "acme/web",
+      "type": "landing.updated",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792572842000,
+      "data": {
+        "landing_id": "L-7",
+        "agent": "maya/claude-1",
+        "task_id": "T-3",
+        "status": "running",
+        "phase": "checking",
+        "attempt": 1,
+        "reason": "phase",
+        "position": null
+      },
+      "targets": null
+    },
+    {
+      "seq": 421,
+      "project": "acme/web",
+      "type": "landing.updated",
+      "actor": "sam",
+      "at": 1792572960000,
+      "data": {
+        "landing_id": "L-7",
+        "agent": "maya/claude-1",
+        "task_id": "T-3",
+        "status": "running",
+        "phase": "checking",
+        "attempt": 1,
+        "reason": "approved",
+        "position": null
+      },
+      "targets": null
+    },
+    {
+      "seq": 422,
+      "project": "acme/web",
+      "type": "landing.updated",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792573100000,
+      "data": {
+        "landing_id": "L-7",
+        "agent": "maya/claude-1",
+        "task_id": "T-3",
+        "status": "running",
+        "phase": "pushing",
+        "attempt": 1,
+        "reason": "phase",
+        "position": null
+      },
+      "targets": null
+    },
+    {
+      "seq": 423,
+      "project": "acme/web",
+      "type": "claim.released",
+      "actor": "maya/claude-1",
+      "at": 1792573103000,
+      "data": {
+        "claim_id": "C-37",
+        "holder": "maya/claude-1",
+        "files": [
+          "migrations/0042_login_options.sql",
+          "src/auth.ts",
+          "src/routes.ts"
+        ],
+        "was": "active",
+        "reason": "landed L-7",
+        "landing_id": "L-7",
+        "scope": [
+          {
+            "file": "migrations/0042_login_options.sql"
+          },
+          {
+            "file": "src/auth.ts",
+            "symbol": "login"
+          },
+          {
+            "file": "src/routes.ts",
+            "symbol": "handleLogin"
+          }
+        ]
+      },
+      "targets": null
+    },
+    {
+      "seq": 424,
+      "project": "acme/web",
+      "type": "task.updated",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792573103000,
+      "data": {
+        "task_id": "T-3",
+        "status": "done",
+        "previous": "landing"
+      },
+      "targets": null
+    },
+    {
+      "seq": 425,
+      "project": "acme/web",
+      "type": "task.unblocked",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792573103000,
+      "data": {
+        "task_id": "T-4",
+        "title": "Use the login options in the mobile client",
+        "after": "T-3"
+      },
+      "targets": null
+    },
+    {
+      "seq": 426,
+      "project": "acme/web",
+      "type": "landing.landed",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792573103000,
+      "data": {
+        "landing_id": "L-7",
+        "agent": "maya/claude-1",
+        "task_id": "T-3",
+        "trunk_sha": "5d4c3b2a1908f7e6d5c4b3a2918f7e6d5c4b3a29",
+        "files": [
+          "migrations/0042_login_options.sql",
+          "src/auth.ts",
+          "src/routes.ts"
+        ],
+        "resolved_by": "clean",
+        "also_landed": [
+          "L-6"
+        ],
+        "reconciled": false
+      },
+      "targets": null
+    },
+    {
+      "seq": 427,
+      "project": "acme/web",
+      "type": "trunk.moved",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792573103000,
+      "data": {
+        "from": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+        "to": "5d4c3b2a1908f7e6d5c4b3a2918f7e6d5c4b3a29",
+        "landing_id": "L-7",
+        "files": [
+          "migrations/0042_login_options.sql",
+          "src/auth.ts",
+          "src/routes.ts"
+        ],
+        "foreign": false
+      },
+      "targets": null
+    },
+    {
+      "seq": 428,
+      "project": "acme/web",
+      "type": "symbol.changed",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792573103000,
+      "data": {
+        "change_id": "S-4",
+        "agent": "maya/claude-1",
+        "file": "src/auth.ts",
+        "symbol": "login",
+        "name": "login",
+        "kind": "signature",
+        "status": "landed",
+        "landing_id": "L-7",
+        "task_id": "T-3"
+      },
+      "targets": null
+    },
+    {
+      "seq": 429,
+      "project": "acme/web",
+      "type": "trunk.moved",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792573150000,
+      "data": {
+        "from": "5d4c3b2a1908f7e6d5c4b3a2918f7e6d5c4b3a29",
+        "to": "8c7b6a5948372615f4e3d2c1b0a9988776655443",
+        "landing_id": null,
+        "files": [
+          "README.md"
+        ],
+        "foreign": true
+      },
+      "targets": null
+    },
+    {
+      "seq": 430,
+      "project": "acme/web",
+      "type": "lander.paused",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792573150000,
+      "data": {
+        "reason": "external_push",
+        "by": "lander/build1-48213-9f3c"
+      },
+      "targets": null
+    },
+    {
+      "seq": 431,
+      "project": "acme/web",
+      "type": "lander.resumed",
+      "actor": "maya",
+      "at": 1792573180000,
+      "data": {
+        "reason": "human",
+        "by": "maya"
+      },
+      "targets": null
+    },
+    {
+      "seq": 432,
+      "project": "acme/web",
+      "type": "landing.failed",
+      "actor": "lander/build1-48213-9f3c",
+      "at": 1792573198000,
+      "data": {
+        "landing_id": "L-8",
+        "agent": "sam/claude-1",
+        "task_id": "T-6",
+        "code": "conflict",
+        "files": [
+          "src/routes.ts",
+          "src/session.ts"
+        ]
+      },
+      "targets": null
+    }
+  ],
+  "seq": 432,
+  "next_since": 432,
+  "epoch": "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@agenthub/symbols",
+  "version": "0.1.0",
+  "description": "Tree-sitter outlines, symbol diffs and references for agenthub's function-level claims and impact warnings.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "grammars.manifest.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@agenthub/contract": "0.1.0",
+    "@vscode/tree-sitter-wasm": "0.3.1",
+    "web-tree-sitter": "0.27.0"
+  }
+}

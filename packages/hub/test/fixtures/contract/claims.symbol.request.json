@@ -1,0 +1,14 @@
+{
+  "scope": [
+    {
+      "file": "src/auth.ts",
+      "symbol": "login"
+    }
+  ],
+  "mode": "auto",
+  "intent": "Let login take an options object",
+  "task_id": "T-3",
+  "base_commit": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+  "queue": false,
+  "mapper": "sym1;vtsw0.3.1;wts0.27.0;4be1c2d9"
+}

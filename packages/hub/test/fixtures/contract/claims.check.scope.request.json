@@ -1,0 +1,13 @@
+{
+  "scope": [
+    {
+      "file": "src/auth.ts",
+      "symbol": "login"
+    },
+    {
+      "file": "src/routes.ts",
+      "symbol": "handleLogin"
+    }
+  ],
+  "mapper": "sym1;vtsw0.3.1;wts0.27.0;4be1c2d9"
+}

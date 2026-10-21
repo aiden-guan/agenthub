@@ -1,0 +1,90 @@
+{
+  "lease": {
+    "lease_claim_id": "C-12",
+    "epoch": "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+  },
+  "attempt": 1,
+  "to": "needs_approval",
+  "required": [
+    {
+      "kind": "protected",
+      "digest": "2c0c16c3025564058c6cb19167011763864f3056d6066b8cec2ee067e161f00e",
+      "paths": [
+        "migrations/0042_login_options.sql"
+      ],
+      "rules": [
+        {
+          "paths": [
+            "migrations/**"
+          ],
+          "approvers": null,
+          "distinct": true
+        }
+      ],
+      "candidate": null,
+      "candidate_ref": null,
+      "trunk_base": null
+    },
+    {
+      "kind": "merged",
+      "digest": "b861e270aed730262fe852e0c524fccd9f882d71214df576be9d94f3cc76f2a3",
+      "paths": [
+        "migrations/0042_login_options.sql"
+      ],
+      "rules": [
+        {
+          "paths": [
+            "migrations/**"
+          ],
+          "approvers": null,
+          "distinct": true
+        }
+      ],
+      "candidate": "5d4c3b2a1908f7e6d5c4b3a2918f7e6d5c4b3a29",
+      "candidate_ref": "refs/agenthub/cand/1b4e28ba/L-7/5d4c3b2a1908",
+      "trunk_base": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+    }
+  ],
+  "report": {
+    "message": "L-7 passed its checks on the candidate. It waits for an approval of migrations/0042_login_options.sql before it can reach main.",
+    "resolved_by": "clean",
+    "files_via": [
+      {
+        "file": "migrations/0042_login_options.sql",
+        "via": "clean"
+      },
+      {
+        "file": "src/auth.ts",
+        "via": "clean"
+      },
+      {
+        "file": "src/routes.ts",
+        "via": "clean"
+      }
+    ],
+    "conflicts": [],
+    "check": {
+      "command_hash": "fc21ee81dccb",
+      "exit_code": 0,
+      "signal": null,
+      "timed_out": false,
+      "duration_ms": 241337,
+      "log_tail": " Test Files  12 passed (12)\n      Tests  318 passed (318)\n   Duration  3m 58s\n",
+      "failed_tests": [],
+      "passes_on_trunk": true,
+      "reproduce": "git fetch origin refs/agenthub/cand/1b4e28ba/L-7/5d4c3b2a1908 && git worktree add --detach ../web-L-7 FETCH_HEAD && cd ../web-L-7 && CI=1 sh -c 'npm ci && npm test'"
+    },
+    "resolver": null,
+    "next_steps": [
+      "Ask an approver to run `hub approve L-7` (any approver other than maya)."
+    ],
+    "warnings": [],
+    "foreign_commits": [],
+    "timings": {
+      "queued_ms": 240000,
+      "merge_ms": 2100,
+      "check_ms": 241337,
+      "push_ms": 0
+    }
+  }
+}

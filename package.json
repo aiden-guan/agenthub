@@ -5,17 +5,23 @@
   "description": "Coordination hub for several people running AI coding agents on one codebase (Phase 1: hub + adapter with enforced file-level leases).",
   "type": "module",
   "workspaces": [
+    "packages/contract",
+    "packages/gitops",
+    "packages/symbols",
     "packages/hub",
-    "packages/adapter"
+    "packages/lander",
+    "packages/adapter",
+    "packages/e2e"
   ],
   "engines": {
     "node": ">=22.12"
   },
   "scripts": {
-    "build": "npm run build -w @agenthub/hub -w @agenthub/adapter",
+    "build": "npm run build -w @agenthub/contract -w @agenthub/gitops -w @agenthub/symbols -w @agenthub/hub -w @agenthub/lander -w @agenthub/adapter",
     "test": "npm run build && vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc -p packages/hub --noEmit && tsc -p packages/adapter --noEmit",
+    "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts",
+    "typecheck": "tsc -p packages/contract --noEmit && tsc -p packages/gitops --noEmit && tsc -p packages/symbols --noEmit && tsc -p packages/hub --noEmit && tsc -p packages/lander --noEmit && tsc -p packages/adapter --noEmit",
     "demo": "bash scripts/demo.sh"
   },
   "devDependencies": {

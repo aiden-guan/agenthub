@@ -1,0 +1,21 @@
+{
+  "changes": [
+    {
+      "file": "src/auth.ts",
+      "symbol": "login",
+      "kind": "signature",
+      "before": "login(user: string, password: string, remember: boolean): Promise<Session>",
+      "after": "login(user: string, password: string, opts?: LoginOptions): Promise<Session>",
+      "task_id": "T-3"
+    },
+    {
+      "file": "src/auth.ts",
+      "symbol": "rememberDays",
+      "kind": "renamed",
+      "before": "rememberDays(remember: boolean): number",
+      "after": "sessionDays(opts: LoginOptions): number",
+      "renamed_to": "sessionDays",
+      "task_id": "T-3"
+    }
+  ]
+}

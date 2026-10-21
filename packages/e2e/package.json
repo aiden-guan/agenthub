@@ -1,0 +1,13 @@
+{
+  "name": "@agenthub/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "End-to-end suite: two agents and a lander against a real hub and a bare remote (npm run test:e2e).",
+  "type": "module",
+  "devDependencies": {
+    "@agenthub/adapter": "0.1.0",
+    "@agenthub/hub": "0.1.0",
+    "@agenthub/lander": "0.1.0",
+    "@modelcontextprotocol/sdk": "^1.32.1"
+  }
+}

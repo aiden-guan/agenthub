@@ -1,0 +1,32 @@
+{
+  "name": "@agenthub/lander",
+  "version": "0.1.0",
+  "description": "The `hub-lander`: the landing queue's lander (admission, squash merge ladder, checks, CAS trunk push, AI conflict resolver).",
+  "type": "module",
+  "exports": {
+    "./resolver-protocol": {
+      "types": "./dist/resolver-protocol.d.ts",
+      "default": "./dist/resolver-protocol.js"
+    }
+  },
+  "bin": {
+    "hub-lander": "bin/hub-lander.js"
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@agenthub/contract": "0.1.0",
+    "@agenthub/gitops": "0.1.0",
+    "@agenthub/symbols": "0.1.0",
+    "@anthropic-ai/sdk": "0.131.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@agenthub/hub": "0.1.0"
+  }
+}

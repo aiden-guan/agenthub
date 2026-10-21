@@ -1,0 +1,48 @@
+{
+  "changes": [
+    {
+      "id": "S-4",
+      "project": "acme/web",
+      "agent": "maya/claude-1",
+      "task_id": "T-3",
+      "landing_id": null,
+      "file": "src/auth.ts",
+      "symbol": "login",
+      "name": "login",
+      "kind": "signature",
+      "before": "login(user: string, password: string, remember: boolean): Promise<Session>",
+      "after": "login(user: string, password: string, opts?: LoginOptions): Promise<Session>",
+      "renamed_to": null,
+      "status": "in_progress",
+      "created_at": 1792572000000,
+      "updated_at": 1792572000000,
+      "decisions": [
+        {
+          "id": "D-9",
+          "agent": "maya/claude-1",
+          "summary": "login() takes an options object instead of positional flags"
+        }
+      ]
+    },
+    {
+      "id": "S-5",
+      "project": "acme/web",
+      "agent": "maya/claude-1",
+      "task_id": "T-3",
+      "landing_id": null,
+      "file": "src/auth.ts",
+      "symbol": "rememberDays",
+      "name": "rememberDays",
+      "kind": "renamed",
+      "before": "rememberDays(remember: boolean): number",
+      "after": "sessionDays(opts: LoginOptions): number",
+      "renamed_to": "sessionDays",
+      "status": "in_progress",
+      "created_at": 1792572000000,
+      "updated_at": 1792572000000,
+      "decisions": []
+    }
+  ],
+  "now": 1792572000000,
+  "seq": 405
+}

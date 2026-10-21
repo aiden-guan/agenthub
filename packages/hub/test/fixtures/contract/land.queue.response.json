@@ -1,0 +1,190 @@
+{
+  "landing": {
+    "project": "acme/web",
+    "branch": "maya/login-opts",
+    "commit": "3f2a9c1e5b7d4a6c8e0f1a2b3c4d5e6f7a8b9c0d",
+    "summary": "login() takes an options object; the remember flag becomes opts.sessionDays, stored by the new migration.",
+    "queue_seq": 5,
+    "position": null,
+    "eta_ms": 540000,
+    "phase": null,
+    "phase_at": null,
+    "attempt": 0,
+    "lander": null,
+    "lease_claim_id": null,
+    "in_doubt": false,
+    "deadline_at": null,
+    "base_sha": null,
+    "first_base": null,
+    "trunk_base": null,
+    "candidate": null,
+    "candidate_ref": null,
+    "candidate_checked": false,
+    "trunk_sha": null,
+    "files": [
+      "migrations/0042_login_options.sql",
+      "src/auth.ts",
+      "src/routes.ts"
+    ],
+    "scope": [
+      {
+        "file": "migrations/0042_login_options.sql"
+      },
+      {
+        "file": "src/auth.ts",
+        "symbol": "login"
+      },
+      {
+        "file": "src/routes.ts",
+        "symbol": "handleLogin"
+      }
+    ],
+    "mapper": "sym1;vtsw0.3.1;wts0.27.0;4be1c2d9",
+    "protected": [],
+    "approval": [],
+    "approvals": [],
+    "hold_ids": [
+      "C-37"
+    ],
+    "report": null,
+    "failure": null,
+    "retries": {
+      "trunk_moved": 0,
+      "lander_lost": 0,
+      "step_timeout": 0
+    },
+    "retry_of": "L-6",
+    "retry": 1,
+    "supersedes": null,
+    "superseded_by": null,
+    "waits_for": null,
+    "landed_with": null,
+    "reconciled": false,
+    "started_at": null,
+    "ended_at": null,
+    "id": "L-7",
+    "agent": "maya/claude-1",
+    "task_id": "T-3",
+    "status": "submitted",
+    "created_at": 1792572600000,
+    "updated_at": 1792572600000
+  },
+  "task": {
+    "id": "T-3",
+    "project": "acme/web",
+    "title": "Let login take an options object",
+    "description": "Replace the positional remember flag of login() with an options object, and store the chosen session length.",
+    "deps": [],
+    "owner": "maya/claude-1",
+    "status": "landing",
+    "created_by": "maya/claude-1",
+    "created_at": 1792566000000,
+    "updated_at": 1792572600000,
+    "blocked_by": []
+  },
+  "released": [
+    {
+      "id": "C-31",
+      "project": "acme/web",
+      "holder": "maya/claude-1",
+      "task_id": "T-3",
+      "scope": [
+        {
+          "file": "src/auth.ts",
+          "symbol": "login"
+        },
+        {
+          "file": "src/routes.ts",
+          "symbol": "handleLogin"
+        }
+      ],
+      "mode": "exclusive",
+      "intent": "Let login take an options object",
+      "base_commit": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      "status": "released",
+      "created_at": 1792571700000,
+      "granted_at": 1792571700000,
+      "expires_at": 1792572690000,
+      "ttl_ms": 120000,
+      "heartbeat_interval_ms": 30000,
+      "ended_at": 1792572600000,
+      "end_reason": "moved to landing L-7",
+      "landing_id": null,
+      "mapper": "sym1;vtsw0.3.1;wts0.27.0;4be1c2d9"
+    },
+    {
+      "id": "C-34",
+      "project": "acme/web",
+      "holder": "maya/claude-1",
+      "task_id": "T-3",
+      "scope": [
+        {
+          "file": "migrations/0042_login_options.sql"
+        }
+      ],
+      "mode": "exclusive",
+      "intent": "Let login take an options object",
+      "base_commit": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      "status": "released",
+      "created_at": 1792572300000,
+      "granted_at": 1792572300000,
+      "expires_at": 1792572690000,
+      "ttl_ms": 120000,
+      "heartbeat_interval_ms": 30000,
+      "ended_at": 1792572600000,
+      "end_reason": "moved to landing L-7",
+      "landing_id": null,
+      "mapper": null
+    }
+  ],
+  "unblocked": [],
+  "held": [
+    {
+      "id": "C-37",
+      "project": "acme/web",
+      "holder": "maya/claude-1",
+      "task_id": "T-3",
+      "scope": [
+        {
+          "file": "migrations/0042_login_options.sql"
+        },
+        {
+          "file": "src/auth.ts",
+          "symbol": "login"
+        },
+        {
+          "file": "src/routes.ts",
+          "symbol": "handleLogin"
+        }
+      ],
+      "mode": "exclusive",
+      "intent": "landing L-7: Let login take an options object",
+      "base_commit": null,
+      "status": "active",
+      "created_at": 1792572600000,
+      "granted_at": 1792572600000,
+      "expires_at": 8640000000000000,
+      "ttl_ms": 120000,
+      "heartbeat_interval_ms": 30000,
+      "ended_at": null,
+      "end_reason": null,
+      "landing_id": "L-7",
+      "mapper": "sym1;vtsw0.3.1;wts0.27.0;4be1c2d9"
+    }
+  ],
+  "superseded": [],
+  "replayed": false,
+  "position": null,
+  "eta_ms": 540000,
+  "lander": {
+    "holder": "lander/build1-48213-9f3c",
+    "claim_id": "C-12",
+    "expires_at": 1792572775000,
+    "standby": [
+      "lander/build2-51007-04ad"
+    ]
+  },
+  "note": "L-7 is submitted; the lander admits it next. Your claims on its files moved into the landing hold C-37 until it lands or fails. migrations/0042_login_options.sql needs an approval. hub_wait {landing_id: \"L-7\"} waits for the result.",
+  "now": 1792572600000,
+  "seq": 416
+}

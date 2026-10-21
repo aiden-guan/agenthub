@@ -1,0 +1,21 @@
+{
+  "control": {
+    "paused": {
+      "reason": "external_push",
+      "detail": "8c7b6a594837 reached main outside the landing queue (externalPushes: pause).",
+      "at": 1792573150000,
+      "by": "lander/build1-48213-9f3c"
+    },
+    "trunk": {
+      "sha": "8c7b6a5948372615f4e3d2c1b0a9988776655443",
+      "landing_id": null,
+      "at": 1792573150000
+    },
+    "policy": {
+      "keep_place_retries": 2,
+      "sendback_grace_min": 30,
+      "approval_timeout_hours": 24,
+      "claim_gate": "fail"
+    }
+  }
+}
