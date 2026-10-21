@@ -180,8 +180,14 @@ export class HubClient {
       deadlock ??= typeof result.deadlock === 'string' ? result.deadlock : undefined;
       for (const c of result.conflicts) {
         const seen = byClaim.get(c.claim_id);
-        if (seen) seen.files = [...new Set([...seen.files, ...c.files])];
-        else byClaim.set(c.claim_id, { ...c, files: [...c.files] });
+        if (seen) {
+          seen.files = [...new Set([...seen.files, ...c.files])];
+          // The holder's overlapping entries from every batch (a hub older than Phase 2 sends no scope).
+          if (Array.isArray(seen.scope) && Array.isArray(c.scope)) {
+            const had = seen.scope;
+            seen.scope = [...had, ...c.scope.filter((s) => !had.some((t) => t.file === s.file && t.symbol === s.symbol))];
+          }
+        } else byClaim.set(c.claim_id, { ...c, files: [...c.files] });
       }
     }
     const { deadlock: _last, ...rest } = result!;

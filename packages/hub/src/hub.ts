@@ -397,8 +397,11 @@ export class Hub {
         const { uncovered, blockers, waits } = this.standing(project, me, [file], mode, waitedFor);
         for (const c of blockers) {
           const seen = byClaim.get(c.id);
-          if (seen) seen.files = unique([...seen.files, ...toConflict(c, uncovered).files]);
-          else byClaim.set(c.id, toConflict(c, uncovered));
+          if (seen) {
+            seen.files = unique([...seen.files, ...toConflict(c, uncovered).files]);
+            // The holder's entries on every file merged so far, as toConflict would give for them all at once.
+            seen.scope = c.scope.filter((s) => seen.files.includes(s.file));
+          } else byClaim.set(c.id, toConflict(c, uncovered));
         }
         const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(c.holder, me));
         deadlock ??= blockers.length ? denialDeadlock(waits, me, blockers, waitsForMe, waitsForMe ? waitCycle(waits().held, me, blockers) : null) : null;
