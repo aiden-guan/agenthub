@@ -1,13 +1,9 @@
-// Which language a path is (design §2.4 "Languages"), and each language's table.
+// Which language a path is (design §2.4 "Languages"), and each language's
+// table. A table is loaded on first use, so a hook process that maps one file
+// loads one table (design §2.4 "Performance": the cold path).
 
 import type { LanguageSpec } from '../spec.js';
 import type { LanguageId } from '../types.js';
-import { go } from './go.js';
-import { java } from './java.js';
-import { javascript } from './javascript.js';
-import { python } from './python.js';
-import { rust } from './rust.js';
-import { tsx, typescript } from './typescript.js';
 
 const EXTENSIONS: Readonly<Record<string, LanguageId>> = {
   ts: 'typescript',
@@ -33,5 +29,35 @@ export function languageFor(path: string): LanguageId | null {
   return EXTENSIONS[base.slice(dot + 1).toLowerCase()] ?? null;
 }
 
-/** The outline table per language. */
-export const SPECS: Partial<Record<LanguageId, LanguageSpec>> = { typescript, tsx, javascript, python, go, rust, java };
+const LOADERS: Readonly<Record<LanguageId, () => Promise<LanguageSpec>>> = {
+  typescript: async () => (await import('./typescript.js')).typescript,
+  tsx: async () => (await import('./typescript.js')).tsx,
+  javascript: async () => (await import('./javascript.js')).javascript,
+  python: async () => (await import('./python.js')).python,
+  go: async () => (await import('./go.js')).go,
+  rust: async () => (await import('./rust.js')).rust,
+  java: async () => (await import('./java.js')).java,
+};
+
+const loading = new Map<LanguageId, Promise<LanguageSpec>>();
+const loaded = new Map<LanguageId, LanguageSpec>();
+
+/** The outline table of `language`, loaded once. Rejects for a language without one. */
+export function loadSpec(language: LanguageId): Promise<LanguageSpec> {
+  let spec = loading.get(language);
+  if (!spec) {
+    const load = Object.hasOwn(LOADERS, language) ? LOADERS[language] : undefined;
+    if (!load) return Promise.reject(new Error(`@agenthub/symbols: no outline table for language ${String(language)}`));
+    spec = load().then((s) => {
+      loaded.set(language, s);
+      return s;
+    });
+    loading.set(language, spec);
+  }
+  return spec;
+}
+
+/** The outline table of `language` once `loadSpec` has loaded it, else undefined. */
+export function loadedSpec(language: LanguageId): LanguageSpec | undefined {
+  return loaded.get(language);
+}

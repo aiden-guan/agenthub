@@ -5,9 +5,32 @@
 // change keeps a signature byte for byte, while any token change alters it.
 // A language can refine the spacing (`LanguageSpec.space`), from the tokens'
 // node types alone, so that stays true.
+//
+// What each kind of declaration's signature covers (the language tables say
+// where it starts and stops):
+// - functions and methods: from the declaration (modifiers, type parameters,
+//   the Go receiver) up to the body;
+// - classes, structs with a body of members, traits, impls, namespaces: up to
+//   the body;
+// - interfaces, type aliases, enums, Go type specs, Rust structs and enums:
+//   all of it (it is all API);
+// - variables, constants and fields: without the initializer, or null when
+//   there is no type annotation, so a value change is never a signature change
+//   (a function value's parameters are API, though: up to its body).
+//
+// signatureChanges (design §2.4 "changedSymbols", step 6) compares two
+// documents' signatures key by key: `signature` for a key on both sides with
+// non-null, different signatures; for a key only `before` has, with a
+// signature, `renamed` when exactly one key only `after` has is of the same
+// kind with the same normalized body, else `removed`. `@imports` and
+// `@toplevel` are never reported.
 
+import { IMPORTS, TOPLEVEL } from '@agenthub/contract';
 import type { Node } from 'web-tree-sitter';
+import type { Doc } from './document.js';
+import type { SigLocation } from './outline.js';
 import type { LanguageSpec, SigToken, SignatureSpec } from './spec.js';
+import type { Item, SignatureChange } from './types.js';
 
 export const MAX_SIGNATURE = 500;
 
@@ -142,4 +165,81 @@ export function truncate(s: string): string {
   const last = cut.charCodeAt(cut.length - 1);
   if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
   return `${cut}…`;
+}
+
+// ------------------------------------------------------------------ lazy signatures and signature changes
+
+/** An item's normalized signature, computed from its document's tree on first use (the tree must still be alive). */
+export function signatureOf(doc: Doc, item: Item): string | null {
+  const known = doc.signatures.get(item);
+  if (known !== undefined) return known;
+  const detail = doc.details.get(item);
+  const spec = detail?.sig ?? (detail?.sigAt ? located(doc, detail.sigAt) : null);
+  const text = spec ? signatureText(doc.src, spec, doc.spec) : null;
+  doc.signatures.set(item, text);
+  return text;
+}
+
+/** A carried-over item's signature node, found in the document's tree by its type and range. */
+function located(doc: Doc, at: SigLocation): SignatureSpec {
+  let node = doc.tree.rootNode.descendantForIndex(at.start, at.end);
+  while (node && !(node.startIndex === at.start && node.endIndex === at.end && node.type === at.type)) node = node.parent;
+  if (!node) throw new Error(`@agenthub/symbols: no ${at.type} node at ${at.start}-${at.end} for a carried-over signature`);
+  return { node, ranges: at.ranges };
+}
+
+/** A key's signature: its items' (overloads, a struct and its impls) joined with newlines; null when none has one. Compared whole, reported cut to 500 characters. */
+function keySignature(doc: Doc, items: Item[]): string | null {
+  const sigs: string[] = [];
+  for (const item of items) {
+    const s = signatureOf(doc, item);
+    if (s !== null) sigs.push(s);
+  }
+  return sigs.length === 0 ? null : sigs.join('\n');
+}
+
+/** The bodies of a key's items with whitespace collapsed, joined; '' when none has a body. */
+function keyBody(doc: Doc, items: Item[]): string {
+  const parts = items.map((item) => {
+    const body = doc.details.get(item)?.body;
+    return body ? doc.src.slice(body[0], body[1]).replace(/\s+/g, ' ').trim() : '';
+  });
+  return parts.every((p) => p === '') ? '' : parts.join('\n');
+}
+
+const isRegion = (key: string): boolean => key === IMPORTS || key === TOPLEVEL;
+
+/**
+ * The signature changes from `b` to `a`, given each side's items by key and
+ * the keys whose texts differ (or that one side lacks). A key whose texts are
+ * the same on both sides has the same signature (a signature is made of
+ * tokens inside the item's text), so only those keys' signatures are
+ * computed.
+ */
+export function signatureChanges(b: Doc, a: Doc, fb: Map<string, Item[]>, fa: Map<string, Item[]>, differing: ReadonlySet<string>): SignatureChange[] {
+  const out: SignatureChange[] = [];
+  let added: Array<{ key: string; kind: string; body: string }> | null = null;
+  for (const [key, items] of fb) {
+    if (isRegion(key) || !differing.has(key)) continue;
+    const before = keySignature(b, items);
+    if (before === null) continue;
+    const other = fa.get(key);
+    if (other) {
+      const after = keySignature(a, other);
+      if (after !== null && after !== before) out.push({ symbol: key, kind: 'signature', before: truncate(before), after: truncate(after) });
+      continue;
+    }
+    added ??= [...fa].filter(([k]) => !fb.has(k) && !isRegion(k)).map(([k, xs]) => ({ key: k, kind: xs[0]!.kind, body: keyBody(a, xs) }));
+    const body = keyBody(b, items);
+    const kind = items[0]!.kind;
+    const candidates = body === '' ? [] : added.filter((c) => c.kind === kind && c.body === body);
+    if (candidates.length === 1) {
+      const to = candidates[0]!.key;
+      const after = keySignature(a, fa.get(to)!);
+      out.push({ symbol: key, kind: 'renamed', before: truncate(before), after: after === null ? null : truncate(after), renamed_to: to });
+    } else {
+      out.push({ symbol: key, kind: 'removed', before: truncate(before), after: null });
+    }
+  }
+  return out;
 }

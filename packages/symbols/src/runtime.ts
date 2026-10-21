@@ -71,6 +71,8 @@ export class GrammarRuntime {
   private readonly locate: (entry: ManifestEntry) => string;
   private readonly warn: (message: string) => void;
   private runtimeReady: Promise<boolean> | null = null;
+  /** The runtime file passed its check (known as soon as ensureRuntime has been called). */
+  private runtimeVerified = false;
   private readonly grammars = new Map<LanguageId, Promise<Grammar | null>>();
   private readonly states = new Map<LanguageId, GrammarStatus>();
   private readonly warned = new Set<string>();
@@ -96,11 +98,13 @@ export class GrammarRuntime {
   }
 
   private async loadOnce(language: LanguageId): Promise<Grammar | null> {
-    const entry = this.manifest.grammars[language];
+    const entry = Object.hasOwn(this.manifest.grammars, language) ? this.manifest.grammars[language] : undefined;
     if (!entry) throw new Error(`@agenthub/symbols: no grammar for language ${String(language)}`);
     const consequence = `${language} files are claimed whole-file (grammar_unverified)`;
-    const bytes = (await this.ensureRuntime()) ? this.verified(entry, consequence) : null;
-    if (!bytes) {
+    // The runtime file is checked now and compiles in the background while the grammar is read and hashed.
+    const runtime = this.ensureRuntime();
+    const bytes = this.runtimeVerified ? this.verified(entry, consequence) : null;
+    if (!(await runtime) || !bytes) {
       this.states.set(language, 'unverified');
       return null;
     }
@@ -120,6 +124,7 @@ export class GrammarRuntime {
     this.runtimeReady ??= (async () => {
       const bytes = this.verified(this.manifest.runtime, 'every language is claimed whole-file (grammar_unverified)');
       if (!bytes) return false;
+      this.runtimeVerified = true;
       parserInit ??= Parser.init({ wasmBinary: bytes });
       try {
         await parserInit;

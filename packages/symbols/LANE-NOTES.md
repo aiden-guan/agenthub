@@ -259,3 +259,129 @@ For lane A (pre-edit, post-edit, guard) and lane L (admission, landed changes):
   notes propose: an incremental reparse of `after` from `before`'s tree, and
   signatures computed only for the keys that changed. `diffSides(b, a, max)`
   takes already-outlined sides, so S4 can feed it whatever outlines it caches.
+
+## S4: signatures, references, performance
+
+Files: `src/signatures.ts` (`signatureOf`, and `signatureChanges` moved here
+from `diff.ts`), `src/references.ts` (new: `referencesIn`, `identifierIndex`,
+`freeKeys`, `importsText`), `src/document.ts` (new: parsed documents,
+incremental reparsing, the document cache), with changes to `src/outline.ts`
+(lazy signatures, `ExtractOptions`, carrying top-level items over),
+`src/diff.ts` (works on documents), `src/languages/index.ts` (tables load on
+first use), `src/runtime.ts` (the grammar is hashed while the runtime WASM
+compiles; manifest lookups use `Object.hasOwn`) and `src/index.ts`. Tests:
+`signatures.test.ts`, `references.test.ts`, `incremental.test.ts`,
+`perf.test.ts`, and `random-edits.ts` (the seeded edit generator, moved out of
+`mapping-property.test.ts` and shared). No contract amendments and no
+dependency requests. Nothing in the frozen `types.ts` changed meaning; the
+notes below are how the implementation reads its doc comments.
+
+For lane A (pre-edit deny messages, post-edit, `relevant()`, `who_uses`,
+`callers_free`, the refcache) and lane H:
+
+- **`referencesIn(path, source, names)`** returns a Map holding **only the
+  names that are used**, in the order of `names`. So `refs.size > 0` is "some
+  reference", which is how §2.5's `relevant()` reads it; use
+  `refs.get(name) ?? []`. Each value lists keys once, in order of first use.
+  A name is matched against identifier tokens exactly (`login`, not
+  `Session.login`; pass the change's `name`, its last segment).
+- **What counts:** identifier tokens (`identifier`, `property_identifier`,
+  `type_identifier`, `field_identifier`, the shorthand property and field
+  names; Python attribute names are `identifier`s). Comments and string text
+  never count. Code inside a string does: a template substitution, an f-string
+  interpolation. So do JSX tag and attribute names and the tokens of Rust macro
+  calls. Go package qualifiers in types (`auth.Session`'s `auth`) don't
+  (`package_identifier`), while `auth.Login(...)`'s `auth` does.
+- **Attribution:** the innermost item: a member (`Router.handle`), a
+  container's own text (`Router`, e.g. `extends Base`), a top-level key,
+  `@imports` or `@toplevel`. A **declaration's own name is not a use**: in each
+  item, the first identifier spelled like the last segment of its key, before
+  its body, is skipped. A recursive call still counts. So `who_uses` needn't
+  drop the declaring key itself, but sites in `@imports` are just the import of
+  the name: `who_uses` probably wants to leave those out of `callers_free`.
+- **`identifierIndex(path, source)`** returns a **null-prototype object**
+  (`constructor`, `__proto__`, `toString` are ordinary identifier names). It
+  serializes as plain JSON; after `JSON.parse`, look names up with
+  `Object.hasOwn(index, name)`, never `index[name] ?? []`, or `toString` finds
+  the prototype's. It agrees with `referencesIn` for every name (tested).
+- **`freeKeys(path, source, held)`**: top-level keys only, once each, in source
+  order, `@imports` and `@toplevel` included (`@imports` stays free even when
+  `@imports` is held: they never overlap). `held` entries are taken as entries
+  of this file, compared with `entriesOverlap`, so the **caller does the mapper
+  gating**: pass `{}` (no `symbol`) for a whole-file claim and for any claim
+  whose mapper is not comparable with ours. A held member makes its container
+  non-free. Returns null when the file can't be mapped at symbol level
+  (unsupported, unverified grammar, binary, over 1 MiB, or an uncontained parse
+  error: then any edit is file level anyway).
+- **`importsText(path, source)`**: one statement per line, in source order,
+  comments removed and whitespace collapsed; `''` with none. It includes
+  imports anywhere in the file (a Python import inside a function, a Rust `use`
+  in a function or module), TS/JS re-exports (`export ... from`), `require('x')`
+  and `import('x')` calls, Rust `extern crate` and bodiless `mod x;`. It
+  excludes Go's `package` clause and Java's `package` declaration.
+- **Import-filter gaps worth knowing (advisory warnings, so false negatives
+  only):** a Java class in the same package needs no import, and Rust can call
+  `crate::auth::login()` without a `use`. Lane A may want to treat Java (and
+  Rust paths) like Go: the same directory passes the filter.
+- **Constructors:** a change to `Session.constructor` (TS, Java) or
+  `Session.__init__` (Python) has `name` `constructor`/`__init__`, which callers
+  never spell (`new Session(...)`, `Session(...)`). If lane H (which derives
+  `SymbolChange.name`) or lane A wants those to reach callers, match the
+  container's name for constructor keys.
+- **null** from `referencesIn` and `identifierIndex`: unsupported language,
+  unverified grammar, binary, or over 1 MiB. A file with a parse error still
+  gets its identifiers (names are advisory).
+
+Performance (design §2.4), for lanes A and L:
+
+- **Lazy signatures.** Computing every signature was about two thirds of an
+  outline. Documents leave `Item.signature` null and compute a signature on
+  demand from the tree; `signatureChanges` asks only for keys whose text
+  differs (same text, same tokens, same signature). `outline()` still returns
+  every signature.
+- **Incremental reparsing.** The side of a diff that isn't cached is parsed
+  from the other side's tree (`tree.edit` of a copy with the common prefix and
+  suffix, then `parse(text, old)`). An incremental parse that reports a syntax
+  error is redone from scratch: error recovery can depend on history (Java
+  differed in 7 of 294 such trees when measured), while error-free trees were
+  always identical. `incremental.test.ts` checks the tree and the full outline
+  (signatures included) against a fresh parse along chains of seeded edits
+  (300 per fixture in CI; it also passed at 4,000 per fixture).
+- **Carried-over items.** An incremental parse keeps the subtrees outside the
+  edit, with the same node ids. A top-level node with the same id as in the
+  base document gets the base's classification, and its items are moved to
+  their new offsets when the item's span text is identical (so its attached
+  comments are too). A moved item's signature is found again in the new tree
+  by node type and range. Python's indentation scanner rarely lets top-level
+  subtrees be reused, so Python gets little of this (it is just slower there).
+- **The document cache.** Per runtime, the 8 most recent documents (at most
+  2M UTF-16 units of text together), trees included, keyed by language and
+  exact text. Each edit's `before` is usually the previous edit's `after`, so a
+  process that maps a sequence of edits parses each text once, incrementally.
+  `referencesIn`, `identifierIndex`, `freeKeys` and `importsText` use it too
+  (a deny message's `freeKeys` right after `changedSymbols` costs nothing).
+  Evicted trees are deleted on `setImmediate` (off the caller's path), at most
+  8 waiting. Every use of a document is synchronous after the grammar await, so
+  nothing is evicted mid-use.
+- **The cold path:** only the needed language table is loaded (the other five
+  cost 5–8 ms to import), and the grammar file is hashed while the runtime WASM
+  compiles.
+- **Measured here** (Node 22, 4 cores, `npx vitest run
+  packages/symbols/test/perf.test.ts`, the file alone): cold (a fresh process
+  importing the built package and mapping one body edit of a generated
+  2000-line TS file) p95 132–136 ms, median 106–113 ms (import 21 ms, the rest
+  init, grammar and two parses), budget p95 < 150 ms. Warm, an editing session
+  (each `before` the previous `after`): median 2.1 ms, p95 4–5 ms, budget
+  < 20 ms. Warm, a version of the file the process hasn't seen (one full parse
+  is 15 ms of it): median 18.6–19.6 ms. Before S4: cold p95 244 ms, median
+  186 ms; warm 51 ms. Under `npm test` other files run in parallel and the cold
+  numbers rise (p95 about 190 ms with the hub's race tests running); the log
+  line prints the load average. The cold script preloads `node:crypto`: the
+  hook's own `fetch` to the hub loads it anyway (16 crypto modules after one
+  `fetch`), so it isn't a cost symbols adds; without the preload, add about
+  7 ms.
+- For the hook, the remaining cold cost is mostly WASM: the first parse of a
+  2000-line file runs in baseline-compiled code (30 ms, against 15 ms warm),
+  and module import, runtime init and grammar load take about 40 ms together.
+  If that matters, §7.2's long-running mapping server would make every call
+  warm.
