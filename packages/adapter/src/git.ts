@@ -152,11 +152,37 @@ export function gitCommonDir(root: string): string | null {
  * sides of renames (without rename detection a rename is a deletion plus an
  * addition, and skipping it keeps big move-and-edit commits fast). Throws when
  * git fails, so a failure never reads as "nothing staged".
+ *
+ * In a merge (`merging`: the commits it brings in, see mergeHeads), only the
+ * paths the merge commit itself changes: where the index differs from the
+ * version the merge brings in, which is a merged commit's where that commit
+ * changed the path since the merge base, else HEAD's. A change merged in as it
+ * was committed on the other branch is that branch's, not this commit's; a
+ * conflict resolved against it, both sides' changes combined, or an edit is.
  */
-export function stagedPaths(root: string): string[] {
+export function stagedPaths(root: string, merging: string[] = []): string[] {
+  const staged = diffNames(root, ['diff', '--cached', '--name-only', '-z', '--no-renames'], 'git diff --cached');
+  const fromHere = new Set(staged);
+  let touched: string[] | null = null;
+  for (const head of merging) {
+    const base = git(root, ['merge-base', 'HEAD', head]);
+    const changedThere = new Set(
+      base
+        ? diffNames(root, ['diff', '--name-only', '-z', '--no-renames', base, head], 'git diff')
+        : diffNames(root, ['ls-tree', '-r', '-z', '--name-only', head], 'git ls-tree'), // unrelated histories: all of it is new there
+    );
+    const fromThere = new Set(diffNames(root, ['diff', '--cached', '--name-only', '-z', '--no-renames', head], 'git diff --cached'));
+    const changed = new Set([...staged, ...fromThere].filter((p) => (changedThere.has(p) ? fromThere.has(p) : fromHere.has(p))));
+    // An octopus merge changes what it changes against every one of them.
+    touched = touched ? touched.filter((p) => changed.has(p)) : [...changed];
+  }
+  return touched ?? staged;
+}
+
+function diffNames(root: string, args: string[], what: string): string[] {
   let out: string;
   try {
-    out = execFileSync('git', ['diff', '--cached', '--name-only', '-z', '--no-renames'], {
+    out = execFileSync('git', args, {
       cwd: root,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -166,9 +192,26 @@ export function stagedPaths(root: string): string[] {
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stderr?: string };
     const reason = e.code === 'ETIMEDOUT' ? 'no answer within 120 s' : String(e.stderr ?? '').trim().split('\n')[0] || e.message;
-    throw new Error(`git diff --cached failed: ${reason}`);
+    throw new Error(`${what} failed: ${reason}`);
   }
   return [...new Set(out.split('\0').filter((s) => s.length > 0).map((s) => s.normalize('NFC')))];
+}
+
+/**
+ * The commits a merge in progress brings in: MERGE_HEAD, or, in pre-merge-commit,
+ * which git merge runs before it writes that, the GITHEAD_<id> variables it sets
+ * for each one. Empty outside a merge.
+ */
+export function mergeHeads(root: string, env: NodeJS.ProcessEnv): string[] {
+  const file = git(root, ['rev-parse', '--path-format=absolute', '--git-path', 'MERGE_HEAD']);
+  let heads: string[] = [];
+  try {
+    if (file) heads = readFileSync(file, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+  } catch {
+    // no merge in progress
+  }
+  if (heads.length === 0) heads = Object.keys(env).flatMap((k) => /^GITHEAD_([0-9a-f]{40}|[0-9a-f]{64})$/.exec(k)?.[1] ?? []);
+  return heads;
 }
 
 /** Settings `hub init` records in the repository's shared git config (`agenthub.project`, `agenthub.url`). */

@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { RunningServer } from '@agenthub/hub';
@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { HubClient } from '../src/client.js';
 import { loadConfig } from '../src/config.js';
 import { stagedPaths } from '../src/git.js';
-import { PRE_EDIT_MATCHER as EDIT_MATCHER, guardScript, init, splitCommand } from '../src/init.js';
+import { PRE_EDIT_MATCHER as EDIT_MATCHER, HOOKS_PATH_LINE, guardScript, init, splitCommand } from '../src/init.js';
 import {
   A,
   B,
@@ -150,6 +150,41 @@ describe('hub init', () => {
     expect(init({ cwd: repo.wtB, agent: B, project: PROJECT, url: srv.url, command: CLI_COMMAND, hooks: false, mcp: false, env: { HUB_AGENT: B } })).toEqual([
       'already set up; nothing to change',
     ]);
+  });
+
+  it('replaces its own hook entries when run again with another --command, instead of adding a second set', () => {
+    const x = makeRepo();
+    try {
+      const settingsPath = path.join(x.main, '.claude', 'settings.json');
+      mkdirSync(path.dirname(settingsPath), { recursive: true });
+      const mine = { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo bash' }] };
+      writeFileSync(settingsPath, JSON.stringify({ hooks: { PreToolUse: [mine], SessionStart: [{ hooks: [{ type: 'command', command: 'echo hello' }] }] } }));
+      const opts = { cwd: x.main, project: PROJECT, guard: false, env: {} };
+      init(opts); // `hub`, which turns out not to be on Claude's PATH
+      expect(init({ ...opts, command: CLI_COMMAND }).join('\n')).toMatch(/updated \.claude\/settings\.json/);
+      const expected = {
+        PreToolUse: [mine, { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: `${CLI_COMMAND} hook pre-edit`, timeout: 30, onFailure: 'block' }] }],
+        PostToolUse: [{ matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: `${CLI_COMMAND} hook post-edit`, timeout: 30 }] }],
+        SessionStart: [{ hooks: [{ type: 'command', command: 'echo hello' }] }, { hooks: [{ type: 'command', command: `${CLI_COMMAND} hook digest`, timeout: 30 }] }],
+        ...Object.fromEntries(['Stop', 'SubagentStop', 'UserPromptSubmit', 'SessionEnd'].map((e) => [e, [{ hooks: [{ type: 'command', command: `${CLI_COMMAND} hook settle`, timeout: 30 }] }]])),
+      };
+      expect(JSON.parse(readFileSync(settingsPath, 'utf8')).hooks).toEqual(expected);
+      expect(init({ ...opts, command: CLI_COMMAND })[0]).toBe('already set up; nothing to change');
+
+      // Settings an older hub init left with both sets get one again; someone else's hook in a shared group stays.
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+      settings.hooks.PreToolUse.splice(1, 0, { matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: 'hub hook pre-edit', timeout: 30, onFailure: 'block' }] });
+      settings.hooks.PostToolUse.unshift({ matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: 'echo mine' }, { type: 'command', command: 'hub hook post-edit', timeout: 30 }] });
+      settings.hooks.Stop.push({ hooks: [{ type: 'command', command: '"/old/place/hub" hook settle', timeout: 30 }] });
+      writeFileSync(settingsPath, JSON.stringify(settings));
+      expect(init({ ...opts, command: CLI_COMMAND }).join('\n')).toMatch(/updated \.claude\/settings\.json/);
+      expect(JSON.parse(readFileSync(settingsPath, 'utf8')).hooks).toEqual({
+        ...expected,
+        PostToolUse: [{ matcher: EDIT_MATCHER, hooks: [{ type: 'command', command: 'echo mine' }] }, ...expected.PostToolUse],
+      });
+    } finally {
+      x.cleanup();
+    }
   });
 
   it('splits quoted commands for .mcp.json', () => {
@@ -795,5 +830,270 @@ describe('a worktree on a branch made before agenthub.json was committed', () =>
     } finally {
       fresh.cleanup();
     }
+  });
+});
+
+describe('hub init where git runs hooks from somewhere else (core.hooksPath)', () => {
+  let hub: RunningServer;
+  const env = (agent: string, extra: Record<string, string | undefined> = {}) => testEnv({ HUB_URL: hub.url, HUB_PROJECT: PROJECT, HUB_AGENT: agent, ...extra });
+  const commit = (cwd: string, file: string, agent = B, extra: Record<string, string | undefined> = {}) => {
+    writeFileSync(path.join(cwd, file), `export const at = ${Date.now()}${Math.random()};\n`);
+    git(cwd, 'add', file);
+    return run('git', ['commit', '-q', '-m', `change ${file}`], { cwd, env: env(agent, extra) });
+  };
+  const snapshot = (dir: string) => Object.fromEntries(readdirSync(dir).map((f) => [f, readFileSync(path.join(dir, f), 'utf8')]));
+  const opts = { project: PROJECT, command: CLI_COMMAND, hooks: false, mcp: false, env: {} };
+
+  /** What husky 9 sets up: core.hooksPath=.husky/_, where a stub per git hook runs .husky/<the stub's own name>. */
+  const huskify = (dir: string) => {
+    const stubs = path.join(dir, '.husky', '_');
+    mkdirSync(stubs, { recursive: true });
+    writeFileSync(
+      path.join(stubs, 'h'),
+      ['#!/usr/bin/env sh', 'n=$(basename "$0")', 's=$(dirname "$(dirname "$0")")/$n', '[ ! -f "$s" ] && exit 0', 'sh -e "$s" "$@"', 'c=$?',
+        '[ $c != 0 ] && echo "husky - $n script failed (code $c)" >&2', 'exit $c', ''].join('\n'),
+    );
+    for (const name of ['pre-commit', 'prepare-commit-msg', 'pre-merge-commit', 'pre-applypatch', 'post-commit']) {
+      writeFileSync(path.join(stubs, name), '#!/usr/bin/env sh\n. "$(dirname "$0")/h"\n');
+      chmodSync(path.join(stubs, name), 0o755);
+    }
+    writeFileSync(path.join(stubs, '.gitignore'), '*\n');
+    writeFileSync(path.join(dir, '.husky', 'pre-commit'), 'echo "husky lint: FAILED" >&2\nexit 1\n');
+    git(dir, 'config', 'core.hooksPath', '.husky/_');
+    return stubs;
+  };
+
+  beforeAll(async () => {
+    hub = await startHub();
+  });
+  afterAll(async () => {
+    await hub.close();
+  });
+
+  it("leaves husky's hooks alone, so the project's own pre-commit keeps running, and puts the guard where husky's hooks can call it", async () => {
+    const x = makeRepo();
+    try {
+      const stubs = huskify(x.main);
+      const before = snapshot(stubs);
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject({ code: 1, stderr: expect.stringMatching(/husky lint: FAILED/) });
+
+      const report = init({ cwd: x.main, ...opts }).join('\n');
+      expect(snapshot(stubs)).toEqual(before);
+      expect(report).toMatch(/note: git runs hooks from core\.hooksPath \(\.husky\/_, set in the local git config\)/);
+      expect(report).toContain(HOOKS_PATH_LINE);
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject({ code: 1, stderr: expect.stringMatching(/husky lint: FAILED/) });
+      expect(init({ cwd: x.main, ...opts })[0]).toBe('already set up; nothing to change'); // and no "merge them by hand"
+
+      // Wired in as the note says, the guard runs from husky's pre-commit, before the project's own checks.
+      writeFileSync(path.join(x.main, '.husky', 'pre-commit'), `${HOOKS_PATH_LINE}\necho "husky lint: ok" >&2\n`);
+      await client(hub.url, A).claim({ files: ['src/auth.ts'], intent: 'Migrate login to OAuth2' });
+      const blocked = await commit(x.main, 'src/auth.ts');
+      expect(blocked.code).not.toBe(0);
+      expect(blocked.stderr).toMatch(/hub guard: commit blocked[\s\S]*src\/auth\.ts — claimed by maya\/claude-1/);
+      expect(blocked.stderr).not.toMatch(/husky lint: ok/);
+      git(x.main, 'reset', '-q');
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject({ code: 0, stderr: expect.stringMatching(/husky lint: ok/) });
+      // A clone that has not run hub init commits as before: the line does nothing there.
+      const clone = path.join(x.dir, 'lee');
+      git(x.dir, 'clone', '-q', x.main, clone);
+      cpHusky(x.main, clone);
+      expect(await commit(clone, 'src/users.ts')).toMatchObject({ code: 0, stderr: 'husky lint: ok\n' });
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it('says how to undo a guard an older hub init put in a core.hooksPath directory, instead of refusing to run', () => {
+    const x = makeRepo();
+    try {
+      const stubs = huskify(x.main);
+      // what an older hub init left there
+      writeFileSync(path.join(stubs, 'pre-commit.pre-agenthub'), readFileSync(path.join(stubs, 'pre-commit')));
+      writeFileSync(path.join(stubs, 'pre-commit'), guardScript(CLI_COMMAND));
+      const report = init({ cwd: x.main, ...opts }).join('\n');
+      expect(report).toMatch(/\.husky\/_\/pre-commit is a guard an older hub init installed there/);
+      expect(report).toMatch(/pre-commit\.pre-agenthub/);
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it("leaves a global core.hooksPath alone, so the guard doesn't run in the machine's other repositories", async () => {
+    const x = makeRepo();
+    try {
+      const globalHooks = path.join(x.dir, 'globalhooks');
+      mkdirSync(globalHooks);
+      const scan = '#!/bin/sh\necho "corp secret scan ran" >&2\n';
+      writeFileSync(path.join(globalHooks, 'pre-commit'), scan);
+      chmodSync(path.join(globalHooks, 'pre-commit'), 0o755);
+      const gitconfig = path.join(x.dir, 'gitconfig');
+      writeFileSync(gitconfig, `[core]\n\thooksPath = ${globalHooks}\n`);
+      const res = await hubCli(['init', '--project', PROJECT, '--command', CLI_COMMAND, '--no-hooks', '--no-mcp'], { cwd: x.main, env: testEnv({ GIT_CONFIG_GLOBAL: gitconfig }) });
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain(`note: git runs hooks from core.hooksPath (${globalHooks}, set in the global git config)`);
+      expect(snapshot(globalHooks)).toEqual({ 'pre-commit': scan });
+
+      const other = path.join(x.dir, 'other');
+      git(x.dir, 'init', '-q', '-b', 'main', other);
+      writeFileSync(path.join(other, 'secret-plan.txt'), 'plan\n');
+      git(other, 'add', '-A');
+      const unrelated = await run('git', ['commit', '-q', '-m', 'unrelated'], {
+        cwd: other,
+        env: testEnv({ GIT_CONFIG_GLOBAL: gitconfig, HUB_URL: 'http://127.0.0.1:9', HUB_FAIL_CLOSED: '1' }),
+      });
+      expect(unrelated).toMatchObject({ code: 0, stderr: 'corp secret scan ran\n' });
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it('leaves a hooks directory the repository tracks (core.hooksPath=.githooks) alone', () => {
+    const x = makeRepo();
+    try {
+      mkdirSync(path.join(x.main, '.githooks'));
+      writeFileSync(path.join(x.main, '.githooks', 'pre-commit'), '#!/bin/sh\necho "team lint ran" >&2\n');
+      chmodSync(path.join(x.main, '.githooks', 'pre-commit'), 0o755);
+      git(x.main, 'add', '.githooks');
+      git(x.main, 'commit', '-q', '-m', 'team hooks');
+      git(x.main, 'config', 'core.hooksPath', '.githooks');
+      git(x.wtA, 'reset', '-q', '--hard', 'main'); // a worktree's relative core.hooksPath is its own checkout's .githooks
+      for (const cwd of [x.main, x.wtA]) {
+        const report = init({ cwd, ...opts, agent: cwd === x.wtA ? A : undefined }).join('\n');
+        expect(report).toMatch(/note: git runs hooks from core\.hooksPath \(\.githooks, set in the local git config\)/);
+        expect(git(cwd, 'status', '--porcelain', '--untracked-files=all', '--', '.githooks')).toBe('');
+      }
+      const common = git(x.main, 'rev-parse', '--path-format=absolute', '--git-common-dir').trim();
+      expect(readdirSync(path.join(common, 'agenthub-hooks')).sort()).toEqual(['pre-applypatch', 'pre-commit', 'pre-merge-commit', 'prepare-commit-msg']);
+    } finally {
+      x.cleanup();
+    }
+  });
+
+  it('runs a chained hook under its own name, for hooks that pick what to run from it (husky 4, yorkie)', async () => {
+    const x = makeRepo();
+    try {
+      const hooksDir = git(x.main, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks').trim();
+      mkdirSync(hooksDir, { recursive: true });
+      writeFileSync(path.join(hooksDir, 'run-hook.sh'), 'n=$(basename "$0")\n[ "$n" = pre-commit ] || exit 0\necho "lint ($n): FAILED" >&2\nexit 1\n');
+      writeFileSync(path.join(hooksDir, 'pre-commit'), '#!/bin/sh\n. "$(dirname "$0")/run-hook.sh"\n');
+      chmodSync(path.join(hooksDir, 'pre-commit'), 0o755);
+      const failed = expect.stringMatching(/lint \(pre-commit\): FAILED/);
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject({ code: 1, stderr: failed });
+      init({ cwd: x.main, ...opts });
+      expect(readFileSync(path.join(hooksDir, 'pre-commit'), 'utf8')).toContain('# agenthub-guard');
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject({ code: 1, stderr: failed });
+      // Anything that isn't a shell script is run as it is.
+      writeFileSync(path.join(hooksDir, 'pre-commit.pre-agenthub'), '#!/usr/bin/env node\nconsole.error("node hook ran with " + process.argv.length + " args"); process.exit(1);\n');
+      expect(await commit(x.main, 'src/users.ts')).toMatchObject({ code: 1, stderr: expect.stringMatching(/node hook ran with 2 args/) });
+    } finally {
+      x.cleanup();
+    }
+  });
+});
+
+/** Copy husky's setup into a clone (.husky/_ is not committed, and core.hooksPath is local). */
+function cpHusky(from: string, to: string): void {
+  const stubs = path.join(from, '.husky', '_');
+  mkdirSync(path.join(to, '.husky', '_'), { recursive: true });
+  for (const f of readdirSync(stubs)) {
+    writeFileSync(path.join(to, '.husky', '_', f), readFileSync(path.join(stubs, f)));
+    chmodSync(path.join(to, '.husky', '_', f), 0o755);
+  }
+  writeFileSync(path.join(to, '.husky', 'pre-commit'), readFileSync(path.join(from, '.husky', 'pre-commit')));
+  git(to, 'config', 'core.hooksPath', '.husky/_');
+}
+
+describe('hub guard: merge commits', () => {
+  let hub: RunningServer;
+  let r: SampleRepo;
+  const env = (agent: string, extra: Record<string, string | undefined> = {}) => testEnv({ HUB_URL: hub.url, HUB_PROJECT: PROJECT, HUB_AGENT: agent, ...extra });
+  const gitAs = (cwd: string, agent: string, args: string[], extra: Record<string, string | undefined> = {}) => run('git', args, { cwd, env: env(agent, extra) });
+  const write = (cwd: string, file: string, text: string) => writeFileSync(path.join(cwd, file), text);
+  const config = (first: string, last: string) => [first, ...Array.from({ length: 8 }, (_, i) => `export const c${i + 1} = ${i + 1};`), last, ''].join('\n');
+  const MAYA_AUTH = 'export function login(user: string) {\n  return `session-${user}`; // maya: OAuth2 next\n}\n';
+  /** sam merges maya's branch, which conflicts in src/users.ts only, and resolves that. */
+  const conflictedMerge = async () => {
+    expect((await gitAs(r.wtB, B, ['merge', 'agent-a'])).code).not.toBe(0);
+    write(r.wtB, 'src/users.ts', 'export const users = ["maya", "sam"];\n');
+    git(r.wtB, 'add', 'src/users.ts');
+  };
+
+  beforeAll(async () => {
+    hub = await startHub();
+    r = makeRepo();
+    // a longer file, so changes at its two ends merge without a conflict
+    write(r.main, 'src/config.ts', config('export const c0 = 0;', 'export const c9 = 9;'));
+    git(r.main, 'add', '-A');
+    git(r.main, 'commit', '-q', '-m', 'config');
+    for (const wt of [r.wtA, r.wtB]) git(wt, 'reset', '-q', '--hard', 'main');
+    init({ cwd: r.main, project: PROJECT, command: CLI_COMMAND, hooks: false, mcp: false, env: {} });
+    await client(hub.url, A).claim({ files: ['src/auth.ts', 'src/config.ts'], intent: 'Migrate login to OAuth2' });
+    // maya, who holds src/auth.ts, changes it and src/users.ts; sam changes src/users.ts too
+    write(r.wtA, 'src/auth.ts', MAYA_AUTH);
+    write(r.wtA, 'src/users.ts', 'export const users = ["maya"];\n');
+    expect((await gitAs(r.wtA, A, ['commit', '-qam', 'maya: auth, users'])).code).toBe(0);
+    write(r.wtB, 'src/users.ts', 'export const users = ["sam"];\n');
+    expect((await gitAs(r.wtB, B, ['commit', '-qam', 'sam: users'])).code).toBe(0);
+  });
+  afterAll(async () => {
+    await hub.close();
+    r.cleanup();
+  });
+
+  it("lets a merge through that brings in the holder's own change to a claimed file as it is", async () => {
+    await conflictedMerge();
+    const res = await gitAs(r.wtB, B, ['commit', '--no-edit']);
+    expect(res).toMatchObject({ code: 0, stderr: '' });
+    expect(git(r.wtB, 'show', 'HEAD:src/auth.ts')).toBe(MAYA_AUTH);
+    git(r.wtB, 'reset', '-q', '--hard', 'HEAD~1');
+  });
+
+  it("blocks a merge that leaves the holder's change to a claimed file out, or changes it, and doesn't advise unstaging", async () => {
+    const resolutions: Record<string, () => void> = {
+      'keeps this branch': () => git(r.wtB, 'checkout', 'HEAD', '--', 'src/auth.ts'),
+      'unstages it': () => git(r.wtB, 'restore', '--staged', 'src/auth.ts'),
+      'edits it': () => {
+        write(r.wtB, 'src/auth.ts', `${MAYA_AUTH}// sam was here\n`);
+        git(r.wtB, 'add', 'src/auth.ts');
+      },
+    };
+    for (const [how, resolve] of Object.entries(resolutions)) {
+      await conflictedMerge();
+      resolve();
+      const res = await gitAs(r.wtB, B, ['commit', '--no-edit']);
+      expect(res.code, how).not.toBe(0);
+      expect(res.stderr, how).toMatch(/hub guard: commit blocked[\s\S]*\n {2}src\/auth\.ts — claimed by maya\/claude-1 \(C-1\)/);
+      expect(res.stderr, how).not.toMatch(/src\/users\.ts/);
+      expect(res.stderr, how).toMatch(/git merge --abort/);
+      expect(res.stderr, how).not.toMatch(/restore --staged/);
+      git(r.wtB, 'reset', '-q', '--hard');
+    }
+    expect(git(r.wtB, 'log', '-1', '--format=%s').trim()).toBe('sam: users');
+  });
+
+  it('checks the merges git commits without a conflict (pre-merge-commit) the same way', async () => {
+    git(r.wtA, 'checkout', '-q', '-b', 'maya-2', 'main');
+    write(r.wtA, 'src/config.ts', config('export const c0 = "maya";', 'export const c9 = 9;'));
+    expect((await gitAs(r.wtA, A, ['commit', '-qam', 'maya: config'])).code).toBe(0);
+    // sam changed the other end of src/config.ts before maya claimed it
+    git(r.wtB, 'checkout', '-q', '-b', 'sam-2', 'main');
+    write(r.wtB, 'src/config.ts', config('export const c0 = 0;', 'export const c9 = "sam";'));
+    expect((await gitAs(r.wtB, B, ['commit', '-qam', 'sam: config'], { HUB_GUARD: 'off' })).code).toBe(0);
+
+    const combined = await gitAs(r.wtB, B, ['merge', '--no-edit', 'maya-2']);
+    expect(combined.code).not.toBe(0);
+    expect(combined.stderr).toMatch(/hub guard: commit blocked[\s\S]*src\/config\.ts — claimed by maya\/claude-1/);
+    expect(combined.stderr).toMatch(/git merge --no-verify/);
+    expect(git(r.wtB, 'log', '-1', '--format=%s').trim()).toBe('sam: config');
+    git(r.wtB, 'merge', '--abort');
+    expect((await gitAs(r.wtB, B, ['merge', '-q', '--no-edit', '--no-verify', 'maya-2'])).code).toBe(0);
+
+    // A merge that takes maya's change as it is goes through.
+    git(r.wtB, 'checkout', '-q', '-b', 'sam-3', 'main');
+    write(r.wtB, 'src/users.ts', 'export const users = ["sam", "lee"];\n');
+    expect((await gitAs(r.wtB, B, ['commit', '-qam', 'sam: users again'])).code).toBe(0);
+    const clean = await gitAs(r.wtB, B, ['merge', '-q', '--no-edit', 'maya-2']);
+    expect(clean).toMatchObject({ code: 0, stderr: '' });
+    expect(git(r.wtB, 'show', 'HEAD:src/config.ts')).toContain('export const c0 = "maya";');
   });
 });

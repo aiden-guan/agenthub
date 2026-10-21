@@ -11,7 +11,7 @@ import {
   upstreamTeamConfig,
   type ConfigFile,
 } from './config.js';
-import { deriveProject, git, recordedSettings } from './git.js';
+import { deriveProject, git, realish, recordedSettings } from './git.js';
 
 export interface InitOptions {
   cwd: string;
@@ -40,6 +40,12 @@ const GUARD_MARKER = '# agenthub-guard';
 const CHAINED_SUFFIX = '.pre-agenthub';
 /** In the worktree's git dir: the pid of the `git commit` whose pre-commit ran the guard, so its prepare-commit-msg doesn't ask again. */
 const CHECKED_FILE = 'agenthub-pre-commit';
+/** In the repository's git dir: the guard hooks, for the hooks core.hooksPath points git at to call. */
+const CALLED_HOOKS_DIR = 'agenthub-hooks';
+/** The line that runs the guard from such a hook. It does nothing in a checkout where hub init hasn't run. */
+export const HOOKS_PATH_LINE =
+  `agenthub_guard="$(git rev-parse --git-common-dir)/${CALLED_HOOKS_DIR}/$(basename "$0")"; ` +
+  'if [ -x "$agenthub_guard" ]; then "$agenthub_guard" "$@" || exit $?; fi';
 
 /**
  * `hub init` — set up the current worktree:
@@ -51,11 +57,14 @@ const CHECKED_FILE = 'agenthub-pre-commit';
  *    SubagentStop, UserPromptSubmit and SessionEnd (`hub hook settle`)
  *  - `.mcp.json` entry for the `hub mcp` server
  *  - the git guard, as pre-commit, as prepare-commit-msg (for the commits git
- *    revert, cherry-pick and rebase make without pre-commit) and as
- *    pre-applypatch (git am, git rebase --apply); existing hooks are kept and chained
+ *    revert, cherry-pick and rebase make without pre-commit), as
+ *    pre-merge-commit (merges git commits itself) and as pre-applypatch
+ *    (git am, git rebase --apply); existing hooks are kept and chained. Where
+ *    core.hooksPath sends git to other hooks, those are left alone (see below)
  *  - the project id and hub URL in the repository's git config, which every
  *    worktree shares, for checkouts whose branch has no agenthub.json yet
- * Safe to run again; it only adds what's missing.
+ * Safe to run again; it only adds what's missing, and replaces its own hook
+ * entries written with another --command.
  */
 export function init(opts: InitOptions): string[] {
   const root = git(opts.cwd, ['rev-parse', '--show-toplevel']);
@@ -173,14 +182,24 @@ export function init(opts: InitOptions): string[] {
     }
   }
 
-  // 5. git guard
+  // 5. git guard, in the repository's own hooks directory. Where core.hooksPath sends git elsewhere
+  // (husky's generated .husky/_, a directory the team tracks, a global one every repository runs),
+  // those hooks aren't hub init's to change: the guard goes where they can call it, and a note says how.
   if (opts.guard !== false) {
-    const hooksDir = git(root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']);
-    if (!hooksDir) throw new Error('could not locate the git hooks directory');
+    const common = git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+    const runs = git(root, ['rev-parse', '--path-format=absolute', '--git-path', 'hooks']);
+    if (!common || !runs) throw new Error('could not locate the git hooks directory');
+    const own = path.join(common, 'hooks');
+    const elsewhere = realish(runs) !== realish(own);
+    const hooksDir = elsewhere ? path.join(common, CALLED_HOOKS_DIR) : own;
     mkdirSync(hooksDir, { recursive: true });
-    installGitHook(hooksDir, 'pre-commit', guardScript(command), report);
-    installGitHook(hooksDir, 'prepare-commit-msg', sequencerGuardScript(command), report);
-    installGitHook(hooksDir, 'pre-applypatch', applyPatchGuardScript(command), report);
+    const installed: string[] = [];
+    for (const [name, script] of guardHooks(command)) installGitHook(hooksDir, name, script, installed);
+    if (!elsewhere) report.push(...installed);
+    else {
+      if (installed.length) report.push(`wrote the git guard to ${hooksDir}`);
+      notes.push(...hooksPathNotes(root, runs, own, hooksDir));
+    }
   }
 
   // A token in the environment looks as if it went everywhere: say now if it doesn't go to this hub.
@@ -202,6 +221,38 @@ function siblingTeamConfig(root: string): ConfigFile | null {
   const projects = [...new Set(found.map((f) => f.project))];
   if (projects.length > 1) throw new Error(`the worktrees' ${TEAM_CONFIG_FILE_NAME} files name different projects (${projects.join(', ')}); run hub init --project ID`);
   return found.find((f) => f.url) ?? found[0] ?? null;
+}
+
+/** The guard hooks hub init installs, by git hook name. */
+function guardHooks(command: string): Array<[name: string, script: string]> {
+  return [
+    ['pre-commit', guardScript(command)],
+    ['prepare-commit-msg', sequencerGuardScript(command)],
+    ['pre-merge-commit', mergeGuardScript(command)],
+    ['pre-applypatch', applyPatchGuardScript(command)],
+  ];
+}
+
+/** What to say when core.hooksPath (`runs`) means git doesn't run the guard hub init put in `installed`. */
+function hooksPathNotes(root: string, runs: string, own: string, installed: string): string[] {
+  const m = /^(\w+)\t(.*)$/.exec(git(root, ['config', '--show-scope', '--get', 'core.hooksPath']) ?? '');
+  const where = m ? `core.hooksPath (${m[2]}, set in the ${m[1]} git config)` : `core.hooksPath (${runs})`;
+  const notes = [
+    `note: git runs hooks from ${where}, not from ${own}. hub init leaves those alone (a hook manager, your team or other repositories may use them) ` +
+      `and put the guard in ${installed}, which git does not run by itself. To turn it on, add this line near the top of your pre-commit, prepare-commit-msg, ` +
+      `pre-merge-commit and pre-applypatch hooks (with husky: .husky/pre-commit and so on); it does nothing in a checkout where hub init has not run: ${HOOKS_PATH_LINE}`,
+  ];
+  const stale = guardHooks('hub')
+    .map(([name]) => path.join(runs, name))
+    .filter((f) => existsSync(f) && readFileSync(f, 'utf8').includes(GUARD_MARKER));
+  if (stale.length) {
+    const undo = stale.map((f) => (existsSync(f + CHAINED_SUFFIX) ? `move ${f}${CHAINED_SUFFIX} back to ${f}` : `delete ${f}`));
+    notes.push(
+      `note: ${stale.join(', ')} ${stale.length > 1 ? 'are guards' : 'is a guard'} an older hub init installed there, which every checkout that uses ${runs} runs. ` +
+        `To undo that, ${undo.join('; ')}.`,
+    );
+  }
+  return notes;
 }
 
 /** Write a guard hook; a hook of the user's already there is kept and chained after it. */
@@ -254,11 +305,22 @@ fail_closed() {
   return "$fc"
 }`;
 
+/**
+ * Run the hook hub init found (kept as <name>.pre-agenthub) the way git would
+ * have, under its own name: some hooks (husky 4's, yorkie's) pick what to run
+ * from it. So a shell script is read by its shell with $0 set to that name.
+ * Anything else, or a symlink (whose target the hook may find through $0), is
+ * run as it is.
+ */
 const chainSh = (name: string): string => `chained="$(dirname "$0")/${name}${CHAINED_SUFFIX}"
-if [ -x "$chained" ]; then
-  exec "$chained" "$@"
-fi
-exit 0
+[ -x "$chained" ] || exit 0
+first=
+[ -L "$chained" ] || IFS= read -r first < "$chained"
+case "$first" in
+  '#!'*[/\\ ]sh | '#!'*[/\\ ]sh\\ * | '#!'*[/\\ ]bash | '#!'*[/\\ ]bash\\ * | '#!'*[/\\ ]dash | '#!'*[/\\ ]dash\\ *)
+    exec \${first#??} -c '__agenthub_hook=$1; shift; . "$__agenthub_hook"' "$(dirname "$0")/${name}" "$chained" "$@" ;;
+esac
+exec "$chained" "$@"
 `;
 
 export function guardScript(command: string): string {
@@ -311,6 +373,24 @@ fi
 ${chainSh('prepare-commit-msg')}`;
 }
 
+/**
+ * pre-merge-commit: git merge commits a merge without conflicts without running
+ * pre-commit. It runs this before it writes MERGE_HEAD: `--merge` tells the
+ * guard to find the merged commits elsewhere (see mergeHeads).
+ */
+export function mergeGuardScript(command: string): string {
+  return `#!/bin/sh
+${GUARD_MARKER} (installed by \`hub init\`)
+# git merge commits a merge without conflicts without running pre-commit; this
+# checks what the merge itself changes against other agents' exclusive claims.
+# Bypass in an emergency: git merge --no-verify   or   HUB_GUARD=off git merge
+
+${FAIL_CLOSED_SH}
+
+${runGuardSh(command, ' --merge')}
+${chainSh('pre-merge-commit')}`;
+}
+
 /** pre-applypatch: git am, and git rebase --apply through it, commit each patch without pre-commit or prepare-commit-msg. */
 export function applyPatchGuardScript(command: string): string {
   return `#!/bin/sh
@@ -336,17 +416,34 @@ function missingTools(matcher: string | undefined, tools: string[]): string[] {
 }
 
 /**
- * Add the hook unless it's there. An entry from an older `hub init` gets the
- * `onFailure` it lacks (an explicit choice is kept), and one whose group's
- * matcher misses a file-writing tool (NotebookEdit) moves to `matcher`: the
- * whole group if the entry is alone in it, else into a group of its own.
+ * Add the hook unless it's there. An entry an earlier `hub init` wrote with
+ * another --command (one that runs the same `hook <name>` subcommand) is
+ * updated to `command`, and any more of them are removed, so the hook runs
+ * once. An entry from an older `hub init` gets the `onFailure` it lacks (an
+ * explicit choice is kept), and one whose group's matcher misses a
+ * file-writing tool (NotebookEdit) moves to `matcher`: the whole group if the
+ * entry is alone in it, else into a group of its own.
  */
 function addHook(hooks: Record<string, HookGroup[]>, event: string, matcher: string | undefined, command: string, onFailure?: 'block'): boolean {
   const groups = (hooks[event] ??= []);
-  const holder = groups.find((g) => (g.hooks ?? []).some((h) => h.command === command));
-  if (holder) {
-    const existing = holder.hooks.find((h) => h.command === command)!;
-    let changed = false;
+  const subcommand = command.slice(command.lastIndexOf(' hook '));
+  const ours = groups.flatMap((g) =>
+    (g.hooks ?? []).filter((h) => typeof h?.command === 'string' && h.command.endsWith(subcommand)).map((h) => ({ group: g, entry: h })),
+  );
+  const kept = ours.find((o) => o.entry.command === command) ?? ours[0];
+  let changed = false;
+  for (const o of ours) {
+    if (o === kept) continue;
+    o.group.hooks = o.group.hooks.filter((h) => h !== o.entry);
+    if (o.group.hooks.length === 0) groups.splice(groups.indexOf(o.group), 1);
+    changed = true;
+  }
+  if (kept) {
+    const { group: holder, entry: existing } = kept;
+    if (existing.command !== command) {
+      existing.command = command;
+      changed = true;
+    }
     if (onFailure && existing.onFailure === undefined) {
       existing.onFailure = onFailure;
       changed = true;

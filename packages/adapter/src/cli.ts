@@ -12,7 +12,7 @@ Agent integration
   hub hook post-edit         Claude Code PostToolUse hook: confirm the claim of an edit that ran
   hub hook settle            Claude Code Stop/SubagentStop/UserPromptSubmit/SessionEnd hook: release claims of edits that never ran
   hub hook digest            Claude Code SessionStart hook: team state as additionalContext
-  hub guard                  git pre-commit hook (also prepare-commit-msg for revert/cherry-pick/rebase, pre-applypatch for am):
+  hub guard                  git pre-commit hook (also prepare-commit-msg for revert/cherry-pick/rebase, pre-merge-commit for merges, pre-applypatch for am):
                              reject commits touching files others hold exclusively
   hub init [--agent human/agent] [--project ID] [--url URL] [--command CMD] [--no-hooks] [--no-mcp] [--no-guard]
                              Write .hub.json, .claude/settings.json hooks, .mcp.json and the pre-commit guard
@@ -68,7 +68,7 @@ async function main(argv: string[]): Promise<void> {
     }
     case 'guard': {
       const { guard } = await import('./guard.js');
-      return finish(await guard({ cwd: process.cwd(), env: process.env, sequencer: rest.includes('--sequencer') }));
+      return finish(await guard({ cwd: process.cwd(), env: process.env, sequencer: rest.includes('--sequencer'), merge: rest.includes('--merge') }));
     }
     case 'init': {
       const { values } = parseArgs({
