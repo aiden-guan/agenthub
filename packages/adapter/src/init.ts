@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   AGENT_ID_RE,
@@ -38,6 +38,8 @@ const EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit'];
 const SETTLE_EVENTS = ['Stop', 'SubagentStop', 'UserPromptSubmit', 'SessionEnd'];
 const GUARD_MARKER = '# agenthub-guard';
 const CHAINED_SUFFIX = '.pre-agenthub';
+/** Next to a kept hook: a link to it under its own name, so it runs as that name (see chainSh). */
+const NAMED_DIR = 'agenthub-chained';
 /** In the worktree's git dir: the pid of the `git commit` whose pre-commit ran the guard, so its prepare-commit-msg doesn't ask again. */
 const CHECKED_FILE = 'agenthub-pre-commit';
 /** In the repository's git dir: the guard hooks, for the hooks core.hooksPath points git at to call. */
@@ -259,16 +261,41 @@ function hooksPathNotes(root: string, runs: string, own: string, installed: stri
 function installGitHook(hooksDir: string, name: string, script: string, report: string[]): void {
   const hookPath = path.join(hooksDir, name);
   const current = existsSync(hookPath) ? readFileSync(hookPath, 'utf8') : null;
-  if (current === script) return;
-  if (current !== null && !current.includes(GUARD_MARKER)) {
-    const chained = path.join(hooksDir, `${name}${CHAINED_SUFFIX}`);
-    if (existsSync(chained)) throw new Error(`${hookPath} exists and ${chained} too; merge them by hand`);
-    renameSync(hookPath, chained);
-    report.push(`kept your existing ${name} hook as ${name}${CHAINED_SUFFIX} (runs after the guard)`);
+  let kept = false;
+  if (current !== script) {
+    if (current !== null && !current.includes(GUARD_MARKER)) {
+      const chained = path.join(hooksDir, `${name}${CHAINED_SUFFIX}`);
+      if (existsSync(chained)) throw new Error(`${hookPath} exists and ${chained} too; merge them by hand`);
+      renameSync(hookPath, chained);
+      report.push(`kept your existing ${name} hook as ${name}${CHAINED_SUFFIX} (runs after the guard)`);
+      kept = true;
+    }
+    writeFileSync(hookPath, script);
+    chmodSync(hookPath, 0o755);
+    report.push(`installed ${name} guard at ${hookPath}`);
   }
-  writeFileSync(hookPath, script);
-  chmodSync(hookPath, 0o755);
-  report.push(`installed ${name} guard at ${hookPath}`);
+  // Also for a hook an older hub init kept without the link.
+  if (linkChained(hooksDir, name) && !kept) report.push(`linked your ${name} hook (kept as ${name}${CHAINED_SUFFIX}) as ${NAMED_DIR}/${name}, so it runs under its own name`);
+}
+
+/** Link a kept hook as NAMED_DIR/<name>; true if the link is new. Where there are no symlinks it runs as <name>.pre-agenthub. */
+function linkChained(hooksDir: string, name: string): boolean {
+  if (!lstatSync(path.join(hooksDir, `${name}${CHAINED_SUFFIX}`), { throwIfNoEntry: false })) return false;
+  const link = path.join(hooksDir, NAMED_DIR, name);
+  const target = path.join('..', `${name}${CHAINED_SUFFIX}`);
+  try {
+    if (readlinkSync(link) === target) return false;
+  } catch {
+    // not there yet, or not a link
+  }
+  try {
+    mkdirSync(path.dirname(link), { recursive: true });
+    rmSync(link, { force: true });
+    symlinkSync(target, link);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** POSIX sh that runs the guard and handles a CLI that can't start (exit 127) as fail-closed says. */
@@ -307,10 +334,12 @@ fail_closed() {
 
 /**
  * Run the hook hub init found (kept as <name>.pre-agenthub) the way git would
- * have, under its own name: some hooks (husky 4's, yorkie's) pick what to run
- * from it. So a shell script is read by its shell with $0 set to that name.
- * Anything else, or a symlink (whose target the hook may find through $0), is
- * run as it is.
+ * have, under its own name: some hooks (husky 4's, yorkie's, dispatchers,
+ * overcommit's) pick what to run from it. So a shell script is read by its
+ * shell with $0 set to that name. Anything else (another language, a binary,
+ * or a symlink, whose target the hook may find through $0) runs through the
+ * link hub init made to it in agenthub-chained/, which has that name, or as it
+ * is where there is no such link.
  */
 const chainSh = (name: string): string => `chained="$(dirname "$0")/${name}${CHAINED_SUFFIX}"
 [ -x "$chained" ] || exit 0
@@ -320,6 +349,8 @@ case "$first" in
   '#!'*[/\\ ]sh | '#!'*[/\\ ]sh\\ * | '#!'*[/\\ ]bash | '#!'*[/\\ ]bash\\ * | '#!'*[/\\ ]dash | '#!'*[/\\ ]dash\\ *)
     exec \${first#??} -c '__agenthub_hook=$1; shift; . "$__agenthub_hook"' "$(dirname "$0")/${name}" "$chained" "$@" ;;
 esac
+named="$(dirname "$0")/${NAMED_DIR}/${name}"
+[ "$named" -ef "$chained" ] && exec "$named" "$@"
 exec "$chained" "$@"
 `;
 
