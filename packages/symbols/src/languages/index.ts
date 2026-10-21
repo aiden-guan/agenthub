@@ -2,7 +2,11 @@
 
 import type { LanguageSpec } from '../spec.js';
 import type { LanguageId } from '../types.js';
+import { go } from './go.js';
+import { java } from './java.js';
 import { javascript } from './javascript.js';
+import { python } from './python.js';
+import { rust } from './rust.js';
 import { tsx, typescript } from './typescript.js';
 
 const EXTENSIONS: Readonly<Record<string, LanguageId>> = {
@@ -30,4 +34,4 @@ export function languageFor(path: string): LanguageId | null {
 }
 
 /** The outline table per language. */
-export const SPECS: Partial<Record<LanguageId, LanguageSpec>> = { typescript, tsx, javascript };
+export const SPECS: Partial<Record<LanguageId, LanguageSpec>> = { typescript, tsx, javascript, python, go, rust, java };

@@ -20,7 +20,10 @@
 // - A container's text is its shell (see `shellText`).
 // - Errors: `contained` when every ERROR or MISSING node lies inside the body of
 //   a keyed declaration (the innermost such key is recorded), `uncontained`
-//   otherwise.
+//   otherwise. A table names the body as a node, or as the children of a node
+//   from an offset on (`Decl.region`).
+// - A comment's span ends at its last non-whitespace character (the Rust
+//   grammar ends a line comment after its newline).
 
 import { IMPORTS, TOPLEVEL, isValidSymbolKey } from '@agenthub/contract';
 import type { Node } from 'web-tree-sitter';
@@ -28,6 +31,7 @@ import { SymbolsError } from './errors.js';
 import { SPECS } from './languages/index.js';
 import { signatureText } from './signatures.js';
 import type { Decl, LanguageSpec } from './spec.js';
+import { blankLineBetween, lineStarts, sameLine, trimEnd } from './text.js';
 import type { GrammarRuntime } from './runtime.js';
 import type { Item, LanguageId, Outline } from './types.js';
 
@@ -52,6 +56,8 @@ interface Ctx {
   lines: number[];
   /** Body node id → the key of the declaration it belongs to, for error containment. */
   bodies: Map<number, string>;
+  /** Node id → the key whose body its children from `from` on are (`Decl.region`). */
+  regions: Map<number, { from: number; key: string }>;
 }
 
 /** One stretch of a scope: a declaration's item, an import group, or other content. */
@@ -66,7 +72,7 @@ interface Element {
 }
 
 export function extract(root: Node, src: string, spec: LanguageSpec): Outline {
-  const ctx: Ctx = { src, spec, lines: lineStarts(src), bodies: new Map() };
+  const ctx: Ctx = { src, spec, lines: lineStarts(src), bodies: new Map(), regions: new Map() };
   const items: Item[] = [];
   for (const el of scanScope(root, 'top', null, ctx)) {
     if (el.kind === 'item') {
@@ -93,17 +99,33 @@ export function extract(root: Node, src: string, spec: LanguageSpec): Outline {
       });
     }
   }
-  return { language: spec.id, items, ...classifyErrors(root, ctx.bodies) };
+  return { language: spec.id, items, ...classifyErrors(root, ctx) };
 }
 
-function scanScope(parent: Node, scope: string, prefix: string | null, ctx: Ctx): Element[] {
+/** The children of `parent` a scope scan visits: non-empty, from `from` on, with transparent nodes replaced by theirs. */
+function scopeChildren(parent: Node, spec: LanguageSpec, from: number | undefined): Node[] {
+  const out: Node[] = [];
+  const add = (node: Node, floor: number | undefined): void => {
+    for (const c of node.children) {
+      if (c.endIndex <= c.startIndex || (floor !== undefined && c.startIndex < floor)) continue;
+      if (spec.transparent?.has(c.type)) add(c, undefined);
+      else out.push(c);
+    }
+  };
+  add(parent, from);
+  return out;
+}
+
+function scanScope(parent: Node, scope: string, prefix: string | null, ctx: Ctx, from?: number): Element[] {
   const { src, spec } = ctx;
-  const children = parent.children.filter((c) => c.endIndex > c.startIndex);
+  const children = scopeChildren(parent, spec, from);
   const out: Element[] = [];
   let pending: Node[] = [];
   let pendingDecorator = false;
+  /** A node's end, a comment's trimmed of trailing whitespace. */
+  const endOf = (n: Node): number => (spec.comments.has(n.type) ? trimEnd(src, n.startIndex, n.endIndex) : n.endIndex);
   const flush = (): void => {
-    if (pending.length > 0) out.push({ kind: 'other', start: pending[0]!.startIndex, end: pending[pending.length - 1]!.endIndex });
+    if (pending.length > 0) out.push({ kind: 'other', start: pending[0]!.startIndex, end: endOf(pending[pending.length - 1]!) });
     pending = [];
     pendingDecorator = false;
   };
@@ -119,7 +141,7 @@ function scanScope(parent: Node, scope: string, prefix: string | null, ctx: Ctx)
 
     if (cls.type === 'comment') {
       if (pending.length === 0 && prev && sameLine(src, prev.end, c.startIndex) && !leadsNext(children, i, ctx)) {
-        prev.end = c.endIndex;
+        prev.end = endOf(c);
         continue;
       }
       detachIfBlank(c);
@@ -168,13 +190,14 @@ function buildItem(el: Element, ctx: Ctx): Item {
   let members: Item[] = [];
   let text: string;
   if (d.members) {
-    const inner = scanScope(d.members.node, d.members.scope, key, ctx);
+    const inner = scanScope(d.members.node, d.members.scope, key, ctx, d.members.from);
     members = inner.filter((e) => e.kind === 'item').map((e) => buildItem(e, ctx));
-    text = shellText(el, d.members.node, inner, ctx.src);
+    text = shellText(el, d.members.node, d.members.from ?? d.members.node.startIndex, inner, ctx.src);
   } else {
     text = (d.textPrefix ?? '') + ctx.src.slice(el.start, el.end);
   }
   if (d.body) ctx.bodies.set(d.body.id, key);
+  if (d.region) ctx.regions.set(d.region.node.id, { from: d.region.from, key });
   return {
     key,
     kind: d.kind,
@@ -199,13 +222,13 @@ function buildItem(el: Element, ctx: Ctx): Item {
  * whitespace between them, leaves the shell alone, while any other change to
  * the container, or moving a piece across a member, changes it.
  */
-function shellText(el: Element, body: Node, inner: Element[], src: string): string {
+function shellText(el: Element, body: Node, bodyStart: number, inner: Element[], src: string): string {
   let lo = 0;
   let hi = inner.length;
-  let headerEnd = body.startIndex;
+  let headerEnd = bodyStart;
   let footerStart = body.endIndex;
   const first = inner[0];
-  if (first && first.kind === 'other' && first.delimiter && first.start === body.startIndex) {
+  if (first && first.kind === 'other' && first.delimiter && first.start === bodyStart) {
     headerEnd = first.end;
     lo = 1;
   }
@@ -225,7 +248,8 @@ function shellText(el: Element, body: Node, inner: Element[], src: string): stri
   return parts.filter((p) => p !== '').join(' ');
 }
 
-function classifyErrors(root: Node, bodies: Map<number, string>): Pick<Outline, 'errors' | 'errorKeys'> {
+function classifyErrors(root: Node, ctx: Ctx): Pick<Outline, 'errors' | 'errorKeys'> {
+  const { bodies, regions } = ctx;
   if (!root.hasError) return { errors: 'none', errorKeys: [] };
   const errorKeys: string[] = [];
   let uncontained = false;
@@ -238,22 +262,17 @@ function classifyErrors(root: Node, bodies: Map<number, string>): Pick<Outline, 
       else if (!errorKeys.includes(key)) errorKeys.push(key);
       continue;
     }
+    const region = regions.get(node.id);
     const children = node.children;
     for (let i = children.length - 1; i >= 0; i--) {
       const c = children[i]!;
-      if (c.hasError) stack.push({ node: c, key });
+      if (c.hasError) stack.push({ node: c, key: region && c.startIndex >= region.from ? region.key : key });
     }
   }
   return { errors: uncontained ? 'uncontained' : 'contained', errorKeys };
 }
 
 // ------------------------------------------------------------------ text helpers
-
-function lineStarts(src: string): number[] {
-  const starts = [0];
-  for (let i = src.indexOf('\n'); i !== -1; i = src.indexOf('\n', i + 1)) starts.push(i + 1);
-  return starts;
-}
 
 /** 1-based line of a UTF-16 offset. */
 function lineOf(ctx: Ctx, offset: number): number {
@@ -266,16 +285,6 @@ function lineOf(ctx: Ctx, offset: number): number {
     else hi = mid - 1;
   }
   return lo + 1;
-}
-
-/** No line break between `a` (an end) and `b` (a start). */
-function sameLine(src: string, a: number, b: number): boolean {
-  return src[a - 1] !== '\n' && !src.slice(a, b).includes('\n');
-}
-
-function blankLineBetween(src: string, a: number, b: number): boolean {
-  const gap = (src[a - 1] === '\n' ? '\n' : '') + src.slice(a, b);
-  return /\n[^\S\n]*\n/.test(gap);
 }
 
 /** The comment at `i` shares its line with the next non-comment node, which it then leads. */

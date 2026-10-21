@@ -230,8 +230,9 @@ describe('the TypeScript fixture', () => {
     expect(await sig(tall, 'load')).toBe(await sig(flat, 'load'));
     // A real change (here, a parameter type) does change it.
     expect(await sig(flat.replace('id: string', 'id: number'), 'load')).not.toBe(await sig(flat, 'load'));
-    // String literals keep their inner spacing; the cap is 500 characters.
+    // String literals keep their inner spacing, and a word before one keeps its space; the cap is 500 characters.
     expect(await sig("function f(a = 'x  y'): void {}", 'f')).toBe("function f(a = 'x  y'): void");
+    expect(await sig('function isA(x: unknown): x is "a" { return true; }', 'isA')).toBe('function isA(x: unknown): x is "a"');
     const long = `interface Big { ${Array.from({ length: 200 }, (_, i) => `field${i}: string;`).join(' ')} }`;
     const big = (await sig(long, 'Big'))!;
     expect(big.length).toBe(500);

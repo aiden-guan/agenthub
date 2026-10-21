@@ -3,7 +3,8 @@
 // §2.5). The interface is frozen in ./types.ts.
 //
 // S1: MAPPER_VERSION, languageFor and outline (TypeScript, TSX, JavaScript).
-// The rest is implemented by steps S2–S4 and throws until then.
+// S2: outline for Python, Go, Rust and Java.
+// The rest is implemented by steps S3–S4 and throws until then.
 
 import { languageFor as languageOf } from './languages/index.js';
 import { outlineWith } from './outline.js';

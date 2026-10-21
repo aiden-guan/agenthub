@@ -3,17 +3,15 @@
 // fixed spacing rule, at most 500 characters. Because the spacing comes from
 // the tokens and never from the source, a whitespace-only or comment-only
 // change keeps a signature byte for byte, while any token change alters it.
+// A language can refine the spacing (`LanguageSpec.space`), from the tokens'
+// node types alone, so that stays true.
 
 import type { Node } from 'web-tree-sitter';
-import type { LanguageSpec, SignatureSpec } from './spec.js';
+import type { LanguageSpec, SigToken, SignatureSpec } from './spec.js';
 
 export const MAX_SIGNATURE = 500;
 
-interface Token {
-  text: string;
-  /** An anonymous word token: a keyword such as `function`, `async`, `func`. */
-  keyword: boolean;
-}
+type Token = SigToken;
 
 const WORD = /[\p{L}\p{N}_$]/u;
 const KEYWORD = /^[A-Za-z_]+$/;
@@ -26,6 +24,7 @@ const SPACED = new Set(['=', '=>', '->', '|', '||', '&&', '??', '==', '!=', '===
 /** A `?` followed by one of these marks an optional item (`a?: T`), not a conditional. */
 const OPTIONAL_FOLLOWERS = new Set([':', '.', ')', ',', '=', ']', ';', '>']);
 const CLOSERS = new Set([')', ']', '>', '}', '"', "'", '`']);
+const QUOTES = new Set(['"', "'", '`']);
 
 /** The normalized signature `spec` describes in `source`, or null when it has no tokens. */
 export function signatureText(source: string, spec: SignatureSpec, lang: LanguageSpec): string | null {
@@ -36,16 +35,16 @@ export function signatureText(source: string, spec: SignatureSpec, lang: Languag
     let pos = start;
     const gap = (upTo: number): void => {
       const text = source.slice(pos, upTo).trim();
-      if (text !== '') tokens.push({ text: text.replace(/\s+/g, ' '), keyword: false });
+      if (text !== '') tokens.push({ text: text.replace(/\s+/g, ' '), keyword: false, type: '', parent: '' });
     };
-    walkTokens(spec.node, start, end, lang, (s, e, skip, named) => {
+    walkTokens(spec.node, start, end, lang, (s, e, skip, named, type, parent) => {
       if (budget <= 0) return false;
       if (s < pos) return true;
       gap(s);
       pos = Math.min(e, end);
       if (skip || e <= s) return true;
       const text = source.slice(s, e);
-      tokens.push({ text, keyword: KEYWORD.test(text) && !named() });
+      tokens.push({ text, keyword: KEYWORD.test(text) && !named(), type, parent });
       budget -= text.length + 1;
       return true;
     });
@@ -53,22 +52,24 @@ export function signatureText(source: string, spec: SignatureSpec, lang: Languag
   }
   while (tokens.length > 0 && (tokens[tokens.length - 1]!.text === ';' || tokens[tokens.length - 1]!.text === ',')) tokens.pop();
   if (tokens.length === 0) return null;
-  return truncate(join(tokens, lang.binaryOps));
+  return truncate(join(tokens, lang));
 }
 
 /**
  * Visit the tokens of `root` that overlap [start, end), in source order: leaves,
- * atoms (taken whole) and skipped nodes (comments, decorators: `skip` true), with
- * a tree cursor so no Node objects are made. `emit` returns false to stop.
+ * atoms (taken whole) and skipped nodes (comments, decorators: `skip` true), each
+ * with its node type and its parent's, with a tree cursor so no Node objects are
+ * made. `emit` returns false to stop.
  */
 function walkTokens(
   root: Node,
   start: number,
   end: number,
   lang: LanguageSpec,
-  emit: (s: number, e: number, skip: boolean, named: () => boolean) => boolean,
+  emit: (s: number, e: number, skip: boolean, named: () => boolean, type: string, parent: string) => boolean,
 ): void {
   const cur = root.walk();
+  const parents: string[] = [];
   try {
     const named = (): boolean => cur.nodeIsNamed;
     for (;;) {
@@ -78,22 +79,26 @@ function walkTokens(
         const type = cur.nodeType;
         const skip = lang.comments.has(type) || lang.sigSkip.has(type);
         if (skip || lang.atoms.has(type) || !cur.gotoFirstChild()) {
-          if (!emit(s, cur.endIndex, skip, named)) return;
+          if (!emit(s, cur.endIndex, skip, named, type, parents[parents.length - 1] ?? '')) return;
         } else {
+          parents.push(type);
           continue; // now on the first child
         }
       }
-      while (!cur.gotoNextSibling()) if (!cur.gotoParent()) return;
+      while (!cur.gotoNextSibling()) {
+        if (!cur.gotoParent()) return;
+        parents.pop();
+      }
     }
   } finally {
     cur.delete();
   }
 }
 
-function join(tokens: Token[], binaryOps: ReadonlySet<string>): string {
+function join(tokens: Token[], lang: LanguageSpec): string {
   let out = tokens[0]!.text;
   for (let i = 1; i < tokens.length; i++) {
-    if (spaceBefore(tokens, i, binaryOps)) out += ' ';
+    if (lang.space?.(tokens[i - 1]!, tokens[i]!) ?? spaceBefore(tokens, i, lang.binaryOps)) out += ' ';
     out += tokens[i]!.text;
   }
   return out;
@@ -121,6 +126,7 @@ function spaceBefore(tokens: Token[], i: number, binaryOps: ReadonlySet<string>)
   if (b === '{') return true; // `interface I {`, `enum E {`
   if (a === ',' || a === ';' || a === ':') return true;
   if (WORD.test(la) && WORD.test(fb)) return true;
+  if (WORD.test(la) && QUOTES.has(fb)) return true; // `default ""`, `x is "a"`, a Go struct tag
   if (CLOSERS.has(la) && WORD.test(fb)) return true; // `) Refresh`, `> extends`, `] args`
   if (a === ')' && b === '(') return true; // Go results: `() (int, error)`
   if (b === '@') return true;
