@@ -163,6 +163,41 @@ describe('feed heartbeat period', () => {
     expect((await other.getClaim(claim.id)).status).toBe('active');
   });
 
+  it('hears a claim made elsewhere while the WebSocket is down, in time to heartbeat it', async () => {
+    // TTL 6 s: the hub wants a heartbeat every 1500 ms; this lease lasts 600 ms and is made right after one.
+    const srv = await hubAt({ leaseTtlMs: 6000 });
+    const raw = client(srv.url, A);
+    const broken = Object.create(raw) as HubClient;
+    broken.feedUrl = () => 'ws://127.0.0.1:9/feed';
+    const feed = new Feed(broken, { info: { client: 'mcp' } });
+    feed.start();
+    cleanups.push(() => feed.stop());
+    await until(() => feed.heartbeatsSent >= 1);
+    await sleep(100); // its long-poll is waiting by now
+    const other = client(srv.url, A); // the same agent, another process (the edit hook)
+    const claim = (await other.claim({ files: ['src/hook.ts'], intent: 'edit', ttl_ms: 600 })).claim!;
+    await sleep(2500);
+    expect(feed.connected).toBe(false);
+    expect((await other.getClaim(claim.id)).status).toBe('active');
+  });
+
+  it('wakes a wait from its long-poll while the WebSocket is down', async () => {
+    const srv = await hubAt();
+    const raw = client(srv.url, A);
+    const broken = Object.create(raw) as HubClient;
+    broken.feedUrl = () => 'ws://127.0.0.1:9/feed';
+    const feed = new Feed(broken, { info: { client: 'mcp' } });
+    feed.start();
+    cleanups.push(() => feed.stop());
+    await until(() => feed.heartbeatsSent >= 1);
+    const since = (await raw.status()).seq;
+    setTimeout(() => void client(srv.url, B).post('#general', 'hello'), 300);
+    const t0 = Date.now();
+    const got = await feed.waitFor(since, (e) => e.type === 'message.posted', 5000);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(got.events.map((e) => e.type)).toEqual(['message.posted']);
+  });
+
   it('heartbeats at once at the interval of a claim it was just given', async () => {
     const srv = await hubAt({ leaseTtlMs: 6000 });
     const raw = client(srv.url, A);
@@ -477,6 +512,20 @@ describe('feed epochs and cursors', () => {
     const feed = new Feed(client(fake.url, A));
     expect(await feed.waitFor(40, () => true, 1000)).toEqual({ events: [], restarted: true });
     expect(fake.polled).toEqual(['40']);
+  });
+
+  it('keeps its cursor at 0 on a hub with no events yet, instead of starting again from whatever is latest', async () => {
+    // Without `since` the hub answers from its latest event: nothing, ever, here. Event 1 is there only for since=0.
+    const fake = await fakeFeedHub({ hello: () => ({}), events: (since) => (since === null ? { events: [], seq: 0, epoch: 'db-1' } : since === '0' ? { events: [message(1)], seq: 1, epoch: 'db-1' } : null) });
+    const raw = client(fake.url, A);
+    const broken = Object.create(raw) as HubClient;
+    broken.feedUrl = () => 'ws://127.0.0.1:9/feed';
+    const feed = new Feed(broken, { info: { client: 'mcp' } });
+    feed.start();
+    cleanups.push(() => feed.stop());
+    const got = await feed.waitFor(0, () => true, 3000);
+    expect(got.events.map((e) => e.seq)).toEqual([1]);
+    expect(fake.polled.slice(0, 2)).toEqual([null, '0']);
   });
 
   it("stops a long-poll that the socket's coming back makes moot", async () => {

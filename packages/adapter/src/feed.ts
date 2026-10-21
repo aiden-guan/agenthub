@@ -35,8 +35,9 @@ const validMs = (v: unknown): v is number => typeof v === 'number' && Number.isF
  * process:
  *  - keeps a WebSocket to the project feed open (reconnecting with backoff and
  *    replaying missed events by sequence number), buffering recent events for
- *    hub_wait. When the hub's database changes (a new `epoch`, or the sequence
- *    going back), the old events and claims are forgotten and waits end;
+ *    hub_wait. While the socket isn't open it follows the events by long-polling
+ *    over HTTP instead. When the hub's database changes (a new `epoch`, or the
+ *    sequence going back), the old events and claims are forgotten and waits end;
  *  - sends a heartbeat every period, over the socket when it's open and over
  *    HTTP otherwise, which renews every claim this agent holds. A socket that
  *    hasn't answered one heartbeat when the next is due is dropped, so a
@@ -46,6 +47,8 @@ const validMs = (v: unknown): v is number => typeof v === 'number' && Number.isF
  */
 export class Feed {
   lastSeq = 0;
+  /** `lastSeq` came from the hub (it may be 0, a database with no events yet); before that the feed starts from the hub's latest. */
+  private synced = false;
   heartbeatsSent = 0;
   /** The hub database's id, from the last hello or long-poll answer; null before one or from a hub that doesn't send it. */
   epoch: string | null = null;
@@ -53,6 +56,8 @@ export class Feed {
   restarts = 0;
   private ws: WebSocket | null = null;
   private open = false;
+  /** The HTTP long-poll that stands in for the socket while it isn't open is running. */
+  private following = false;
   private stopped = true;
   /** stop() was called: waits end. */
   private halted = false;
@@ -101,6 +106,7 @@ export class Feed {
     this.stopped = false;
     this.halted = false;
     this.connect();
+    void this.follow();
     this.scheduleHeartbeat(0);
   }
 
@@ -132,59 +138,105 @@ export class Feed {
 
   /**
    * Wait for visible events after `since` that match `pred`; none on timeout.
-   * Reads the buffer while the socket is open and long-polls over HTTP while
-   * it isn't, switching as the socket comes and goes. Ends early when the
-   * hub's history restarts after the count of `restarts` (default: now).
+   * A running feed reads its buffer, which the socket fills or, while it is
+   * down, the feed's long-poll; one never started long-polls here. Ends early
+   * when the hub's history restarts after the count of `restarts` (default: now).
    */
   async waitFor(since: number, pred: (e: HubEvent) => boolean, timeoutMs: number, restarts = this.restarts): Promise<WaitResult> {
     const deadline = Date.now() + timeoutMs;
     let cursor = since;
-    // The first poll after the socket or the hub went away answers at once, so a hub back on a fresh database shows at once.
+    // The first poll after the hub went away answers at once, so a hub back on a fresh database shows at once.
     let probe = true;
     for (;;) {
       if (this.restarts !== restarts) return { events: [], restarted: true };
       if (this.halted) return { events: this.buffer.filter((e) => e.seq > cursor && pred(e)), restarted: false };
       const remaining = deadline - Date.now();
-      if (this.open) {
+      if (!this.stopped) {
         const hits = this.buffer.filter((e) => e.seq > cursor && pred(e));
         if (hits.length || remaining <= 0) return { events: hits, restarted: false };
         await this.nap(remaining);
-        probe = true;
         continue;
       }
       if (remaining <= 0) return { events: [], restarted: false };
-      let page: Awaited<ReturnType<HubClient['events']>>;
-      // The socket opening (or closing, or the feed stopping) makes this poll moot.
-      const moot = new AbortController();
-      const stop = () => moot.abort();
-      this.waiters.add(stop);
+      let page: Awaited<ReturnType<Feed['poll']>>;
       try {
-        page = await this.client.events(cursor, probe ? 0 : Math.min(remaining, 60_000), moot.signal);
+        page = await this.poll(cursor, probe ? 0 : Math.min(remaining, 60_000));
       } catch (err) {
-        if (moot.signal.aborted) continue;
         if (classifyFailure(err, this.client.cfg).kind !== 'unreachable') throw err;
-        await this.nap(Math.min(remaining, 1000)); // down for now: ask again, or use the socket once it's back
+        await this.nap(Math.min(remaining, 1000)); // down for now: ask again
         probe = true;
         continue;
-      } finally {
-        this.waiters.delete(stop);
       }
       probe = false;
-      if (this.restarts !== restarts) continue; // the socket's hello saw it first
-      // A different database: a new epoch or, without two epochs to compare, a history that ends before `cursor` (it never goes back).
-      const otherDatabase = page.epoch !== undefined && this.epoch !== null ? page.epoch !== this.epoch : page.seq < cursor;
-      if (page.epoch !== undefined) this.epoch = page.epoch;
-      if (otherDatabase) {
-        this.resetHistory(page.seq);
-        continue;
-      }
+      if (!page) continue; // a different database
       const hits = page.events.filter(pred);
       if (hits.length) return { events: hits, restarted: false };
-      cursor = page.next_since ?? page.events[page.events.length - 1]?.seq ?? cursor;
+      cursor = page.next;
     }
   }
 
-  /** Sleep until something changes (an event, the socket opening or closing, a stop) or `ms` passes. */
+  /**
+   * One long-poll from `cursor` (from now when there is none): the events and
+   * the cursor past them, or null when the hub's database changed (its history is reset then).
+   */
+  private async poll(cursor: number | undefined, waitMs: number, signal?: AbortSignal): Promise<{ events: HubEvent[]; next: number } | null> {
+    const page = await this.client.events(cursor, waitMs, signal);
+    // A different database: a new epoch or, without two epochs to compare, a history that ends before `cursor` (it never goes back).
+    const otherDatabase = page.epoch !== undefined && this.epoch !== null ? page.epoch !== this.epoch : cursor !== undefined && page.seq < cursor;
+    if (page.epoch !== undefined) this.epoch = page.epoch;
+    if (otherDatabase) {
+      this.resetHistory(page.seq);
+      return null;
+    }
+    return { events: page.events, next: page.next_since ?? page.events[page.events.length - 1]?.seq ?? cursor ?? page.seq };
+  }
+
+  /**
+   * While the socket isn't open (down, reconnecting, or never connecting),
+   * follow the events by long-polling over HTTP, so waits still wake and a
+   * claim this agent makes elsewhere (the edit hook) is heard, and heartbeated,
+   * before its lease runs out. Ends when the socket opens or the feed stops.
+   */
+  private async follow(): Promise<void> {
+    if (this.following) return;
+    this.following = true;
+    // The first poll after the socket or the hub went away answers at once, so a hub back on a fresh database shows at once.
+    let probe = true;
+    let failures = 0;
+    try {
+      while (!this.stopped && !this.open) {
+        // The socket opening (or the feed stopping) makes the poll moot.
+        const moot = new AbortController();
+        const stop = () => moot.abort();
+        this.waiters.add(stop);
+        const got = await this.poll(this.synced ? this.lastSeq : undefined, probe ? 0 : 60_000, moot.signal).then(
+          (page) => ({ page }),
+          (err: unknown) => ({ err }),
+        );
+        this.waiters.delete(stop);
+        if (moot.signal.aborted) continue;
+        if ('err' in got) {
+          const failure = classifyFailure(got.err, this.client.cfg);
+          // Down for now: ask again soon. A refusal is reported once and asked again less and less often.
+          if (failure.kind !== 'unreachable' && failures === 0) this.opts.log?.(`hub event poll failed: ${failure.message}`);
+          failures++;
+          probe = true;
+          await this.nap(failure.kind === 'unreachable' ? 1000 : Math.min(500 * 2 ** failures, 15_000));
+          continue;
+        }
+        probe = false;
+        failures = 0;
+        if (!got.page) continue; // a different database
+        for (const e of got.page.events) this.ingest(e);
+        this.lastSeq = Math.max(this.lastSeq, got.page.next);
+        this.synced = true;
+      }
+    } finally {
+      this.following = false;
+    }
+  }
+
+  /** Sleep until something changes (an event, the socket opening, a different database, a stop) or `ms` passes. */
   private nap(ms: number): Promise<void> {
     return new Promise((resolve) => {
       const done = () => {
@@ -203,7 +255,7 @@ export class Feed {
 
   private connect(): void {
     if (this.stopped) return;
-    const since = this.lastSeq || undefined;
+    const since = this.synced ? this.lastSeq : undefined;
     const ws = new WebSocket(this.client.feedUrl(since), { headers: this.client.headers() });
     this.ws = ws;
     ws.on('message', (raw) => {
@@ -216,12 +268,8 @@ export class Feed {
       }
       if (frame.type === 'hello') {
         this.onHello(frame, since);
-      } else if (frame.type === 'event' && frame.event.seq > this.lastSeq) {
-        this.lastSeq = frame.event.seq;
-        this.buffer.push(frame.event);
-        if (this.buffer.length > BUFFER_LIMIT) this.buffer.splice(0, this.buffer.length - BUFFER_LIMIT);
-        this.track(frame.event);
-        this.wake();
+      } else if (frame.type === 'event') {
+        this.ingest(frame.event);
       } else if (frame.type === 'heartbeat.ack') {
         this.askedAt = null;
         if (validMs(frame.next_heartbeat_ms)) this.ackMs = frame.next_heartbeat_ms;
@@ -238,12 +286,12 @@ export class Feed {
       this.ws = null;
       this.open = false;
       this.askedAt = null;
-      if (wasOpen) this.wake(); // waits switch to HTTP (one that never opened changes nothing for them)
       if (this.stopped) return;
       if (wasOpen) {
         this.opts.log?.('hub feed connection lost; heartbeats continue over HTTP, reconnecting');
         this.reportedDown = true;
       }
+      void this.follow();
       this.reconnectLater();
     });
     ws.on('error', (err) => {
@@ -260,7 +308,8 @@ export class Feed {
     if (hello.epoch !== undefined) this.epoch = hello.epoch;
     this.backoffMs = 500;
     if (newDatabase) this.resetHistory(hello.seq);
-    else if (this.lastSeq === 0) this.lastSeq = hello.seq;
+    else if (!this.synced) this.lastSeq = hello.seq;
+    this.synced = true;
     // A socket opened at a cursor from the old database, past where this one stands, would skip its events up to there.
     if (since !== undefined && since > hello.seq) return this.dropSocket(0);
     this.open = true;
@@ -270,11 +319,22 @@ export class Feed {
     this.tighten();
   }
 
-  /** The hub's database is not the one this feed followed: forget its events and this agent's claims there. */
+  /** A new event from the socket or the long-poll: buffer it for waits and keep up with this agent's claims. */
+  private ingest(e: HubEvent): void {
+    if (e.seq <= this.lastSeq) return;
+    this.lastSeq = e.seq;
+    this.buffer.push(e);
+    if (this.buffer.length > BUFFER_LIMIT) this.buffer.splice(0, this.buffer.length - BUFFER_LIMIT);
+    this.track(e);
+    this.wake();
+  }
+
+  /** The hub's database is not the one this feed followed: forget its events and this agent's claims there; waits end. */
   private resetHistory(seq: number): void {
     this.opts.log?.(`hub event history restarted (a different database); following it from seq ${seq}`);
     this.buffer = [];
     this.lastSeq = seq;
+    this.synced = true;
     this.restarts++;
     this.ackMs = null;
     if (this.held.size > 0) {
@@ -283,6 +343,7 @@ export class Feed {
     }
     this.held.clear();
     this.reportedLost.clear();
+    this.wake();
   }
 
   /** Give up on the socket (it stopped answering, or it was opened at a stale cursor) and connect again. */
@@ -292,7 +353,7 @@ export class Feed {
     this.open = false;
     this.askedAt = null;
     ws?.terminate();
-    this.wake();
+    void this.follow();
     this.reconnectLater(delayMs);
   }
 

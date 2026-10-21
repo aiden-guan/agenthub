@@ -201,12 +201,14 @@ export class HubClient {
     return this.request('POST', '/land', req);
   }
   /**
-   * Long-poll: events after `since`, waiting up to `waitMs` for the first one.
-   * Newer hubs add `epoch` (their database's id) and `next_since` (the cursor
-   * for the next call, past events this agent can't see). `abort` ends the wait early.
+   * Long-poll: events after `since` (after the hub's latest without it),
+   * waiting up to `waitMs` for the first one. Newer hubs add `epoch` (their
+   * database's id) and `next_since` (the cursor for the next call, past events
+   * this agent can't see). `abort` ends the wait early.
    */
-  events(since: number, waitMs = 0, abort?: AbortSignal): Promise<{ events: HubEvent[]; seq: number; epoch?: string; next_since?: number }> {
-    return this.request('GET', `/events?since=${since}&wait_ms=${waitMs}`, undefined, waitMs + this.cfg.timeoutMs + 5000, abort);
+  events(since: number | undefined, waitMs = 0, abort?: AbortSignal): Promise<{ events: HubEvent[]; seq: number; epoch?: string; next_since?: number }> {
+    const from = since === undefined ? '' : `since=${since}&`;
+    return this.request('GET', `/events?${from}wait_ms=${waitMs}`, undefined, waitMs + this.cfg.timeoutMs + 5000, abort);
   }
 
   feedUrl(since?: number): string {
