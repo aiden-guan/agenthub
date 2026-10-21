@@ -286,3 +286,49 @@ export function conflictedNames(stdout: string): string[] {
   for (let i = 1; i < parts.length && parts[i] !== ''; i++) names.push(parts[i]!);
   return [...new Set(names)].sort();
 }
+
+/** merge-file's exit code is its conflict count, truncated to 127; anything above is an error. */
+const CONFLICT_COUNTS = Array.from({ length: 128 }, (_, i) => i);
+
+/** The longest run of one conflict-marker character (`<`, `=`, `>`, `|`) at the start of a line. */
+function longestMarkerRun(...texts: string[]): number {
+  let longest = 0;
+  for (const text of texts) {
+    for (const m of text.matchAll(/^([<=>|])\1*/gm)) longest = Math.max(longest, m[0].length);
+  }
+  return longest;
+}
+
+/**
+ * Three-way merge of three blobs (null = absent, merged as empty) with
+ * `git merge-file -p --diff3 -L trunk -L base -L yours`, the fix-it report's
+ * and the AI resolver's view of a conflicted file (design §2.2.6, §2.6). The
+ * markers are made longer than any marker-like run at the start of a line of
+ * the inputs, so the conflict regions can always be found again. Writes
+ * nothing to the repository.
+ */
+export async function mergeFile(
+  g: Git,
+  blobs: { trunk: string | null; base: string | null; yours: string | null },
+  labels: [string, string, string] = ['trunk', 'base', 'yours'],
+): Promise<{ text: string; conflicts: number; markerSize: number }> {
+  for (const l of labels) if (!/^[^\s\0]{1,40}$/.test(l)) throw new Error(`gitops: bad merge-file label ${JSON.stringify(l)}`);
+  const read = async (oid: string | null): Promise<string> => {
+    if (oid === null) return '';
+    if (!FULL_SHA_RE.test(oid)) throw new Error(`gitops: blob must be a full object id, got ${JSON.stringify(oid)}`);
+    return (await g.run(['cat-file', 'blob', oid])).stdout;
+  };
+  const [trunk, base, yours] = await Promise.all([read(blobs.trunk), read(blobs.base), read(blobs.yours)]);
+  const markerSize = Math.max(7, longestMarkerRun(trunk, base, yours) + 1);
+  const dir = mkdtempSync(path.join(tmpdir(), 'gitops-merge-file-'));
+  try {
+    const files = ['trunk', 'base', 'yours'].map((n) => path.join(dir, n));
+    writeFileSync(files[0]!, trunk);
+    writeFileSync(files[1]!, base);
+    writeFileSync(files[2]!, yours);
+    const r = await g.run(['merge-file', '-p', '--diff3', `--marker-size=${markerSize}`, '-L', labels[0], '-L', labels[1], '-L', labels[2], ...files], { ok: CONFLICT_COUNTS });
+    return { text: r.stdout, conflicts: r.code, markerSize };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
