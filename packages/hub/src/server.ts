@@ -1,9 +1,12 @@
 import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from 'node:http';
 import { isIP, type AddressInfo } from 'node:net';
 import { timingSafeEqual } from 'node:crypto';
+import { RESERVED_PREFIX } from '@agenthub/contract';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { Hub, HubError, assertAgent, isVisibleTo } from './hub.js';
-import type { EventsResult, FeedClientFrame, FeedServerFrame, HubEvent, TaskStatus } from './protocol.js';
+import { approverTokenMatches, isLoopbackAddress, parseApprovers, sameSecret } from './auth.js';
+import { Hub, HubError, assertAgent, isVisibleTo, type HubAuth } from './hub.js';
+import { HUMAN_RE } from './landing-requests.js';
+import type { EventsResult, FeedClientFrame, FeedServerFrame, HubEvent, LandingStatus, TaskStatus } from './protocol.js';
 
 export interface ServerOptions {
   hub: Hub;
@@ -32,13 +35,44 @@ export interface ServerOptions {
    * Host only when this list is non-empty.
    */
   allowHosts?: string[];
+  /**
+   * `--lander-token`: lander routes, and claims of the lander lease key, need
+   * this secret in `x-hub-lander-token` (with an `x-hub-agent` of `lander/...`).
+   * Without it they work only on a hub that listens on loopback; on a network
+   * address they answer 403 lander_token_required.
+   */
+  landerToken?: string;
+  /**
+   * `--approvers`: each approver's name and the sha256 of their token,
+   * `{"maya": "sha256:<hex>"}`. Approvals need `x-hub-approver` and a matching
+   * `x-hub-approver-token`. Without it they answer 403 approvals_disabled.
+   */
+  approvers?: Record<string, string>;
+  /**
+   * Approvals need only `x-hub-approver: <name>`, no token: for demos and
+   * tests. Refused (startServer throws) unless the hub listens on loopback.
+   */
+  allowUnauthenticatedApprovals?: boolean;
 }
 
 export interface RunningServer {
   url: string;
   port: number;
   hub: Hub;
+  /** The hub listens on a loopback address only (lander routes are open there without a lander token). */
+  loopback: boolean;
   close(): Promise<void>;
+}
+
+/**
+ * How the server tells a lander and an approver from an agent (design §1.7).
+ * Each check throws the refusal or returns what the hub methods take as auth.
+ */
+interface Credentials {
+  /** A lander route (`required`), or a claim that names the lease key: whether the caller is a lander. */
+  lander(ctx: RequestContext, required: boolean): boolean;
+  /** An approver route: the human the approver token belongs to. */
+  approver(ctx: RequestContext): string;
 }
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -82,16 +116,82 @@ interface Route {
  *   POST /v1/p/:project/messages         GET  /v1/p/:project/inbox
  *   GET  /v1/p/:project/decisions        POST /v1/p/:project/decisions
  *   POST /v1/p/:project/land
+ *   GET  /v1/p/:project/landings?status=a,b&agent=&task=&limit=
+ *   GET  /v1/p/:project/landings/stats?days=7
+ *   GET  /v1/p/:project/landings/:id
+ *   POST /v1/p/:project/landings/:id/cancel         (author or approver)
+ *   POST /v1/p/:project/landings/:id/approve        POST /v1/p/:project/landings/:id/reject   (approver)
+ *   POST /v1/p/:project/landings/:id/admit          POST /v1/p/:project/landings/:id/advance  (lander)
+ *   POST /v1/p/:project/landings/:id/resolve        (lander)
+ *   POST /v1/p/:project/lander/next   POST /v1/p/:project/lander/trunk   POST /v1/p/:project/lander/pause   (lander)
+ *   POST /v1/p/:project/lander/resume               (approver)
+ *   GET  /v1/p/:project/lander
  *   GET  /v1/p/:project/events?since=N&wait_ms=M   (long-poll)
  *   WS   /v1/p/:project/feed?agent=A&since=N       (push feed + heartbeats)
  *
  * The caller's identity travels in the `x-hub-agent` header (WebSocket: the
- * `agent` query parameter). Phase 1 trusts it; see README "Security".
+ * `agent` query parameter). Phase 1 trusts it; see README "Security". A
+ * lander also sends `x-hub-lander-token`, an approver `x-hub-approver` and
+ * `x-hub-approver-token` (see ServerOptions).
  */
 export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const { hub } = opts;
   const maxWaitMs = opts.maxWaitMs ?? 600_000;
-  const routes = buildRoutes(hub, maxWaitMs);
+  if (opts.landerToken !== undefined && opts.landerToken.length === 0) throw new Error('the lander token must not be empty');
+  // A host that is an address is known before listening; a name is checked once bound.
+  if (opts.allowUnauthenticatedApprovals && opts.host !== undefined && isIP(opts.host) !== 0 && !isLoopbackAddress(opts.host)) {
+    throw new Error(unauthenticatedOffLoopback(opts.host));
+  }
+  const approverDigests = opts.approvers !== undefined ? parseApprovers(opts.approvers, 'approvers') : null;
+  // Settled once listening: whether the hub listens on loopback only (until then, as if it didn't).
+  let loopback = false;
+
+  const credentials: Credentials = {
+    lander(ctx, required) {
+      const isLander = ctx.agent !== null && ctx.agent.startsWith('lander/');
+      if (opts.landerToken === undefined) {
+        if (loopback) return isLander;
+        if (!required) return false;
+        throw new HubError(
+          'lander_token_required',
+          'this hub listens on a network address and has no lander token, so its lander routes are closed: restart it with hub-server --lander-token <secret> (or HUB_LANDER_TOKEN), and run hub-lander with the same HUB_LANDER_TOKEN',
+          403,
+        );
+      }
+      const given = header(ctx.req, 'x-hub-lander-token');
+      if (given === null || !sameSecret(given, opts.landerToken)) {
+        if (!required) return false;
+        throw new HubError(
+          'forbidden',
+          given === null
+            ? 'this is a lander route: send the hub’s lander token in x-hub-lander-token (hub-lander reads it from HUB_LANDER_TOKEN)'
+            : 'wrong x-hub-lander-token: it is not this hub’s --lander-token',
+          403,
+        );
+      }
+      return isLander;
+    },
+    approver(ctx) {
+      if (approverDigests === null && !opts.allowUnauthenticatedApprovals) {
+        throw new HubError(
+          'approvals_disabled',
+          'approvals are disabled on this hub: it was started without --approvers FILE (HUB_APPROVERS_FILE), the JSON {"<name>": "sha256:<hex of their token>"} of the humans who may approve',
+          403,
+        );
+      }
+      const name = header(ctx.req, 'x-hub-approver');
+      if (name === null || !HUMAN_RE.test(name)) {
+        throw new HubError('not_approver', 'this needs an approver: send your name in x-hub-approver and your token in x-hub-approver-token (hub approve and hub lander resume do)', 403);
+      }
+      if (opts.allowUnauthenticatedApprovals) return name;
+      if (!approverTokenMatches(header(ctx.req, 'x-hub-approver-token') ?? '', approverDigests!.get(name))) {
+        throw new HubError('not_approver', `${name} is not an approver on this hub, or x-hub-approver-token is not their token`, 403);
+      }
+      return name;
+    },
+  };
+
+  const routes = buildRoutes(hub, maxWaitMs, credentials);
   const allowedOrigins = new Set((opts.allowOrigins ?? []).map(toOrigin));
   const allowedHosts = new Set((opts.allowHosts ?? []).map(toHostname));
   const bindName = opts.host && isIP(opts.host) === 0 ? hostnameOf(opts.host) : null;
@@ -319,25 +419,32 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     server.listen(opts.port ?? 7077, opts.host ?? '127.0.0.1', () => resolve());
   });
   const { port, address } = server.address() as AddressInfo;
-  hostCheck = isLoopback(address) || (opts.allowHosts ?? []).length > 0;
+  loopback = isLoopbackAddress(address);
+  hostCheck = loopback || (opts.allowHosts ?? []).length > 0;
   const host = opts.host && opts.host !== '0.0.0.0' && opts.host !== '::' ? opts.host : '127.0.0.1';
+  const close = () =>
+    new Promise<void>((resolve) => {
+      clearInterval(sweeper);
+      for (const ws of sockets) ws.terminate();
+      wss.close();
+      server.closeAllConnections?.();
+      server.close(() => resolve());
+    });
+  if (opts.allowUnauthenticatedApprovals && !loopback) {
+    await close();
+    throw new Error(unauthenticatedOffLoopback(address));
+  }
 
   return {
     url: `http://${host.includes(':') ? `[${host}]` : host}:${port}`,
     port,
     hub,
-    close: () =>
-      new Promise<void>((resolve) => {
-        clearInterval(sweeper);
-        for (const ws of sockets) ws.terminate();
-        wss.close();
-        server.closeAllConnections?.();
-        server.close(() => resolve());
-      }),
+    loopback,
+    close,
   };
 }
 
-function buildRoutes(hub: Hub, maxWaitMs: number): Route[] {
+function buildRoutes(hub: Hub, maxWaitMs: number, credentials: Credentials): Route[] {
   const r = (method: Route['method'], path: string, handler: Handler): Route => ({
     method,
     pattern: new RegExp(`^${path.replace(/:[a-z_]+/g, '([^/]+)')}$`),
@@ -347,6 +454,13 @@ function buildRoutes(hub: Hub, maxWaitMs: number): Route[] {
     if (!ctx.agent) throw new HubError('bad_agent', 'send your agent id (human/agent) in the x-hub-agent header', 400);
     return ctx.agent;
   };
+  /** A lander route: the lander credentials are checked first (403), then the agent id. */
+  const lander = (ctx: RequestContext): { agent: string; auth: HubAuth } => {
+    const isLander = credentials.lander(ctx, true);
+    return { agent: me(ctx), auth: { lander: isLander, approver: null } };
+  };
+  /** An approver route: 403 approvals_disabled or not_approver unless the approver's token checks out. */
+  const approver = (ctx: RequestContext): HubAuth => ({ lander: false, approver: credentials.approver(ctx) });
 
   return [
     r('GET', '/status', (c) => hub.status(c.project, c.agent)),
@@ -364,9 +478,13 @@ function buildRoutes(hub: Hub, maxWaitMs: number): Route[] {
         include_ended: c.query.get('include_ended') === '1',
       }),
     })),
-    r('POST', '/claims', (c) => hub.claim(c.project, me(c), c.body)),
+    // The lander lease is a claim on a reserved key: that needs lander credentials.
+    r('POST', '/claims', (c) => {
+      const isLander = credentials.lander(c, namesReservedPath(c.body));
+      return hub.claim(c.project, me(c), c.body, { lander: isLander, approver: null });
+    }),
     r('POST', '/claims/release', (c) => hub.release(c.project, me(c), c.body)),
-    r('POST', '/claims/check', (c) => hub.check(c.project, c.agent, Array.isArray(c.body.files) ? c.body.files : [], c.body.mode ?? undefined)),
+    r('POST', '/claims/check', (c) => hub.check(c.project, c.agent, checkedFiles(c.body), c.body.mode ?? undefined)),
     r('GET', '/claims/:id', (c) => ({ claim: hub.getClaim(c.project, c.params[0]) })),
 
     r('POST', '/messages', (c) => ({ message: hub.post(c.project, me(c), c.body as any) })),
@@ -379,8 +497,90 @@ function buildRoutes(hub: Hub, maxWaitMs: number): Route[] {
 
     r('POST', '/land', (c) => hub.land(c.project, me(c), c.body)),
 
+    // Landings (design §1.7). The literal /landings/stats comes before /landings/:id.
+    r('GET', '/landings', (c) => ({
+      landings: hub.listLandings(c.project, {
+        statuses: listParam(c.query, 'status') as LandingStatus[] | undefined,
+        agent: c.query.get('agent') ?? undefined,
+        task_id: c.query.get('task') ?? undefined,
+        limit: c.query.has('limit') ? Number(c.query.get('limit')) : undefined,
+      }),
+    })),
+    r('GET', '/landings/stats', (c) => hub.landingStats(c.project, c.query.get('days') ?? undefined)),
+    r('GET', '/landings/:id', (c) => ({ landing: hub.getLanding(c.project, c.params[0]) })),
+    // Its author (x-hub-agent), or an approver (x-hub-approver and its token).
+    r('POST', '/landings/:id/cancel', (c) => {
+      const auth: HubAuth = header(c.req, 'x-hub-approver') !== null ? approver(c) : { lander: false, approver: null };
+      return hub.cancelLanding(c.project, auth.approver === null ? me(c) : c.agent, c.params[0], c.body, auth);
+    }),
+    r('POST', '/landings/:id/approve', (c) => hub.approveLanding(c.project, c.params[0], c.body as any, approver(c))),
+    r('POST', '/landings/:id/reject', (c) => hub.rejectLanding(c.project, c.params[0], c.body as any, approver(c))),
+    r('POST', '/landings/:id/admit', (c) => {
+      const { agent, auth } = lander(c);
+      return hub.admitLanding(c.project, agent, c.params[0], c.body as any, auth);
+    }),
+    r('POST', '/landings/:id/advance', (c) => {
+      const { agent, auth } = lander(c);
+      return hub.advanceLanding(c.project, agent, c.params[0], c.body as any, auth);
+    }),
+    r('POST', '/landings/:id/resolve', (c) => {
+      const { agent, auth } = lander(c);
+      return hub.resolveLanding(c.project, agent, c.params[0], c.body as any, auth);
+    }),
+
+    // The lander and its control.
+    r('GET', '/lander', (c) => hub.landerStatus(c.project)),
+    r('POST', '/lander/next', (c) => {
+      const { agent, auth } = lander(c);
+      return hub.nextLanding(c.project, agent, c.body as any, auth);
+    }),
+    r('POST', '/lander/trunk', (c) => {
+      const { agent, auth } = lander(c);
+      return hub.reportTrunk(c.project, agent, c.body as any, auth);
+    }),
+    r('POST', '/lander/pause', (c) => {
+      const { agent, auth } = lander(c);
+      return hub.pauseLander(c.project, agent, c.body as any, auth);
+    }),
+    r('POST', '/lander/resume', (c) => hub.resumeLander(c.project, c.body as any, approver(c))),
+
     r('GET', '/events', (c) => longPollEvents(hub, c, maxWaitMs)),
   ];
+}
+
+/** Whether a claim request names a path under RESERVED_PREFIX (the lander lease key). */
+function namesReservedPath(body: Record<string, any>): boolean {
+  const files = [...(Array.isArray(body.files) ? body.files : []), ...(Array.isArray(body.scope) ? body.scope.map((e: any) => e?.file) : [])];
+  return files.some((f) => typeof f === 'string' && f.normalize('NFC').startsWith(RESERVED_PREFIX));
+}
+
+/**
+ * The files a check names: `files`, and the files of `scope` entries. Until
+ * the hub compares symbol entries (Phase 3), a scope is checked whole-file,
+ * which can only find more conflicts, never fewer.
+ */
+function checkedFiles(body: Record<string, any>): string[] {
+  const files = Array.isArray(body.files) ? body.files : [];
+  const scope = Array.isArray(body.scope) ? body.scope.map((e: any) => (e !== null && typeof e === 'object' ? e.file : e)) : [];
+  // Not checked here: the hub refuses anything that isn't a repo path (400 invalid_path).
+  return [...files, ...scope];
+}
+
+/** A comma-separated query parameter as a list; undefined when absent or empty. */
+function listParam(query: URLSearchParams, name: string): string[] | undefined {
+  const values = (query.get(name) ?? '').split(',').filter(Boolean);
+  return values.length > 0 ? values : undefined;
+}
+
+/** A request header's value; null when absent or empty. */
+function header(req: IncomingMessage, name: string): string | null {
+  const value = req.headers[name];
+  const s = Array.isArray(value) ? value.join(', ') : value;
+  return s === undefined || s === '' ? null : s;
+}
+
+function unauthenticatedOffLoopback(address: string): string {
+  return `--allow-unauthenticated-approvals lets anyone who reaches the hub approve under any name, so it works only on a loopback address, and this hub would listen on ${address}; give the approvers' token digests with --approvers FILE instead`;
 }
 
 /** Returns visible events after `since`; if none, waits up to `wait_ms` for one. */
@@ -456,12 +656,6 @@ function toOrigin(s: string): string {
     throw new Error(`allowed origin ${JSON.stringify(s)} is not an origin; expected scheme://host[:port], e.g. https://dash.example.com`);
   }
   return url.origin;
-}
-
-/** Whether a listening address only accepts connections from this machine (`0.0.0.0` and `::` don't). */
-function isLoopback(address: string): boolean {
-  const v4 = address.replace(/^::ffff:/i, '');
-  return isIP(v4) === 4 ? v4.startsWith('127.') : address === '::1';
 }
 
 /** The lowercased host name in a `Host` header (`name[:port]`), or null if it is something else. */

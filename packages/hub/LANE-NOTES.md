@@ -90,3 +90,36 @@ Decisions H4, lane L and lane A build on:
 - **Stats.** Window: landings whose `ended_at` is within `days` (1 to 365, default 7). Time to trunk per landed landing from the earliest landing of its retry/supersede chain; p90 by nearest rank; first-try rate = landed chains with no failed landing, rounded to 2 decimals; send-backs by failure code; median check from `report.check.duration_ms` and queue wait from `started_at - created_at` (latest pick), over landed and failed landings.
 - **expireDue** re-reads each due claim before ending it: a lander lease that ends can fail its landing, whose effects end or extend other claims in the same loop.
 - **Tests' race child.** `test/fixtures/race-child.mjs` takes optional `[file] [lander]` arguments (the old three-argument form is unchanged).
+
+## H4: HTTP routes, credentials, hub-server flags
+
+No contract-amendment or dependency requests. Two notes for the integrator (README, a hardening option) are at the end.
+
+Layout:
+
+- **`src/auth.ts` (new).** `approverTokenDigest(token)` (the `sha256:<hex>` entry an approvers file holds), `parseApprovers(value)` and `readApproversFile(file)` (validation, one-line errors), `approverTokenMatches` and `sameSecret` (constant-time, through sha256 digests), `isLoopbackAddress`, `isLoopbackHost`. `index.ts` exports the first four public ones plus `isLoopbackAddress`.
+- **`src/server.ts`.** Every §1.7 route in `buildRoutes()` (`/landings/stats` before `/landings/:id`). `ServerOptions` gains `landerToken`, `approvers` (`{name: 'sha256:<hex>'}`, validated by `startServer`) and `allowUnauthenticatedApprovals`; `RunningServer` gains `loopback`. A `Credentials` object turns the headers into the `HubAuth` the H3 methods take. Error bodies carry `details` (done in H2).
+- **`src/cli.ts`.** `--lander-token` / `HUB_LANDER_TOKEN`, `--approvers FILE` / `HUB_APPROVERS_FILE`, `--allow-unauthenticated-approvals`, all checked before the database opens (exit 2, one line, like the lease flags). Startup lines and a log line that names the landing.
+
+Decisions lanes L and A build on:
+
+- **Lander credentials.** On a lander route (`next`, `admit`, `advance`, `resolve`, `trunk`, `pause`) and on a claim that names a path under `RESERVED_PREFIX`, the server checks first, then the agent id:
+  - no `--lander-token`: on loopback, an `x-hub-agent` under `lander/` is a lander (no header needed); on a network address, 403 `lander_token_required`;
+  - with one: a missing or wrong `x-hub-lander-token` is 403 `forbidden` (the message names the header; the design has no separate code); the right token with an agent id not under `lander/` reaches the hub without lander auth, which answers 403 `forbidden`.
+  - Other requests from a lander (`/heartbeat`, `/claims/release`, `/events`) need no lander token (§1.2 names only lander routes and reserved-key claims). The lander may send the header on every request; it is ignored there.
+- **Approver credentials** (`approve`, `reject`, `lander/resume`, and `cancel` when `x-hub-approver` is sent): no approvers file and no `--allow-unauthenticated-approvals` is 403 `approvals_disabled`; then `x-hub-approver` must be a human name (403 `not_approver`); then the sha256 of `x-hub-approver-token` must equal that name's entry (403 `not_approver`; an unknown name is compared against a dummy digest, so timing tells nothing). With `--allow-unauthenticated-approvals` the name alone is enough, file or not. The hub then applies the rules (`approvers`, `distinct`: 403 `not_approver` naming the rule).
+- **Cancel.** With `x-hub-approver` present, the approver credentials are checked (a bad token is 403 even when `x-hub-agent` is the author); otherwise the author is `x-hub-agent` (400 `bad_agent` without one).
+- **`GET /landings`**: `status=a,b` (empty means all), `agent=`, `task=`, `limit=` (bad values 400 `bad_request`, from the hub).
+- **`POST /claims/check` with `scope`** passes `files` plus the files of the `scope` entries to the current `check(files)`, so a scope is checked whole-file (it can only find more conflicts) until H5 makes `check()` take the `CheckRequest`; H5 should then pass the body through. `invalid_symbol` on `/claims` and `/claims/check` is H5's (an `it.todo` in `server.landing.test.ts`).
+- **Approvers file.** A JSON object of `name: "sha256:<64 hex>"` (hex of either case, kept lowercase); `{}` is refused (it would mean nobody may approve, which is what leaving the flag out says). Read once at startup.
+- **Lander token value.** Visible ASCII without spaces (it travels in a header). An empty `HUB_LANDER_TOKEN` means unset; an empty `--lander-token` is refused. No message repeats it.
+- **`--allow-unauthenticated-approvals`** is refused by the CLI unless `--host` is a loopback address or `localhost` (`isLoopbackHost`), and by `startServer` again once bound (a name that resolved elsewhere).
+- **Startup output** after the lease line: `  lander routes: need the lander token (x-hub-lander-token)` or `  warning: no --lander-token: ...` (loopback: open to local processes; network: closed with `lander_token_required`), then `  approvals: maya, sam` or `  approvals: disabled (...)` or `  warning: --allow-unauthenticated-approvals: ...`. The event log line names the landing id and its status, phase, reason or code (`... landing.updated lander/x L-7 running merging picked`); events carry no free text, so neither does the log.
+- **Browsers.** The CORS preflight's allowed headers are unchanged, so no browser page, allowlisted or not, can send lander or approver credentials.
+
+Fixture conformance (`server.landing.test.ts`): one scenario sends every request fixture (only `lease`, `attempt` and `task_id` replaced by live values) and compares every response with its fixture: the same keys, and the same types where both sides are non-null. Allowed differences, all from the frozen types or Phase 1: `null` on either side (a nullable field); array elements need to match some fixture element; `ScopeEntry.symbol` is optional; `sendbacks`, `resolved_by` (stats) and `explanations` have data as keys; claim events may carry more data keys (`partial`, `from_queue`, `moved_from`, ...), and a partial `claim.released` has no `was` or `reason` (Phase 1's shape); `status().landings` carries the undeclared `seq` (Phase 1, `phase1-landings.test.ts`). The two `symbol-changes` fixtures wait for H6's routes (an `it.todo`); the test checks that every other fixture was used.
+
+For the integrator:
+
+- **README (frozen).** The three new flags and env vars, the startup warnings, and how to make an approvers entry (`approverTokenDigest` from `@agenthub/hub`, or `printf %s "$TOKEN" | sha256sum`).
+- **Optional hardening, not done.** Anyone who can reach a hub (and has the bearer token, if set) can send `x-hub-agent: lander/...` to `/claims/release` or `/heartbeat` for the lease: fencing keeps that safe (T9/T10), but it can force a lease change. Requiring the lander token on every request from a `lander/` agent id is a few lines in `server.ts`, once lane L's client sends the header on every request.
