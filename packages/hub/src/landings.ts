@@ -1,8 +1,9 @@
 import { FULL_SHA_RE, LANDER_LEASE_KEY, RESERVED_PREFIX, humanOf } from '@agenthub/contract';
-import { HubError, capText, cleanText, entryName, idOf, normalizeRepoPath, unique, type HubInternals } from './common.js';
+import { HubError, assertNotReserved, capText, cleanText, entryName, idOf, normalizeRepoPath, unique, type HubInternals } from './common.js';
 import { holdsToLeases, moveHolds, planHolds, releaseHolds, setHolds, type HoldOwner } from './holds.js';
-import { assertNotReserved, normalizeLandingScope, type AdmitInput, type AdvanceInput, type ResolveInput } from './landing-requests.js';
+import { normalizeLandingScope, type AdmitInput, type AdvanceInput, type ResolveInput } from './landing-requests.js';
 import { phase1Landing } from './landing-row.js';
+import { recordLandedChanges, type ChangeInput } from './symbol-changes.js';
 import type {
   ApprovalKind,
   ApprovalRequirement,
@@ -637,13 +638,23 @@ export function failLanding(
  * T11 and T16: landed. The landed effects (holds released, waiters promoted,
  * the task done, its dependents announced), also_landed annotated, and,
  * unless reconciled from a trunk report (which says where trunk is itself),
- * control.trunk and trunk.moved.
+ * control.trunk and trunk.moved. Phase 3: with the lander's `symbol_changes`
+ * (advance and resolve landed; a trunk report has none), the landed rows are
+ * recorded and supersede the author's in-progress rows for the task (§2.5).
  */
 export function completeLanding(
   ix: HubInternals,
   project: string,
   landing: Landing,
-  o: { trunk_sha: string; base_sha?: string | null; files?: string[] | null; report?: LandingReport | null; also_landed?: string[]; reconciled: boolean },
+  o: {
+    trunk_sha: string;
+    base_sha?: string | null;
+    files?: string[] | null;
+    report?: LandingReport | null;
+    also_landed?: string[];
+    symbol_changes?: readonly ChangeInput[];
+    reconciled: boolean;
+  },
   now: number,
   actor: string,
 ): Transition {
@@ -681,6 +692,7 @@ export function completeLanding(
   if (!o.reconciled && from !== o.trunk_sha) {
     ix.emit(project, 'trunk.moved', actor, { from, to: o.trunk_sha, landing_id: done.id, files: done.files.slice(0, 200), foreign: false });
   }
+  if (o.symbol_changes) recordLandedChanges(ix, project, done, o.symbol_changes, now, actor);
   return { landing: done, released: effects.released, unblocked: effects.unblocked, replayed: false };
 }
 
@@ -806,7 +818,14 @@ export function advanceLanding(ix: HubInternals, project: string, agent: string,
       if (pushing && req.trunk_sha !== landing.candidate) {
         throw new HubError('bad_request', `${id} was pushing candidate ${landing.candidate}: landed means trunk is that commit, not ${req.trunk_sha}`);
       }
-      return completeLanding(ix, project, landing, { trunk_sha: req.trunk_sha, base_sha: req.base_sha, files: req.files, report: req.report, also_landed: req.also_landed, reconciled: false }, now, agent);
+      return completeLanding(
+        ix,
+        project,
+        landing,
+        { trunk_sha: req.trunk_sha, base_sha: req.base_sha, files: req.files, report: req.report, also_landed: req.also_landed, symbol_changes: req.symbol_changes, reconciled: false },
+        now,
+        agent,
+      );
     case 'failed':
       return failLanding(ix, project, landing, req.code, summaryOf(req.report, req.code, id), req.report, now, agent);
   }
@@ -930,7 +949,7 @@ function park(ix: HubInternals, project: string, landing: Landing, req: Extract<
 export function resolveLanding(ix: HubInternals, project: string, agent: string, id: string, req: ResolveInput, lease: Claim, now: number): Transition {
   const landing = mustGetLanding(ix.store, project, id);
   if (landing.status === 'running' && landing.phase === 'pushing' && (landing.in_doubt || landing.lease_claim_id === lease.id)) {
-    if (req.outcome === 'landed') return completeLanding(ix, project, landing, { trunk_sha: req.trunk_sha, reconciled: false }, now, agent);
+    if (req.outcome === 'landed') return completeLanding(ix, project, landing, { trunk_sha: req.trunk_sha, symbol_changes: req.symbol_changes, reconciled: false }, now, agent);
     return requeueLanding(ix, project, landing, 'trunk_moved', now, agent);
   }
   const already = req.outcome === 'landed' ? landing.status === 'landed' && landing.trunk_sha === req.trunk_sha : landing.status === 'queued';

@@ -6,7 +6,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import { approverTokenMatches, isLoopbackAddress, parseApprovers, sameSecret } from './auth.js';
 import { Hub, HubError, assertAgent, isVisibleTo, type HubAuth } from './hub.js';
 import { HUMAN_RE } from './landing-requests.js';
-import type { CheckRequest, EventsResult, FeedClientFrame, FeedServerFrame, HubEvent, LandingStatus, TaskStatus } from './protocol.js';
+import type { CheckRequest, EventsResult, FeedClientFrame, FeedServerFrame, HubEvent, LandingStatus, SymbolChangeStatus, TaskStatus } from './protocol.js';
 
 export interface ServerOptions {
   hub: Hub;
@@ -531,6 +531,12 @@ function buildRoutes(hub: Hub, maxWaitMs: number, credentials: Credentials): Rou
       credentials.landerAgent(c);
       return hub.land(c.project, me(c), c.body);
     }),
+
+    // Phase 3: signature changes (design §2.5). `status` is a comma-separated list; `since_ms` a time in ms.
+    r('POST', '/symbol-changes', (c) => hub.postSymbolChanges(c.project, me(c), c.body as any)),
+    r('GET', '/symbol-changes', (c) =>
+      hub.listSymbolChanges(c.project, { since_ms: c.query.get('since_ms') ?? undefined, statuses: listParam(c.query, 'status') as SymbolChangeStatus[] | undefined }),
+    ),
 
     // Landings (design §1.7). The literal /landings/stats comes before /landings/:id.
     r('GET', '/landings', (c) => ({

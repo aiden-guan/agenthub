@@ -106,7 +106,7 @@ export interface Store {
    * with no open row, is a new row with id `S-<n>`. Returns the stored row.
    */
   upsertSymbolChange(change: Omit<SymbolChangeRow, 'id'>): SymbolChangeRow;
-  /** Applies `patch` to every row matching `filter`; returns those rows as they are now, oldest first. */
+  /** Applies `patch` to every row matching `filter`; returns those rows as they are now, oldest first. An empty patch only reads them. */
   updateSymbolChanges(filter: SymbolChangeFilter, patch: SymbolChangePatch): SymbolChangeRow[];
   /** Rows updated at or after `since` in the given states, newest first. */
   listSymbolChanges(project: string, filter: { since: number; statuses: SymbolChangeStatus[]; limit?: number }): SymbolChangeRow[];

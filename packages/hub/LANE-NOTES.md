@@ -222,3 +222,40 @@ Integrator fixes at CP2 (each with a test; the tests fail without the fix):
 For lane H (performance observation from L4, no action required at CP2): `shownLanding`/`emitUpdated` recompute `queueView` per landing returned and per event; caching it per `write()` would make the lander's simulation several times faster (`listLandings` is about 40% of its CPU).
 
 README (CP2): the landing-queue section, the host setup guide, the new hub-server flags, the lander-token rule, the landing routes and events are documented. The Phase 3 hub items listed under H5 "README (frozen), CP3" are noted briefly (symbol entries need the mapper; the per-file cap) and get their full section at CP3.
+
+## H6: symbol changes
+
+No dependency or contract-amendment requests.
+
+Layout:
+
+- **`src/symbol-changes.ts` (new).** `parseSymbolChangesRequest` and `parseSymbolChange` (validation), `landedChangeInputs` (the lander's entries), `parseListing`, `recordSymbolChanges` (the in-progress upsert and withdraw), `recordLandedChanges` (landed rows, then supersede), `listSymbolChanges` and `linkDecisions` (up to 3 decisions per change), `nameOf`.
+- **`src/hub.ts`.** `postSymbolChanges(project, agent, req)` (a plain write: claim writes aren't durable either) and `listSymbolChanges(project, {since_ms?, statuses?})` (a read). `HubInternals` gains `resolveTaskId`, as §2.1 lists it.
+- **`src/landings.ts`.** `completeLanding` takes the lander's `symbol_changes` from `advance {landed}` and `resolve {landed}` and records them after `landing.landed` and `trunk.moved`, the order of the events fixture.
+- **`src/landing-requests.ts`.** The lander's `symbol_changes` are checked entry by entry (below). `assertNotReserved` moved to `common.ts` unchanged, so `symbol-changes.ts` can use it without an import cycle.
+- **`src/server.ts`.** `POST /symbol-changes` (needs `x-hub-agent`) and `GET /symbol-changes?since_ms=&status=` (any caller).
+
+Decisions lane A (A4) and lane L (L6) build on:
+
+- **One in-progress row per (agent, file, symbol), measured from the first `before`.** A row keeps the `before` of the agent's first change of the symbol, and each later change of it updates `kind`, `after` and `renamed_to`. The row withdraws when a change's `after` equals its own `before` (the explicit form) or the row's `before` (an edit that brings the signature back). So the post-edit hook can forward `changedSymbols(...).signatureChanges` as they come. It doesn't need to keep the originals. With nothing open, a withdraw records nothing and isn't in the response. A change that would leave its row as it is writes nothing and emits nothing.
+- **Task of an in-progress row.** The task the change names (404 `not_found` if unknown, as `decide` does), else the agent's only task in progress, else the row's own task.
+- **Validation** (all or nothing: one refused change and nothing is written):
+  - `symbol` and a rename's `renamed_to` must be declaration keys: `SYMBOL_KEY_RE` once NFC-normalized, at most 200 characters, and not `@imports` or `@toplevel`, which never have a signature. Otherwise 400 `invalid_symbol`, which also covers a missing or non-string key.
+  - These are 400 `bad_request`: an unknown `kind`, an empty or missing `before`, a `signature` change without `after`, a `removed` one with `after`, a `renamed` one without `renamed_to`, and `renamed_to` on any other kind.
+  - Paths follow the claim rules (`invalid_path`, and 403 `forbidden` under `RESERVED_PREFIX`). At most 200 changes go in one POST.
+  - Signature text loses control and bidi characters (newlines stay, since overloads are joined with them) and is cut to 500 characters.
+- **The response** lists the row each change ended up in, once each, in request order. A withdrawn row appears with `status: 'withdrawn'`.
+- **`since_ms` is a time** (ms since the epoch: "all timestamps are milliseconds since the Unix epoch", and the store's `since`), not a window length. The default is 24 hours before now. `status` is a comma-separated list; empty means the default (`in_progress,landed`). A bad value is 400 `bad_request`. Rows come newest first by `updated_at`, at most 1000.
+- **Landed rows** carry the landing's author and task (a `task_id` the lander sends is ignored) and `landing_id`. There is one row per (file, symbol), the last one reported, and none where `after == before`. Then **the author's in-progress rows for the landing's task are superseded** (rows without a task, for a landing without one). That happens whether or not the landing reported a change, as §2.1, §2.5 and the brief say. Events come landed rows first, then superseded ones, with the lander as actor. A replayed advance or resolve records nothing. A landing reconciled from a trunk report (T16) has no `symbol_changes`, and its symbol changes are left alone.
+- **The lander's entries are never refused.** An entry the hub can't record (bad path or key, unknown kind, not an object) is dropped, and so is anything past the first 1000. Refusing would answer a `landed` advance or resolve with 400 after trunk moved, which leaves the landing in doubt. A `symbol_changes` that isn't a list is still 400 `bad_request`, as in H3.
+- **Decision linkage**, computed on every read, so a decision made after the change shows up too. Up to 3 decisions, newest first: those with the change's `task_id`, and those with a `symbols` entry equal to the key, the name, `file#key` or `file#name` of the change's file. A trailing `()` is ignored (`login()`). `Session` does not link `Session.refresh`. Linkage looks at the newest 2000 decisions. Each one is `{id, agent, summary}`.
+- **`symbol.changed`** has exactly `change_id, agent, file, symbol, name, kind, status, landing_id, task_id` and `targets: null`: no `before`, `after` or `renamed_to`.
+- These routes have no lander-token rule: they neither touch nor follow a lease.
+
+Tests: `symbol-changes.test.ts` (new) covers every acceptance item: the upsert, withdraw both ways, landed superseding in-progress (advance and resolve, replays, no-change landings, landings without a task, reconcile), linkage both ways, event payloads without text, `invalid_symbol` and the other refusals, the listing, and both routes over HTTP. Removing the composed withdraw, the supersede, the task linkage, or the landing's task on landed rows each fails at least two of its tests, and so does adding `before` to the event. In `server.landing.test.ts`, H4's `it.todo` is now a test that sends `symbol-changes.request.json` and checks POST and GET against `symbol-changes.response.json` and `symbol.changed` against the events fixture. The main conformance test no longer leaves out `symbol.changed`: the landed fixtures' `symbol_changes` now record rows, and it checks them.
+
+For the integrator:
+
+- **Observation, lane S and the adapter: long signatures.** `signatureChanges` compares signatures whole but reports them cut to 500 characters. A change after the 499th character therefore arrives with `before == after`. The hub then withdraws the open row, or skips the landed row. This is rare: a signature over 500 characters is a very long parameter list. A fix belongs in lane S, for example cutting both sides around the first difference. No hub change is needed.
+- **Observation: what the supersede rule loses.** The design supersedes the author's in-progress rows of the task as a whole, so a file the lander maps file-level gets no landed row (`too_many_symbols` past 40 keys, a parse error). Its in-progress rows are still superseded. Other agents keep the notice they got at edit time, but get no "landed in L-n" notice for those symbols. The same goes for every landing today, because the lander sends `symbol_changes: []` until L6. Superseding only the keys a landed row names would keep those rows, but it is not what §2.5 says, so I did not do it.
+- **README (frozen), CP3:** the two routes; `since_ms` is a time; a change whose `after` returns to the first `before` withdraws; landed rows supersede the task's in-progress rows; the lander's bad entries are dropped.
