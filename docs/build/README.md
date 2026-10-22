@@ -28,7 +28,7 @@ How Phases 2 and 3 of `docs/design-phase2-3.md` are being built, so the build ca
 3. Run the Workflow tool with `scriptPath: docs/build/stage.js` and the args file's contents as `args`.
 4. When it finishes, check the result, run `npm test` yourself, and check plan usage before the next stage.
 
-Stage 5 runs `stage5.js` directly with args `{repo, scratch, base: "origin/fix/phase1-review", head: "phase23", from: "cp3", tag: "cp3r", lanes: {<lane>: {wt, branch}}}`, reusing the four lane worktrees.
+Stage 5 runs `stage5.js` directly with args `{repo, scratch, base: "origin/fix/phase1-review", head: "phase23", from: "cp3", tag: "cp3r", lanes: {<lane>: {wt, branch}}, known: [<finding>]}`, reusing the four lane worktrees. `known` lists issues earlier verifiers recorded and left open; they go straight to the fixers, who confirm each first.
 
 ## Things learned the hard way
 

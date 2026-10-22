@@ -124,8 +124,12 @@ const DIMENSIONS = [
   { key: 'tests', focus: 'Test quality (5.1 to 5.5): acceptance tests from 6.5 that would still pass on a broken implementation, tests that assert too little, weakened or deleted Phase 1 tests, skipped tests, tests that depend on timing or ports and will flake, tests that reach the network or a real API, simulation and crash tests whose oracles miss the invariants of 0.2, gaps where a safety rule of section 4 has no test at all.' },
 ]
 
+// Issues earlier verifiers already recorded and left open: they skip Find and Verify and go straight to the fixers, who confirm each first.
+const KNOWN = (args.known || []).map((f, i) => ({ ...f, id: `K-${i + 1}` }))
+const knownNote = KNOWN.length ? `\n\nAlready known and queued for fixing (don't report these again): ${JSON.stringify(KNOWN.map(f => `${f.id} ${f.title}`))}` : ''
+
 phase('Find')
-const findPrompt = (d) => `${CONTEXT}
+const findPrompt = (d) => `${CONTEXT}${knownNote}
 
 You are one of ${DIMENSIONS.length} independent reviewers. Your dimension: ${d.focus}
 
@@ -136,7 +140,7 @@ const found = (await parallel(DIMENSIONS.map(d => () => ask(findPrompt(d), { lab
 let raw = found.flatMap(r => r.findings)
 log(`${raw.length} raw findings from ${found.length}/${DIMENSIONS.length} reviewers`)
 
-const critic = await ask(`${CONTEXT}
+const critic = await ask(`${CONTEXT}${knownNote}
 
 ${DIMENSIONS.length} reviewers each reviewed one dimension of git diff ${BASE}..${HEAD_REF}. Their findings so far:
 ${JSON.stringify(raw.map(f => ({ title: f.title, files: f.files, claim: f.claim })), null, 1)}
@@ -183,7 +187,7 @@ Read the code, the reproduction (${rep.repro_path || 'none'}) and the design. Re
     return { f: { ...f, severity: sev }, rep, ref, confirmed: !!ref && !ref.refuted }
   },
 )
-const judged = verified.filter(Boolean)
+const judged = verified.filter(Boolean).concat(KNOWN.map(f => ({ f, rep: { status: 'reported', evidence: f.scenario }, ref: null, confirmed: true, known: true })))
 const confirmed = judged.filter(v => v.confirmed)
 const dropped = judged.filter(v => !v.confirmed)
 log(`${confirmed.length} confirmed, ${dropped.length} dropped (not reproduced or refuted)`)
@@ -211,7 +215,7 @@ async function fixBatch(lane, batch, n) {
 
 ${laneRules(lane)}
 
-Fix batch ${n} of lane ${lane}: findings ${ids}. Each was reproduced and survived an attempt to refute it. To rerun a reproduction against your worktree, set AGENTHUB_ROOT=${L.wt} after npm run build there.
+Fix batch ${n} of lane ${lane}: findings ${ids}. Findings with an R- id were reproduced and survived an attempt to refute it. Findings with a K- id were recorded by an earlier step verifier and not reproduced here: confirm each one first (write the failing regression test), and mark it not_a_defect with your evidence if it doesn't hold. To rerun a reproduction against your worktree, set AGENTHUB_ROOT=${L.wt} after npm run build there.
 ${JSON.stringify(items, null, 2)}`, { label: `fix:${lane}:${n}`, phase: 'Fix', schema: FIX_RESULT })
   if (!res) return { lane, ids, res: null, ver: null }
   let ver = null
@@ -254,7 +258,7 @@ const fixes = (await parallel(Object.keys(byLane).filter(l => LANES[l]).map(l =>
 
 phase('Integrate')
 const fixSummary = fixes.map(x => ({ lane: x.lane, ids: x.ids, verified: !!x.ok, fixed: x.res ? x.res.fixed : [], lane_notes: x.res ? x.res.lane_notes || '' : '', open: x.ver ? x.ver.problems.filter(p => p.severity !== 'minor').map(p => p.what) : ['no verification'] }))
-const ledger = judged.map(v => ({ id: v.f.id, title: v.f.title, severity: v.f.severity, lane: v.f.lane, files: v.f.files, verdict: v.confirmed ? 'confirmed' : (v.rep && v.rep.status === 'not_reproduced' ? 'not reproduced' : 'refuted'), why: v.confirmed ? '' : (v.ref ? v.ref.reason : v.rep ? v.rep.evidence : 'no result') }))
+const ledger = judged.map(v => ({ id: v.f.id, title: v.f.title, severity: v.f.severity, lane: v.f.lane, files: v.f.files, verdict: v.known ? 'known (recorded by a step verifier)' : v.confirmed ? 'confirmed' : (v.rep && v.rep.status === 'not_reproduced' ? 'not reproduced' : 'refuted'), why: v.confirmed ? '' : (v.ref ? v.ref.reason : v.rep ? v.rep.evidence : 'no result') }))
 const intPrompt = `${CONTEXT}
 
 You are the integrator for the stage 5 review fixes, in ${REPO} on branch ${HEAD_REF}. Design 6.7 describes the integrator's duties. Lane worktrees and branches:
