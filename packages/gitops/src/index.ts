@@ -15,8 +15,8 @@ export type * from './types.js';
 export type { MergeMessage, MergeTreesResult, ParsedMergeTree } from './merge.js';
 export { GitError } from './run.js';
 export { classifyPush, porcelainLines } from './push.js';
-export { conflictedNames, conflictsOf, parseMergeTree, spliceOids } from './merge.js';
-export { TRAILER_KEYS } from './trailers.js';
+export { conflictedNames, conflictsOf, mergeFile, parseMergeTree, spliceOids } from './merge.js';
+export { pathHistory, TRAILER_KEYS } from './trailers.js';
 
 export {
   open,

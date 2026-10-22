@@ -36,3 +36,8 @@ None required. One optional, additive request for the integrator:
 - **`pushRef`** accepts only `<prefix>land/…` and `<prefix>cand/…`, where `prefix` is `refs/…/`. The refspec has no `+` and no `--force`. Deleting a missing ref returns `ok`.
 - **`lsRemote`** matches the ref name exactly (`ls-remote` itself matches by suffix).
 - **`approvalDigest`**: a missing blob is the empty string. Lines are `kind\0path\0blob…\n`, sorted by UTF-8 bytes. `protected` and `merged` take exactly 2 blobs, `ai_resolution` takes 4, and every blob is a full object id or null.
+
+## L2 additions (additive exports, not in the frozen interface)
+
+- `mergeFile(g, {trunk, base, yours}, labels?)`: `git merge-file -p --diff3 -L trunk -L base -L yours` over three blob ids (null = absent, merged as empty), from temporary files; writes nothing to the repository. Returns `{text, conflicts, markerSize}`. The markers are one longer than the longest run of `<`, `=`, `>` or `|` at the start of any input line (at least 7), so the regions can always be parsed back. Blobs are decoded as UTF-8.
+- `pathHistory(g, from, to, path, limit)`: first-parent commits in `from..to` (null = all) that changed `path` against their first parent, newest first, at most `limit`, each with its `subject` and the same trailer fields as `trunkTrailers`. The path is literal (`GIT_LITERAL_PATHSPECS`). Tests: `test/history.test.ts`.

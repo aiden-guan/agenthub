@@ -3,7 +3,7 @@
 // three-key identity, and the landed base.
 
 import { isAncestorIfPresent, mergeBase, presentCommits } from './queries.js';
-import { assertRev, FULL_SHA_RE } from './run.js';
+import { assertRev, FULL_SHA_RE, validRepoPath } from './run.js';
 import type { Git, LandedBase, LandingTrailers } from './types.js';
 
 // gitops has no dependencies, so these mirror TRAILER and TRAILER_LINE_RE of
@@ -46,17 +46,23 @@ export function sanitizeMessageText(s: string, max: number): string {
 const FIELDS = ['landing', 'hub', 'source', 'attempt', 'task', 'agent', 'resolved', 'checked'] as const;
 const FORMAT = `%H%x00${FIELDS.map((f) => `%(trailers:key=${TRAILER_KEYS[f]},valueonly,unfold,separator=%x01)%x00`).join('')}`;
 
-function parseTrailerLog(stdout: string): LandingTrailers[] {
+const SUBJECT_FORMAT = `%H%x00%s%x00${FIELDS.map((f) => `%(trailers:key=${TRAILER_KEYS[f]},valueonly,unfold,separator=%x01)%x00`).join('')}`;
+
+function parseTrailerLog(stdout: string): LandingTrailers[];
+function parseTrailerLog(stdout: string, withSubject: true): Array<LandingTrailers & { subject: string }>;
+function parseTrailerLog(stdout: string, withSubject = false): Array<LandingTrailers & { subject?: string }> {
   const parts = stdout.split('\0');
-  const out: LandingTrailers[] = [];
-  const per = FIELDS.length + 1;
+  const out: Array<LandingTrailers & { subject?: string }> = [];
+  const skip = withSubject ? 2 : 1;
+  const per = FIELDS.length + skip;
   for (let i = 0; i + per <= parts.length; i += per) {
     const sha = parts[i]!.trim();
     if (!FULL_SHA_RE.test(sha)) break;
-    const rec: LandingTrailers = { sha, landing: null, hub: null, source: null, attempt: null, task: null, agent: null, resolved: null, checked: null };
+    const rec: LandingTrailers & { subject?: string } = { sha, landing: null, hub: null, source: null, attempt: null, task: null, agent: null, resolved: null, checked: null };
+    if (withSubject) rec.subject = parts[i + 1]!;
     FIELDS.forEach((f, j) => {
       // A key given twice with different values is ambiguous: no lander writes that, so it counts as absent.
-      const values = [...new Set(parts[i + 1 + j]!.split('\u0001').map((v) => v.trim()).filter((v) => v.length > 0))];
+      const values = [...new Set(parts[i + skip + j]!.split('\u0001').map((v) => v.trim()).filter((v) => v.length > 0))];
       rec[f] = values.length === 1 ? values[0]! : null;
     });
     out.push(rec);
@@ -75,6 +81,23 @@ async function logTrailers(g: Git, from: string | null, to: string, extra: strin
 export async function trunkTrailers(g: Git, from: string | null, to: string, limit?: number): Promise<LandingTrailers[]> {
   if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) throw new Error(`gitops: bad limit ${limit}`);
   return logTrailers(g, from, to, limit !== undefined ? [`-n${limit}`] : []);
+}
+
+/**
+ * First-parent commits in from..to (from exclusive; null = all) that changed
+ * `path` against their first parent, newest first, at most `limit`, with
+ * their subjects and Agenthub trailers: who changed the trunk side of a
+ * conflicted file (design §2.2.6 step 4, `trunk_changes`).
+ */
+export async function pathHistory(g: Git, from: string | null, to: string, path: string, limit: number): Promise<Array<LandingTrailers & { subject: string }>> {
+  assertRev(to);
+  if (from !== null) assertRev(from);
+  if (!validRepoPath(path)) throw new Error(`gitops: bad path ${JSON.stringify(path)}`);
+  if (!Number.isInteger(limit) || limit < 1) throw new Error(`gitops: bad limit ${limit}`);
+  const r = await g.run(['log', '--first-parent', `-n${limit}`, `--format=${SUBJECT_FORMAT}`, to, ...(from !== null ? [`^${from}`] : []), '--', path], {
+    env: { GIT_LITERAL_PATHSPECS: '1' },
+  });
+  return parseTrailerLog(r.stdout, true);
 }
 
 /**
