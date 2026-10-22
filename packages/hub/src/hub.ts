@@ -1,5 +1,5 @@
-import { LANDER_LEASE_KEY, RESERVED_PREFIX } from '@agenthub/contract';
-import { HubError, NO_AUTH, capText, claimFiles, cleanText, idOf, normalizeRepoPath, toConflict, unique, type HubAuth, type HubInternals } from './common.js';
+import { LANDER_LEASE_KEY, RESERVED_PREFIX, claimCovers } from '@agenthub/contract';
+import { HubError, NO_AUTH, capText, claimFiles, cleanText, entryName, idOf, normalizeRepoPath, toConflict, unique, type HubAuth, type HubInternals } from './common.js';
 import {
   parseAdmit,
   parseAdvance,
@@ -51,6 +51,7 @@ import {
   CHANNEL_RE,
   PROJECT_RE,
   type AgentInfo,
+  type CheckRequest,
   type CheckResult,
   type Claim,
   type ClaimConflict,
@@ -96,6 +97,7 @@ import {
   type TaskStatus,
 } from './protocol.js';
 import { phase1Landing } from './landing-row.js';
+import { claimMapper, groupByFile, inOrderOf, overlapping, requestScope, sameScope, scopesOverlap, type RequestScope } from './scope.js';
 import type { AgentTouch, Store } from './store.js';
 
 export { HubError, NO_AUTH, cleanText, normalizeRepoPath, type HubAuth } from './common.js';
@@ -220,10 +222,17 @@ export class Hub {
    * `auth` matters only for the reserved key: a claim under RESERVED_PREFIX
    * needs lander credentials and must be exactly [LANDER_LEASE_KEY],
    * exclusive (403 forbidden otherwise). That claim is the lander lease.
+   *
+   * Phase 3 (design §1.10): the request's entries are compared, not its
+   * files. Symbol entries need the request's `mapper` (400 invalid_symbol),
+   * which the claim keeps; they count only against claims made with the same
+   * mapper, every other entry being its whole file (the contract's
+   * claimCovers and overlappingEntries).
    */
   claim(project: string, agent: string, req: ClaimRequest, auth: HubAuth = NO_AUTH): ClaimResult {
     assertAgent(agent);
-    const scope = normalizeScope(req);
+    const asked = normalizeScope(req);
+    const { scope } = asked;
     const mode = req.mode ?? 'exclusive';
     if (mode !== 'exclusive' && mode !== 'shared' && mode !== 'auto') {
       throw new HubError('bad_request', 'mode must be exclusive, shared or auto');
@@ -249,8 +258,7 @@ export class Hub {
       const held = this.renewLeases(project, agent, now);
       // Nobody can wait for an agent that holds nothing, so its requests need no graph.
       const waitedFor = held.length > 0;
-      const files = unique(scope.map((s) => s.file));
-      const { covering, uncovered, queuedOnFiles, waiters, blockers, effectiveMode, waits } = this.standing(project, agent, files, mode, waitedFor);
+      const { covering, uncovered, queuedOnFiles, waiters, blockers, effectiveMode, waits, conflictOf } = this.standing(project, agent, asked, mode, waitedFor);
       if (uncovered.length === 0) {
         // A renewal ties the claims it renews that have no task to the task it is
         // for, as a new claim would be, so landing that task releases them (see
@@ -265,7 +273,7 @@ export class Hub {
         return { status: 'granted', claim: covering[0], claims: covering, renewed: true, conflicts: [], now, seq: this.store.latestSeq(project) };
       }
 
-      const conflicts = blockers.map((c) => toConflict(c, uncovered));
+      const conflicts = blockers.map(conflictOf);
       // A holder in the way that waits, directly or not, for a claim this agent holds
       // would wait forever, and so would this request. That can't be queued. (A
       // landing's hold waits for nobody: it ends when the landing does.)
@@ -293,11 +301,14 @@ export class Hub {
       }
 
       const taskId = this.resolveTaskId(project, agent, requestedTask);
-      const intent = intentIn || this.defaultIntent(project, taskId, uncovered);
-      const claimScope = scope.filter((s) => uncovered.includes(s.file));
+      // The new claim is for the entries no claim of the agent's covers, with the mapper their symbols came from.
+      const claimScope = uncovered;
+      const mapper = claimMapper(claimScope, asked.mapper);
+      const files = claimFiles({ scope: claimScope });
+      const intent = intentIn || this.defaultIntent(project, taskId, unique(claimScope.map(entryName)));
 
       if (conflicts.length > 0) {
-        const existing = queuedOnFiles.find((c) => c.holder === agent && c.mode === effectiveMode && sameFiles(c, uncovered));
+        const existing = queuedOnFiles.find((c) => c.holder === agent && c.mode === effectiveMode && sameScope(c, claimScope, mapper));
         let claim: Claim;
         if (existing) {
           existing.expires_at = now + existing.ttl_ms;
@@ -314,17 +325,19 @@ export class Hub {
             now,
             ttl,
             heartbeat,
+            mapper,
           });
           this.store.insertClaim(claim);
           this.emit(project, 'claim.queued', agent, {
             claim_id: claim.id,
             holder: agent,
-            files: uncovered,
+            files,
             mode: effectiveMode,
             intent,
             waiting_for: unique(conflicts.map((c) => c.holder)),
             landing_id: null,
             scope: claimScope,
+            mapper,
           });
           // Now that this agent waits for others, a claim queued before this one
           // may have to let a waiter go first, which may grant that waiter. (A
@@ -346,17 +359,18 @@ export class Hub {
         };
       }
 
-      const claim = this.newClaim(project, agent, { taskId, scope: claimScope, mode: effectiveMode, intent, baseCommit, status: 'active', now, ttl, heartbeat });
+      const claim = this.newClaim(project, agent, { taskId, scope: claimScope, mode: effectiveMode, intent, baseCommit, status: 'active', now, ttl, heartbeat, mapper });
       this.store.insertClaim(claim);
       this.emit(project, 'claim.granted', agent, {
         claim_id: claim.id,
         holder: agent,
-        files: uncovered,
+        files,
         mode: effectiveMode,
         intent,
         task_id: taskId,
         landing_id: null,
         scope: claimScope,
+        mapper,
       });
       return {
         status: 'granted',
@@ -373,48 +387,59 @@ export class Hub {
   }
 
   /**
-   * Where a claim request of `agent`'s for `files` in `mode` stands, as claim()
-   * decides it: the agent's claims that already cover files (`covering`), the
-   * files they don't (`uncovered`) and, for those, the other agents' claims in
-   * the way (`blockers`) and the mode a grant would have. `waitedFor`: the
+   * Where a claim request of `agent`'s for the entries `asked` names in `mode`
+   * stands, as claim() decides it: the agent's claims that already cover
+   * entries (`covering`), the entries they don't (`uncovered`) and, for those,
+   * the other agents' claims in the way (`blockers`), what each is in the way
+   * with (`conflictOf`) and the mode a grant would have. `waitedFor`: the
    * agent holds a claim, active or queued, so others may wait for it.
+   *
+   * Entries are compared by the contract's rules (design §1.10): a claim of
+   * the agent's covers an entry by claimCovers, another agent's claim is in
+   * the way when its entries overlap the uncovered ones (overlappingEntries),
+   * symbols counting only between the same non-null mapper. The store finds
+   * the claims by file, a superset.
    *
    * The agent's own landing holds are neither: a hold never covers a new
    * request of its holder's (that gets its own lease, which outlives the
    * landing), and it is no conflict for its holder.
    */
-  private standing(project: string, agent: string, files: string[], mode: ClaimRequestMode, waitedFor: boolean) {
-    const live = this.store.claimsForFiles(project, files, ['active']);
+  private standing(project: string, agent: string, asked: RequestScope, mode: ClaimRequestMode, waitedFor: boolean) {
+    const live = this.store.claimsForFiles(project, claimFiles(asked), ['active']);
     const mine = live.filter((c) => c.holder === agent && c.landing_id === null);
     const others = live.filter((c) => c.holder !== agent);
     let graph: Waits | undefined;
     const waits = () => (graph ??= this.waitGraph(project));
 
-    // A claim of mine covers a file if it includes it with a strong enough mode.
-    const covers = (c: Claim, file: string) => hasFile(c, file) && (mode !== 'exclusive' || c.mode === 'exclusive');
-    const covering = mine.filter((c) => files.some((f) => covers(c, f)));
-    const uncovered = files.filter((f) => !mine.some((c) => covers(c, f)));
+    // A claim of mine covers an entry if it includes it, with a strong enough mode.
+    const covers = (c: Claim, entry: ScopeEntry) => (mode !== 'exclusive' || c.mode === 'exclusive') && claimCovers(c, entry, asked.mapper);
+    const covering = mine.filter((c) => asked.scope.some((e) => covers(c, e)));
+    const uncovered = asked.scope.filter((e) => !mine.some((c) => covers(c, e)));
+    const rest: RequestScope = { scope: uncovered, mapper: asked.mapper };
+    // What a claim is in the way with: its entries that overlap the request's uncovered ones.
+    const conflictOf = (c: Claim): ClaimConflict => toConflict(c, [], overlapping(rest, c));
     if (uncovered.length === 0) {
-      return { covering, uncovered, queuedOnFiles: [] as Claim[], waiters: [] as Claim[], blockers: [] as Claim[], effectiveMode: (mode === 'shared' ? 'shared' : 'exclusive') as ClaimMode, waits };
+      return { covering, uncovered, queuedOnFiles: [] as Claim[], waiters: [] as Claim[], blockers: [] as Claim[], effectiveMode: (mode === 'shared' ? 'shared' : 'exclusive') as ClaimMode, waits, conflictOf };
     }
 
     // Earlier waiters stand in the way like holders do, so a later request can't
     // overtake them. A waiter whose agent is itself waiting, directly or not, for
     // this agent doesn't: it can't be granted before this agent lets go anyway,
     // so this request goes ahead of it, queued or not (see waitGraph).
-    const queuedOnFiles = this.store.claimsForFiles(project, uncovered, ['queued']);
-    const theirs = queuedOnFiles.filter((q) => q.holder !== agent);
+    const queuedOnFiles = this.store.claimsForFiles(project, claimFiles(rest), ['queued']);
+    const theirs = queuedOnFiles.filter((q) => q.holder !== agent && scopesOverlap(rest, q));
     const waiters = theirs.filter((q) => !(waitedFor && waits().reach.has(nodeOf(q), agent)));
-    const blocking = [...others.filter((c) => uncovered.some((f) => hasFile(c, f))), ...waiters];
+    const blocking = [...others.filter((c) => scopesOverlap(rest, c)), ...waiters];
     const effectiveMode: ClaimMode =
       mode === 'auto' ? (blocking.length > 0 && blocking.every((c) => c.mode === 'shared') ? 'shared' : 'exclusive') : mode;
     const blockers = blocking.filter((c) => c.mode === 'exclusive' || effectiveMode === 'exclusive');
-    return { covering, uncovered, queuedOnFiles, waiters, blockers, effectiveMode, waits };
+    return { covering, uncovered, queuedOnFiles, waiters, blockers, effectiveMode, waits, conflictOf };
   }
 
   /**
    * `claim_id`, `task_id` and `files` each narrow what is released; `all` alone
-   * names every claim of the agent's. Landing holds aren't the agent's to
+   * names every claim of the agent's. `files` drops every entry of those
+   * files, symbol entries included. Landing holds aren't the agent's to
    * release: naming one is 409 held_by_landing, and the others skip them.
    */
   release(project: string, agent: string, req: ReleaseRequest): ReleaseResult {
@@ -455,7 +480,7 @@ export class Hub {
           const removed = unique(removedEntries.map((s) => s.file));
           this.store.updateClaim(project, c.id, { scope: remaining });
           trimmed.push({ ...c, scope: remaining });
-          this.emit(project, 'claim.released', agent, { claim_id: c.id, holder: c.holder, files: removed, partial: true, landing_id: c.landing_id, scope: removedEntries });
+          this.emit(project, 'claim.released', agent, { claim_id: c.id, holder: c.holder, files: removed, partial: true, landing_id: c.landing_id, scope: removedEntries, mapper: c.mapper });
         } else {
           released.push(this.endClaim(project, c, 'released', 'released by holder', now));
         }
@@ -482,39 +507,54 @@ export class Hub {
   }
 
   /**
-   * Without `mode`: active exclusive claims by anyone other than `agent` on
-   * these files (for the pre-commit guard), and other agents' landing holds,
-   * shared or not, since a commit to a file being landed would go around the
-   * landing. With it: for each file, what a
-   * claim request of `agent`'s for that file alone in `mode`, with queue
-   * false, would be denied for right now, so a wait for the files (hub_wait)
-   * ends exactly when the edit hook's request would be granted. Changes nothing.
+   * Without `mode`: active exclusive claims by anyone other than `agent` whose
+   * entries overlap the request's (for the pre-commit guard), and other
+   * agents' landing holds, shared or not, since a commit to code being landed
+   * would go around the landing. With it: for each file, what a claim request
+   * of `agent`'s for the request's entries in that file alone, in `mode`, with
+   * queue false, would be denied for right now, so a wait for them (hub_wait)
+   * ends exactly when the edit hook's request would be granted. Changes
+   * nothing.
+   *
+   * `req` is a CheckRequest (design §1.7): `files` as whole files, and
+   * `scope` entries with the `mapper` their symbols came from (400
+   * invalid_symbol as for claims), compared like claims compare them (§1.10).
+   * Phase 1's form, a list of files and a mode, still works.
    */
-  check(project: string, agent: string | null, files: string[], mode?: ClaimRequestMode): CheckResult {
+  check(project: string, agent: string | null, req: CheckRequest | string[], mode?: ClaimRequestMode): CheckResult {
     if (agent !== null) assertAgent(agent);
-    if (mode !== undefined && mode !== 'exclusive' && mode !== 'shared' && mode !== 'auto') {
+    const request: CheckRequest = Array.isArray(req) ? { files: req, mode } : { ...(req ?? {}), mode: req?.mode ?? mode };
+    const asked = request.mode ?? undefined;
+    if (asked !== undefined && asked !== 'exclusive' && asked !== 'shared' && asked !== 'auto') {
       throw new HubError('bad_request', 'mode must be exclusive, shared or auto');
     }
-    const norm = unique(files.map(normalizeRepoPath));
+    const want = requestScope(request);
+    const files = claimFiles(want);
     return this.read(project, (now) => {
-      if (mode === undefined) {
-        const live = this.store.claimsForFiles(project, norm, ['active']);
-        const conflicts = live.filter((c) => c.holder !== agent && (c.mode === 'exclusive' || c.landing_id !== null)).map((c) => toConflict(c, norm));
+      if (asked === undefined) {
+        const live = this.store.claimsForFiles(project, files, ['active']);
+        const conflicts = live
+          .filter((c) => c.holder !== agent && (c.mode === 'exclusive' || c.landing_id !== null))
+          .flatMap((c) => {
+            const overlap = overlapping(want, c);
+            return overlap.length > 0 ? [toConflict(c, [], overlap)] : [];
+          });
         return { conflicts, now, seq: this.store.latestSeq(project) };
       }
       const me = agent ?? '';
       const waitedFor = agent !== null && this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent }).length > 0;
       const byClaim = new Map<string, ClaimConflict>();
       let deadlock: string | null = null;
-      for (const file of norm) {
-        const { uncovered, blockers, waits } = this.standing(project, me, [file], mode, waitedFor);
+      for (const [, entries] of groupByFile(want.scope)) {
+        const { blockers, waits, conflictOf } = this.standing(project, me, { scope: entries, mapper: want.mapper }, asked, waitedFor);
         for (const c of blockers) {
+          const found = conflictOf(c);
           const seen = byClaim.get(c.id);
           if (seen) {
-            seen.files = unique([...seen.files, ...toConflict(c, uncovered).files]);
-            // The holder's entries on every file merged so far, as toConflict would give for them all at once.
-            seen.scope = c.scope.filter((s) => seen.files.includes(s.file));
-          } else byClaim.set(c.id, toConflict(c, uncovered));
+            seen.files = unique([...seen.files, ...found.files]);
+            // The holder's entries that overlap on every file so far, in its own order, as one request for them all would give.
+            seen.scope = inOrderOf(c.scope, [...seen.scope, ...found.scope]);
+          } else byClaim.set(c.id, found);
         }
         const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(nodeOf(c), me));
         deadlock ??= blockers.length ? denialDeadlock(waits, me, blockers, waitsForMe, waitsForMe ? waitCycle(waits().held, me, blockers) : null) : null;
@@ -1126,6 +1166,7 @@ export class Hub {
       reason,
       landing_id: c.landing_id,
       scope: c.scope,
+      mapper: c.mapper,
     });
     const ended = { ...c, status, ended_at: now, end_reason: reason };
     if (c.status === 'active' && isLeaseClaim(c)) onLeaseEnded(this.ix, project, ended, now);
@@ -1156,6 +1197,7 @@ export class Hub {
           task_id: q.task_id,
           landing_id: q.landing_id,
           scope: q.scope,
+          mapper: q.mapper,
           from_queue: true,
         });
         // As stored: a graph from an earlier request can predate the waiter's last heartbeat.
@@ -1220,18 +1262,25 @@ export class Hub {
     return waits;
   }
 
-  /** Whether the events after `seq` leave `waits` as they are (see waitGraph). */
+  /**
+   * Whether the events after `seq` leave `waits` as they are (see waitGraph).
+   * An event's files are those it names and those of its `scope`: a claim
+   * that loses a symbol entry but keeps others of that file (a hold trimmed
+   * at admission) names no file, yet a waiter for that symbol may be free now.
+   */
   private leftAlone(project: string, seq: number, waits: Waits): boolean {
     const events = this.store.eventsSince(project, seq, MAX_EVENTS_TO_REUSE + 1);
     if (events.length > MAX_EVENTS_TO_REUSE) return false;
     return events.every((e) => {
       if (!e.type.startsWith('claim.')) return true;
-      const { claim_id: id, files } = e.data;
+      const { claim_id: id, files, scope } = e.data;
+      const touches = (f: unknown) => typeof f !== 'string' || waits.files.has(f);
       return (
         e.type !== 'claim.queued' &&
         !waits.ids.has(id as string) &&
         Array.isArray(files) &&
-        !files.some((f) => waits.files.has(f as string))
+        !files.some(touches) &&
+        (scope === undefined || (Array.isArray(scope) && !scope.some((entry) => touches((entry as { file?: unknown } | null)?.file))))
       );
     });
   }
@@ -1239,7 +1288,7 @@ export class Hub {
   private newClaim(
     project: string,
     holder: string,
-    o: { taskId: string | null; scope: ScopeEntry[]; mode: ClaimMode; intent: string; baseCommit: string | null; status: 'active' | 'queued'; now: number; ttl: number; heartbeat: number },
+    o: { taskId: string | null; scope: ScopeEntry[]; mode: ClaimMode; intent: string; baseCommit: string | null; status: 'active' | 'queued'; now: number; ttl: number; heartbeat: number; mapper: string | null },
   ): Claim {
     return {
       id: `C-${this.store.nextCounter(project, 'claim')}`,
@@ -1259,7 +1308,7 @@ export class Hub {
       ended_at: null,
       end_reason: null,
       landing_id: null,
-      mapper: null,
+      mapper: o.mapper,
     };
   }
 
@@ -1273,11 +1322,11 @@ export class Hub {
     return mine.length === 1 ? mine[0].id : null;
   }
 
-  /** The task's title, else the files (some of them), capped like an intent the request gives. */
-  private defaultIntent(project: string, taskId: string | null, files: string[]): string {
+  /** The task's title, else the entries (some of them: `file` or `file#symbol`), capped like an intent the request gives. */
+  private defaultIntent(project: string, taskId: string | null, names: string[]): string {
     const task = taskId ? this.store.getTask(project, taskId) : null;
     if (task) return capText(task.title, MAX_INTENT);
-    return capText(`edit ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` and ${files.length - 3} more` : ''}`, MAX_INTENT);
+    return capText(`edit ${names.slice(0, 3).join(', ')}${names.length > 3 ? ` and ${names.length - 3} more` : ''}`, MAX_INTENT);
   }
 
   private blockedBy(project: string, task: Pick<Task, 'deps'>): string[] {
@@ -1332,24 +1381,14 @@ export function assertProject(project: unknown): asserts project is string {
   }
 }
 
-function normalizeScope(req: ClaimRequest): ScopeEntry[] {
-  const raw: ScopeEntry[] = [...(req.scope ?? []), ...(req.files ?? []).map((file) => ({ file }))];
-  if (raw.length === 0) throw new HubError('bad_request', 'a claim needs at least one file');
-  const seen = new Set<string>();
-  const out: ScopeEntry[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== 'object') throw new HubError('bad_request', 'scope entries look like {file, symbol?}');
-    const file = normalizeRepoPath(entry.file);
-    const symbol = entry.symbol ? cleanText(entry.symbol, 200) : undefined;
-    const key = `${file}\u0000${symbol ?? ''}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(symbol ? { file, symbol } : { file });
-  }
-  if (unique(out.map((s) => s.file)).length > MAX_FILES_PER_CLAIM) {
+/** A claim request's entries and mapper (see requestScope): at least one, on at most MAX_FILES_PER_CLAIM files. */
+function normalizeScope(req: ClaimRequest): RequestScope {
+  const asked = requestScope(req);
+  if (asked.scope.length === 0) throw new HubError('bad_request', 'a claim needs at least one file');
+  if (claimFiles(asked).length > MAX_FILES_PER_CLAIM) {
     throw new HubError('bad_request', `a claim may cover at most ${MAX_FILES_PER_CLAIM} files`);
   }
-  return out;
+  return asked;
 }
 
 /**
@@ -1388,21 +1427,14 @@ function clampInt(value: unknown, fallback: number, min: number, max: number, na
   return Math.min(max, Math.max(min, Math.round(n)));
 }
 
-function hasFile(c: Claim, file: string): boolean {
-  return c.scope.some((s) => s.file === file);
-}
-
-function sameFiles(c: Claim, files: string[]): boolean {
-  const mine = claimFiles(c);
-  return mine.length === files.length && files.every((f) => mine.includes(f));
-}
-
 /**
- * Two claims that name the same file conflict unless they have one holder or
- * are both shared. Phase 1 is file-level: whatever the symbols.
+ * Two claims conflict when they have different holders, aren't both shared,
+ * and their entries overlap (design §1.10, with mapper gating: symbols count
+ * only between the same non-null mapper, otherwise each entry is its file).
+ * near() and inLine() find the candidates by file, a superset.
  */
 function clash(a: Claim, b: Claim): boolean {
-  return a.holder !== b.holder && !(a.mode === 'shared' && b.mode === 'shared');
+  return a.holder !== b.holder && !(a.mode === 'shared' && b.mode === 'shared') && scopesOverlap(a, b);
 }
 
 function byFile(claims: Claim[]): Map<string, Claim[]> {

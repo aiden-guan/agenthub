@@ -11,7 +11,7 @@ No dependency requests so far. Contract-amendment requests: one comment (H2), tw
 - A missing or wrong `x-hub-lander-token` answers 403 `forbidden`, since §1.9 has no other code for it. Accepted.
 - Both Phase 1 shapes the fixtures don't show are accepted with no amendment: `seq` on `status().landings`, and a partial `claim.released` without `was` or `reason`.
 - **README** (the new flags, env vars, startup warnings and how to make an approvers entry) is the integrator's job at CP2, with the landing-queue section and host guide (design §6.7 item 3).
-- **The optional hardening is recommended for H5:** when the hub has a `--lander-token`, also require it on `/heartbeat`, `/claims/release` and `/events` from an `x-hub-agent` under `lander/`. Lane L's `HubClient` already sends `x-hub-lander-token` on every request when a token is set, so no lander change is needed. Without the token, only fencing protects against a forced lease change.
+- **The optional hardening is recommended for H5 (done there):** when the hub has a `--lander-token`, also require it on `/heartbeat`, `/claims/release` and `/events` from an `x-hub-agent` under `lander/`. Lane L's `HubClient` already sends `x-hub-lander-token` on every request when a token is set, so no lander change is needed. Without the token, only fencing protects against a forced lease change.
 - **Real-server check.** The integrator ran the lander suite (108 passed) and the adapter suite (247 passed, 1 skipped) against H4's `startServer` in place of their test fronts. That change was not committed; lanes L and A switch their rigs next. The CP1 dogfood also used `hub-server` itself, with `--approvers`, a restart on the same database while a landing was parked, and a lander handover. Every response matched what the clients expected.
 - **Dogfood note, behaviour as designed:** `next` picks among *queued* landings, so a kept-place retry (L-5, holding L-3's `queue_seq`) that was still `submitted` was overtaken by a landing admitted a moment earlier (L-4). No change.
 
@@ -130,4 +130,79 @@ Fixture conformance (`server.landing.test.ts`): one scenario sends every request
 For the integrator:
 
 - **README (frozen).** The three new flags and env vars, the startup warnings, and how to make an approvers entry (`approverTokenDigest` from `@agenthub/hub`, or `printf %s "$TOKEN" | sha256sum`).
-- **Optional hardening, not done.** Anyone who can reach a hub (and has the bearer token, if set) can send `x-hub-agent: lander/...` to `/claims/release` or `/heartbeat` for the lease: fencing keeps that safe (T9/T10), but it can force a lease change. Requiring the lander token on every request from a `lander/` agent id is a few lines in `server.ts`, once lane L's client sends the header on every request.
+- **Optional hardening, not done.** Anyone who can reach a hub (and has the bearer token, if set) can send `x-hub-agent: lander/...` to `/claims/release` or `/heartbeat` for the lease: fencing keeps that safe (T9/T10), but it can force a lease change. Requiring the lander token on every request from a `lander/` agent id is a few lines in `server.ts`, once lane L's client sends the header on every request. **Done in H5** (see H5 below).
+
+## H5: symbol-scope claims
+
+No dependency or contract-amendment requests. One integrator ruling is needed: a Phase 1 test whose premise the frozen contract reverses (first item under "For the integrator").
+
+Layout:
+
+- **`src/scope.ts` (new).** `requestScope` (the entries of a claim or check request), `parseMapper`, `claimMapper`, `scopesOverlap` and `overlapping`, `sameScope`, `inOrderOf`, `groupByFile`, `entryKey`. `scopesOverlap(a, b)` is `overlappingEntries(a, b).length > 0` without building the list, and `overlapping` is `overlappingEntries` itself. Once a pair of scopes has more than 64 entry pairs, both look the other side up by file. That is the same answer, because entries of different files never overlap. A seeded property test checks that both equal the contract function, for small and large scopes.
+- **`src/hub.ts`.** `claim()` and `standing()` compare entries. `check()` takes a `CheckRequest`, and Phase 1's `(files, mode)` form still works. `clash()` adds `scopesOverlap`. `leftAlone()` also counts the files of an event's `scope`. Claim events carry `mapper`.
+- **`src/holds.ts`.** Hold events carry `mapper`. A hold row re-made under another mapper emits `claim.granted` with all its entries and the new mapper, and counts as `trimmed`.
+- **`src/server.ts`.** `POST /claims/check` passes `files`, `scope`, `mapper` and `mode` through. As in Phase 1, a `files` that isn't a list names no files. The CP1 hardening is also here (see below).
+
+Decisions lanes A and L build on:
+
+- **Validation.**
+  - A `symbol` that is null or absent means the whole file. Anything else must be a declaration key once NFC-normalized (`isValidSymbolKey`), or 400 `invalid_symbol`. That includes `''`, non-strings and NFD spellings, which are accepted and stored as NFC.
+  - Any symbol entry needs `mapper`, or 400 `invalid_symbol`. This applies to `/claims` and `/claims/check` alike.
+  - `mapper` is a string of at most 200 characters that `cleanText` leaves unchanged: no control characters, and no runs of or surrounding whitespace. Otherwise 400 `bad_request`. `''` means none. Valid values are exactly the ones the landing path's `cleanText(mapper)` keeps as they are, so a claim's mapper and a landing's compare equal exactly when the client sent the same string.
+  - A whole-file entry subsumes the symbol entries of its file within one request. Entries keep request order: `scope` first, then `files`.
+- **What a claim stores.** A claim stores the request's mapper only when it has a symbol entry. A whole-file-only claim stores `mapper: null`, since there is nothing for one to say. Its events carry the same value.
+- **Coverage.**
+  - Coverage is `claimCovers` plus Phase 1's mode rule: an exclusive request needs an exclusive claim.
+  - A whole-file claim covers any request on its file. A symbol covers itself and its members under the same mapper.
+  - A member never covers its container.
+  - A stored symbol entry with `mapper: null` covers nothing. Such entries can only come from a Phase 1 database. A new request then gets its own claim, which never conflicts with its holder's.
+- **Conflicts.**
+  - Another agent's claim is in the way when `overlappingEntries(uncovered entries, it)` is non-empty. `ClaimConflict.scope` lists those entries in the holder's order, and `files` lists their files.
+  - The guard check (no `mode`) reports the overlapping entries of other agents' exclusive claims and holds.
+  - **`check` with a `mode`** takes the request's entries one file at a time, all of that file's entries together. That is what one edit-hook request claims: one edit's keys of one file. It generalizes Phase 1's "each file alone". One claim's conflicts are merged: `files` in the order met, `scope` in the holder's order.
+- **The queue.**
+  - Queued claims and promotions use `clash()` = different holders, not both shared, and `scopesOverlap`. `near()`, `byFile()` and `inLine()` still find candidates by file, as a superset.
+  - The same request asked again renews its queued claim (`sameScope`: the same entries, and the same mapper when they name a symbol).
+  - Deadlock detection follows, because it runs on the same graph.
+- **The cached wait graph (the H2 note).**
+  - When admission trims one symbol from a hold that keeps other entries of the file, the partial `claim.released` has `files: []`. `leftAlone()` now also counts the files of an event's `scope`, so the graph is rebuilt and a waiter for that symbol is promoted in the same write. Tested; the test fails with the check removed.
+  - Changing a hold's mapper changes how it overlaps. `setHolds` therefore re-announces the row and sets `trimmed`, and its caller runs `promoteQueued`. A waiter that was blocked only because the adapter's and the lander's mappers differed then gets in. Tested the same way.
+- **`release({files})`** already dropped every entry of those files. Its partial `claim.released` now also carries `mapper`.
+- **Performance.** A release that promotes the next of 1000 waiters for one file takes about 120 ms here, for whole-file and symbol claims alike. Phase 1's bound in that test is 1 s, and its suite time is unchanged within noise.
+- **`covers ⇒ overlaps` has one exception, by design.** The property in §4.2 #12 and §5.1 holds except for `@imports` against `@imports` (§1.10 rule 3). An `@imports` claim renews its holder's next `@imports` request, but never conflicts with another agent's. The property tests assert exactly that exception. No amendment is needed, but §4.2 #12 could say so.
+
+Tests:
+
+- **`symbol-scope.test.ts` (new).** Every acceptance item of the brief:
+  - disjoint symbols are granted;
+  - the same symbol, container vs member and file vs symbol are denied, with `scope` naming the entries;
+  - `@imports` next to `@imports` is granted;
+  - a mapper mismatch, and a stored null mapper with symbols, compare at file level;
+  - queue promotion entry by entry, including `release {files}`;
+  - seeded property tests: symmetry, `covers ⇒ overlaps` and mapper mismatch at the contract level and through the hub; the stored null mapper; the indexed helpers equal the contract;
+  - the Phase 1 race tests rerun on one contended symbol: 2 and 30 HTTP clients, and 6 OS processes. Each grants exactly one, and 30 clients on 30 symbols of one file are all granted.
+
+  It also covers coverage, `invalid_symbol`, `check` with a scope, the events, deadlock, the hold trim and remap, and a hold on one symbol.
+- **`test/fixtures/race-child.mjs`** takes optional `[symbol mapper]` after `[file] [lander]`. Pass `''` for `lander` in an agent's run. The old forms are unchanged.
+- **`server.landing.test.ts`.** H4's `it.todo` for `invalid_symbol` is now a test over HTTP: `/claims` and `/claims/check`, plus symbol-level answers.
+
+For the integrator:
+
+- **Ruling needed: one Phase 1 test could not stay unchanged.**
+  - The test is `hub.test.ts` "is file-level in Phase 1: different symbols in one file still conflict". It claims symbols without a mapper and expects a denial.
+  - The frozen `ClaimRequest.mapper` comment, §1.9 and the H5 brief all make that request 400 `invalid_symbol`. The same brief and §5.1 also say the Phase 1 suites stay unchanged, so the two can't both hold.
+  - I followed the frozen contract. The test now asserts `invalid_symbol` for that request, and that the same row as Phase 1 stored it (a symbol with `mapper: null`) still conflicts as the whole file.
+  - No real client is affected: Phase 1 adapters never send symbols (the hooks, `hub_claim` and `hub claim` all send `files`).
+  - Every other Phase 1 test passes unchanged.
+  - If you prefer the other reading (symbols without a mapper accepted and compared as whole files), it is a two-line change in `requestScope`, and the HTTP test above flips.
+- **Two lane tests changed.**
+  - H2's `landings.queue.test.ts` checks one event's data exactly, which now includes `mapper: null`.
+  - H4's two lease releases in `server.landing.test.ts` now send the lander token, because of the hardening below.
+- **The CP1 hardening is done.**
+  - On a hub with `--lander-token`, an `x-hub-agent` under `lander/` must send it on `/heartbeat`, `/claims/release` and `GET /events` too. Otherwise 403 `forbidden`, with a message that names the header and never the token.
+  - Agents and tokenless hubs are unchanged. Lane L's `HubClient` sends the header on every request, and nothing in `packages/lander/src` calls those routes another way.
+  - Tested in `server.landing.test.ts`. The full suite passes with it.
+- **README (frozen), CP3:**
+  - symbol claims: `mapper` required with symbols, `invalid_symbol`, file-level across mappers;
+  - `check` with `scope`;
+  - the hardening (a lander sends its token on every request).

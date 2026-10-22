@@ -94,6 +94,7 @@ describe('queue-mode land', () => {
       task_id: 'T-1',
       landing_id: 'L-1',
       scope: hold.scope,
+      mapper: null,
     });
     expect(mine[3].data).toEqual({ task_id: 'T-1', status: 'landing', previous: 'in_progress' });
     expect(mine[4]).toMatchObject({

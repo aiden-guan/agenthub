@@ -6,7 +6,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import { approverTokenMatches, isLoopbackAddress, parseApprovers, sameSecret } from './auth.js';
 import { Hub, HubError, assertAgent, isVisibleTo, type HubAuth } from './hub.js';
 import { HUMAN_RE } from './landing-requests.js';
-import type { EventsResult, FeedClientFrame, FeedServerFrame, HubEvent, LandingStatus, TaskStatus } from './protocol.js';
+import type { CheckRequest, EventsResult, FeedClientFrame, FeedServerFrame, HubEvent, LandingStatus, TaskStatus } from './protocol.js';
 
 export interface ServerOptions {
   hub: Hub;
@@ -71,6 +71,13 @@ export interface RunningServer {
 interface Credentials {
   /** A lander route (`required`), or a claim that names the lease key: whether the caller is a lander. */
   lander(ctx: RequestContext, required: boolean): boolean;
+  /**
+   * Any other request a lander makes for its lease (heartbeat, release,
+   * events): on a hub with a lander token, an agent id under `lander/` must
+   * send it too (403 forbidden), so nobody can renew, release or follow a
+   * lease as a lander without it. Without a token, nothing is checked.
+   */
+  landerAgent(ctx: RequestContext): void;
   /** An approver route: the human the approver token belongs to. */
   approver(ctx: RequestContext): string;
 }
@@ -170,6 +177,18 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         );
       }
       return isLander;
+    },
+    landerAgent(ctx) {
+      if (opts.landerToken === undefined || ctx.agent === null || !ctx.agent.startsWith('lander/')) return;
+      const given = header(ctx.req, 'x-hub-lander-token');
+      if (given !== null && sameSecret(given, opts.landerToken)) return;
+      throw new HubError(
+        'forbidden',
+        given === null
+          ? `${ctx.agent} is a lander id: on this hub a lander sends the hub’s lander token in x-hub-lander-token with every request (hub-lander reads it from HUB_LANDER_TOKEN)`
+          : 'wrong x-hub-lander-token: it is not this hub’s --lander-token',
+        403,
+      );
     },
     approver(ctx) {
       if (approverDigests === null && !opts.allowUnauthenticatedApprovals) {
@@ -464,7 +483,10 @@ function buildRoutes(hub: Hub, maxWaitMs: number, credentials: Credentials): Rou
 
   return [
     r('GET', '/status', (c) => hub.status(c.project, c.agent)),
-    r('POST', '/heartbeat', (c) => hub.heartbeat(c.project, me(c), c.body)),
+    r('POST', '/heartbeat', (c) => {
+      credentials.landerAgent(c);
+      return hub.heartbeat(c.project, me(c), c.body);
+    }),
 
     r('GET', '/tasks', (c) => ({ tasks: hub.listTasks(c.project) })),
     r('POST', '/tasks', (c) => ({ task: hub.createTask(c.project, me(c), c.body as any) })),
@@ -483,8 +505,11 @@ function buildRoutes(hub: Hub, maxWaitMs: number, credentials: Credentials): Rou
       const isLander = credentials.lander(c, namesReservedPath(c.body));
       return hub.claim(c.project, me(c), c.body, { lander: isLander, approver: null });
     }),
-    r('POST', '/claims/release', (c) => hub.release(c.project, me(c), c.body)),
-    r('POST', '/claims/check', (c) => hub.check(c.project, c.agent, checkedFiles(c.body), c.body.mode ?? undefined)),
+    r('POST', '/claims/release', (c) => {
+      credentials.landerAgent(c);
+      return hub.release(c.project, me(c), c.body);
+    }),
+    r('POST', '/claims/check', (c) => hub.check(c.project, c.agent, checkRequest(c.body))),
     r('GET', '/claims/:id', (c) => ({ claim: hub.getClaim(c.project, c.params[0]) })),
 
     r('POST', '/messages', (c) => ({ message: hub.post(c.project, me(c), c.body as any) })),
@@ -544,7 +569,10 @@ function buildRoutes(hub: Hub, maxWaitMs: number, credentials: Credentials): Rou
     }),
     r('POST', '/lander/resume', (c) => hub.resumeLander(c.project, c.body as any, approver(c))),
 
-    r('GET', '/events', (c) => longPollEvents(hub, c, maxWaitMs)),
+    r('GET', '/events', (c) => {
+      credentials.landerAgent(c);
+      return longPollEvents(hub, c, maxWaitMs);
+    }),
   ];
 }
 
@@ -555,15 +583,12 @@ function namesReservedPath(body: Record<string, any>): boolean {
 }
 
 /**
- * The files a check names: `files`, and the files of `scope` entries. Until
- * the hub compares symbol entries (Phase 3), a scope is checked whole-file,
- * which can only find more conflicts, never fewer.
+ * A check body as the hub takes it (CheckRequest). As in Phase 1, `files`
+ * that isn't a list names no files; the hub validates the rest (400
+ * bad_request, invalid_path, invalid_symbol).
  */
-function checkedFiles(body: Record<string, any>): string[] {
-  const files = Array.isArray(body.files) ? body.files : [];
-  const scope = Array.isArray(body.scope) ? body.scope.map((e: any) => (e !== null && typeof e === 'object' ? e.file : e)) : [];
-  // Not checked here: the hub refuses anything that isn't a repo path (400 invalid_path).
-  return [...files, ...scope];
+function checkRequest(body: Record<string, any>): CheckRequest {
+  return { files: Array.isArray(body.files) ? body.files : [], scope: body.scope ?? undefined, mapper: body.mapper ?? undefined, mode: body.mode ?? undefined };
 }
 
 /** A comma-separated query parameter as a list; undefined when absent or empty. */

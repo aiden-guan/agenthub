@@ -292,7 +292,7 @@ describe('landing routes over HTTP: the contract fixtures (design §6.3.7)', () 
     await w.admit(lease, Z, ['src/z.ts']);
     expect((await w.next(lease)).landing.id).toBe(Z);
     await w.pushing(lease, Z, { trunk_base: '5d4c3b2a1908f7e6d5c4b3a2918f7e6d5c4b3a29' });
-    await ok('POST', '/claims/release', { claim_id: lease.lease_claim_id }, { agent: LANDER });
+    await ok('POST', '/claims/release', { claim_id: lease.lease_claim_id }, asLander);
     const lease2 = await w.takeLease();
     const inDoubt = await ok('POST', '/lander/next', { ...fixture('lander.next.request.json'), lease: lease2 }, asLander);
     expectShape(inDoubt, 'lander.next.resolve.response.json');
@@ -597,7 +597,7 @@ describe('landing routes: happy paths and the errors design §1.7 lists', () => 
     // resolve is for a landing in pushing only.
     await w.refused([409, 'landing_stale'], 'POST', '/landings/L-1/resolve', { lease, outcome: 'requeue', trunk_sha: sha('b') }, asLander);
     // The lease ends: every lander write is refused.
-    await w.ok('POST', '/claims/release', { claim_id: lease.lease_claim_id }, { agent: LANDER });
+    await w.ok('POST', '/claims/release', { claim_id: lease.lease_claim_id }, asLander);
     await w.refused([409, 'not_lander'], 'POST', '/landings/L-1/advance', { lease, attempt: 1, to: 'running', phase: 'checking', deadline_ms: MIN }, asLander);
     await w.refused([409, 'not_lander'], 'POST', '/landings/L-1/resolve', { lease, outcome: 'requeue', trunk_sha: sha('b') }, asLander);
     // A new lease: the landing came back (lander_lost), and admitting a closed landing is refused.
@@ -649,7 +649,21 @@ describe('landing routes: happy paths and the errors design §1.7 lists', () => 
     expect((await w.ok('POST', '/claims/check', { scope: [{ file: 'free.ts' }] }, { agent: B })).conflicts).toEqual([]);
   });
 
-  it.todo('claims and check: invalid_symbol for a bad symbol key or a symbol without a mapper (H5 validates claim scopes)');
+  it('claims and check: invalid_symbol for a bad symbol key or a symbol without a mapper, and symbol-level answers (H5)', async () => {
+    const w = await world();
+    const login = { file: 'a.ts', symbol: 'login' };
+    for (const route of ['/claims', '/claims/check']) {
+      await w.refused([400, 'invalid_symbol'], 'POST', route, { scope: [{ file: 'a.ts', symbol: 'not a key' }], mapper: 'm1' }, { agent: A });
+      await w.refused([400, 'invalid_symbol'], 'POST', route, { scope: [login] }, { agent: A });
+      await w.refused([400, 'bad_request'], 'POST', route, { scope: [login], mapper: 7 }, { agent: A });
+      await w.refused([400, 'bad_request'], 'POST', route, { scope: 'a.ts', mapper: 'm1' }, { agent: A });
+    }
+    expect((await w.ok('POST', '/claims', { scope: [login], mapper: 'm1' }, { agent: A })).claim).toMatchObject({ scope: [login], mapper: 'm1' });
+    expect((await w.ok('POST', '/claims', { scope: [{ file: 'a.ts', symbol: 'logout' }], mapper: 'm1' }, { agent: B })).status).toBe('granted');
+    expect((await w.ok('POST', '/claims/check', { scope: [{ file: 'a.ts', symbol: 'refresh' }], mapper: 'm1' }, { agent: C })).conflicts).toEqual([]);
+    expect((await w.ok('POST', '/claims/check', { scope: [login], mapper: 'm1', mode: 'auto' }, { agent: C })).conflicts).toEqual([expect.objectContaining({ holder: A, scope: [login] })]);
+    expect((await w.ok('POST', '/claims/check', { files: ['a.ts'] }, { agent: C })).conflicts.map((c: any) => c.holder)).toEqual([A, B]);
+  });
 });
 
 // ---------------------------------------------------- lander credentials
@@ -696,6 +710,31 @@ describe('lander credentials (design §1.2, §1.7)', () => {
       }
       expect((await w.ok('POST', '/lander/next', { lease }, asLander)).landing).toBeNull();
     }
+  });
+
+  it('with a lander token, a lander/ agent id needs it on heartbeat, release and events too; other agents and tokenless hubs are unchanged', async () => {
+    const w = await world({ landerToken: LANDER_TOKEN });
+    const lease = await w.takeLease();
+    const asIs: Array<[string, string, Record<string, unknown> | undefined]> = [
+      ['POST', '/heartbeat', { claim_ids: [lease.lease_claim_id] }],
+      ['GET', '/events?since=0', undefined],
+      ['POST', '/claims/release', { files: ['nothing.ts'] }],
+    ];
+    for (const [method, route, body] of asIs) {
+      for (const bad of [undefined, 'wrong']) {
+        const err = await w.refused([403, 'forbidden'], method, route, body, { agent: LANDER, landerToken: bad });
+        expect(err.message).toContain('x-hub-lander-token');
+        expect(err.message).not.toContain(LANDER_TOKEN);
+      }
+      await w.ok(method, route, body, asLander);
+      await w.ok(method, route, body, { agent: A });
+    }
+    // Nobody released the lease or let it lapse.
+    expect(w.s.hub.getClaim('demo', lease.lease_claim_id).status).toBe('active');
+    // A loopback hub without a token checks nothing, as before.
+    const open = await world({});
+    await open.ok('POST', '/heartbeat', {}, { agent: LANDER });
+    await open.ok('GET', '/events?since=0', undefined, { agent: LANDER });
   });
 
   it('on loopback without a token, lander/ agents may use the lander routes and claim the lease; other agents may not', async () => {
