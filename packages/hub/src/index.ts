@@ -16,3 +16,4 @@ export type {
 export { SqliteStore } from './sqlite-store.js';
 export { Hub, HubError, NO_AUTH, type HubAuth, type HubOptions, normalizeRepoPath, cleanText, isVisibleTo } from './hub.js';
 export { startServer, type ServerOptions, type RunningServer } from './server.js';
+export { approverTokenDigest, parseApprovers, readApproversFile, isLoopbackHost, isLoopbackAddress } from './auth.js';
