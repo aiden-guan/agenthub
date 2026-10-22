@@ -7,6 +7,14 @@ No dependency requests so far. Contract-amendment requests: one comment (H2), tw
 - H3 admit failure: `LandingAdmitRequest` gained `code?: LandingFailureCode; report?: LandingReport`.
 - H3 parked candidate: the `needs_approval` variant of `LandingAdvanceRequest` gained `candidate?: string; candidate_ref?: string`.
 
+**Integrator, CP1 (H4 merged): no requests to apply.** H4 queued no contract-amendment or dependency requests. Rulings and follow-ups:
+- A missing or wrong `x-hub-lander-token` answers 403 `forbidden`, since §1.9 has no other code for it. Accepted.
+- Both Phase 1 shapes the fixtures don't show are accepted with no amendment: `seq` on `status().landings`, and a partial `claim.released` without `was` or `reason`.
+- **README** (the new flags, env vars, startup warnings and how to make an approvers entry) is the integrator's job at CP2, with the landing-queue section and host guide (design §6.7 item 3).
+- **The optional hardening is recommended for H5:** when the hub has a `--lander-token`, also require it on `/heartbeat`, `/claims/release` and `/events` from an `x-hub-agent` under `lander/`. Lane L's `HubClient` already sends `x-hub-lander-token` on every request when a token is set, so no lander change is needed. Without the token, only fencing protects against a forced lease change.
+- **Real-server check.** The integrator ran the lander suite (108 passed) and the adapter suite (247 passed, 1 skipped) against H4's `startServer` in place of their test fronts. That change was not committed; lanes L and A switch their rigs next. The CP1 dogfood also used `hub-server` itself, with `--approvers`, a restart on the same database while a landing was parked, and a lander handover. Every response matched what the clients expected.
+- **Dogfood note, behaviour as designed:** `next` picks among *queued* landings, so a kept-place retry (L-5, holding L-3's `queue_seq`) that was still `submitted` was overtaken by a landing admitted a moment earlier (L-4). No change.
+
 ## H1: storage and migration
 
 Decisions later steps build on:

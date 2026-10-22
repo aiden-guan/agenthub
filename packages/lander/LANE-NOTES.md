@@ -1,5 +1,20 @@
 # @agenthub/lander: lane L notes
 
+## Integrator, CP1
+
+L2 and L3 merged with H4, A1 and A2. No contract-amendment or dependency requests were queued, so nothing was applied. gitops' `mergeFile` and `pathHistory` are additive exports outside the frozen interface and need no amendment. Rulings on the design questions under "L3 repair round 1":
+
+- **`Agenthub-Approved` on the approved fast path: the lander's behaviour stands.** §3.7 step 4 and §4.1 #3 forbid rebuilding a checked candidate between its check and its push, and those safety rules outrank §1.1's trailer list. §1.1 is read as: the trailer lists the approvals granted when the candidate was built, and the hub's approval audit (`landing_approvals`) is the record. The dogfood saw both cases: L-1 was approved while parked and pushed on the fast path, so it has no trailer; L-6 was approved after trunk moved, rebuilt as attempt 2, and has `Agenthub-Approved: protected:maya`.
+- **§2.2.5 P3 for a stacked branch that merged trunk by hand: P3 stays as written.** It asks again, which is safe. Skipping protected paths whose blob at `H` equals `T0`'s may be proposed with L4. It needs a test showing that no content reaches trunk without an approval.
+- **T5 vs the hub's `enterPushing`: the hub's stricter check stays.** `pushing` also needs the approvals still pending from admission, so nothing reaches trunk without an approval it once asked for. Admission's narrowing of a stacked landing's `required` keeps the extra asks rare.
+- **Test rig.** `test/hub-http.ts` still stands in for H4. The integrator ran the whole lander suite against H4's real `startServer` (`allowUnauthenticatedApprovals: true`, the same `landerToken` and sweep), and all 108 passed. That change was not committed. Lane L should switch `startHubFront` over (or drop it) in its next step, so §5.3 runs against the real HTTP layer.
+- **Dogfood (real `hub-server`, `hub-lander run`, two worktrees, no AI):**
+  - 10 landings, all with the four required trailers, and every task done.
+  - One `checks_failed`, reproduced with the brief's `reproduce` line. One same-line `conflict`, then a merge-mode fix.
+  - A parked protected approval, and a protected landing re-run after trunk moved.
+  - A SIGTERM handover to a standby; its GC deleted a landed landing's attempt-1 candidate.
+  - What was left: the failed L-3's candidate (7-day grace) and two failed landings' land refs (1-hour grace), as §1.1 says.
+
 ## L2 (done): config, hub client, ports, checks runner, report builders, redaction
 
 Files: `src/ports.ts`, `src/config.ts`, `src/hub-client.ts`, `src/git-port.ts` (new, not in the brief's list: the real `GitPort`, needed by the report builder), `src/checks.ts`, `src/report.ts`, `src/redact.ts`. Tests: `test/{config,hub-client,checks,report,redact}.test.ts`, `test/helpers.ts`.
