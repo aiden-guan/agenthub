@@ -366,8 +366,14 @@ describe('landing routes over HTTP: the contract fixtures (design §6.3.7)', () 
     expectShape({ ...log, events: [] }, 'events.landing.json', (f) => ({ ...f, events: [] }));
     expect(eventProblems(log.events, fixtureEvents.events)).toEqual([]);
     const types = new Set(log.events.map((e: HubEvent) => e.type));
-    const missing = [...new Set<string>(fixtureEvents.events.map((e: HubEvent) => e.type))].filter((t) => t !== 'symbol.changed' && !types.has(t as HubEvent['type']));
+    const missing = [...new Set<string>(fixtureEvents.events.map((e: HubEvent) => e.type))].filter((t) => !types.has(t as HubEvent['type']));
     expect(missing).toEqual([]);
+    // The landed fixtures' symbol_changes were recorded: landed rows of the landing's task, announced without signature text.
+    const landedChanges = log.events.filter((e: HubEvent) => e.type === 'symbol.changed' && e.data.status === 'landed');
+    expect(landedChanges.map((e: HubEvent) => [e.data.landing_id, e.data.task_id, e.data.symbol])).toEqual([
+      [X, t1, 'login'],
+      [Z, t3, 'login'],
+    ]);
 
     // Record mode, on a project that never had a lander.
     const rec = (method: string, route: string, body?: unknown, as: As = {}) => call(w.s.url, method, route, body, as, 'acme/web');
@@ -383,7 +389,28 @@ describe('landing routes over HTTP: the contract fixtures (design §6.3.7)', () 
     expect([...used].sort()).toEqual(all.filter((f) => !LATER.includes(f)).sort());
   });
 
-  it.todo('accepts symbol-changes.request.json and answers in symbol-changes.response.json’s shape (H6 adds the routes)');
+  it('accepts symbol-changes.request.json and answers POST and GET /symbol-changes in symbol-changes.response.json’s shape', async () => {
+    const w = await world();
+    const t = await w.task(A, 'Let login take an options object');
+    const decision = (await w.ok('POST', '/decisions', { summary: 'login() takes an options object instead of positional flags', task_id: t, symbols: ['login'] }, { agent: A })).decision;
+    // Only task_id is replaced by the live value.
+    const req = fixture('symbol-changes.request.json');
+    const posted = await w.ok('POST', '/symbol-changes', { changes: req.changes.map((c: any) => ({ ...c, task_id: t })) }, { agent: A });
+    expectShape(posted, 'symbol-changes.response.json');
+    expect(posted.changes.map((c: any) => [c.id, c.symbol, c.name, c.kind, c.status, c.task_id, c.renamed_to])).toEqual([
+      ['S-1', 'login', 'login', 'signature', 'in_progress', t, null],
+      ['S-2', 'rememberDays', 'rememberDays', 'renamed', 'in_progress', t, 'sessionDays'],
+    ]);
+    expect(posted.changes[0].decisions).toEqual([{ id: decision.id, agent: A, summary: decision.summary }]);
+    const read = await w.ok('GET', '/symbol-changes?status=in_progress,landed', undefined, {});
+    expectShape(read, 'symbol-changes.response.json');
+    expect(read.changes.map((c: any) => c.id)).toEqual(['S-2', 'S-1']);
+    // symbol.changed in the event fixture's shape.
+    const changed = (await w.events(0, { agent: B })).filter((e) => e.type === 'symbol.changed');
+    expect(changed.map((e) => e.data.change_id)).toEqual(['S-1', 'S-2']);
+    expect(eventProblems(changed, fixture('events.landing.json').events)).toEqual([]);
+    for (const f of LATER) expect(used.has(f), f).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------- a full cycle

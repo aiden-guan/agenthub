@@ -1,7 +1,8 @@
-import { FULL_SHA_RE, RESERVED_PREFIX, isValidSymbolKey } from '@agenthub/contract';
-import { HubError, cleanText, normalizeRepoPath, unique } from './common.js';
+import { FULL_SHA_RE, isValidSymbolKey } from '@agenthub/contract';
+import { HubError, assertNotReserved, cleanText, normalizeRepoPath, unique } from './common.js';
 import { PATH_FORBIDDEN_RE } from './protocol.js';
 import { collapseCrowded } from './scope.js';
+import { landedChangeInputs, type ChangeInput } from './symbol-changes.js';
 import type {
   ApprovalKind,
   ApprovalRequirement,
@@ -12,7 +13,6 @@ import type {
   LandingReport,
   RequeueReason,
   ScopeEntry,
-  SymbolChangeInput,
 } from './protocol.js';
 
 // Validation of the lander's and the approvers' request bodies (design §1.7),
@@ -89,12 +89,12 @@ export type AdvanceInput =
       files: string[] | null;
       report: LandingReport | null;
       also_landed: string[];
-      symbol_changes: SymbolChangeInput[];
+      symbol_changes: ChangeInput[];
     }
   | { to: 'failed'; lease: LanderAuth; attempt: number; code: LandingFailureCode; report: LandingReport };
 
 export type ResolveInput =
-  | { outcome: 'landed'; lease: LanderAuth; trunk_sha: string; symbol_changes: SymbolChangeInput[] }
+  | { outcome: 'landed'; lease: LanderAuth; trunk_sha: string; symbol_changes: ChangeInput[] }
   | { outcome: 'requeue'; lease: LanderAuth; trunk_sha: string };
 
 export interface TrunkCommit {
@@ -387,17 +387,17 @@ export function normalizeLandingScope(raw: unknown[], mapper: string | null): Sc
   return collapseCrowded(out);
 }
 
-/** Paths under RESERVED_PREFIX belong to the lander lease: no landing may name them (403 forbidden). */
-export function assertNotReserved(path: string): string {
-  if (path.startsWith(RESERVED_PREFIX)) {
-    throw new HubError('forbidden', `${path} is under ${RESERVED_PREFIX}, which is reserved for the lander lease`, 403);
-  }
-  return path;
-}
-
-function symbolChanges(value: unknown): SymbolChangeInput[] {
-  // Recorded from H6 on; until then only their shape is checked.
-  return list(value ?? [], 'symbol_changes', MAX_SYMBOL_CHANGES).map((c, i) => object(c, `symbol_changes[${i}]`) as unknown as SymbolChangeInput);
+/**
+ * The signature changes a landing made (design §2.5), recorded when it lands.
+ * Each is checked like an agent's (symbol-changes.ts), but one the hub can't
+ * record (a bad path or key, an unknown kind) is left out, as are any past the
+ * first MAX_SYMBOL_CHANGES, rather than refusing the report: by then trunk has
+ * moved, and a refused landed or resolve would leave the landing in doubt.
+ */
+function symbolChanges(value: unknown): ChangeInput[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw bad('symbol_changes must be a list');
+  return landedChangeInputs(value.slice(0, MAX_SYMBOL_CHANGES));
 }
 
 function failureCode(value: unknown): LandingFailureCode {

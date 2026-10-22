@@ -1,10 +1,11 @@
+import { RESERVED_PREFIX } from '@agenthub/contract';
 import { PATH_FORBIDDEN_RE, type Claim, type ClaimConflict, type HubEventType, type ScopeEntry, type Task } from './protocol.js';
 import type { Store } from './store.js';
 
-// What hub.ts shares with the modules it delegates to (landings.ts, holds.ts):
-// the error type, the text and path rules, and the narrow view of the hub's
-// internals those modules get. Nothing here imports hub.ts, so there is no
-// import cycle.
+// What hub.ts shares with the modules it delegates to (landings.ts, holds.ts,
+// symbol-changes.ts): the error type, the text and path rules, and the narrow
+// view of the hub's internals those modules get. Nothing here imports hub.ts,
+// so there is no import cycle.
 
 export class HubError extends Error {
   constructor(
@@ -58,6 +59,8 @@ export interface HubInternals {
   withBlocked(project: string, task: Omit<Task, 'blocked_by'>): Task;
   /** Throws 409 task_blocked when a dependency isn't done. */
   assertUnblocked(project: string, task: Pick<Task, 'id' | 'deps'>, what: 'taken' | 'completed' | 'landed'): void;
+  /** An explicit task id must exist (404 otherwise); without one, the agent's only task in progress, if any. */
+  resolveTaskId(project: string, agent: string, taskId: string | undefined): string | null;
 }
 
 const MAX_PATH = 4096;
@@ -80,6 +83,14 @@ export function normalizeRepoPath(input: unknown): string {
     throw invalidPath(p, 'has a ".", ".." or empty segment');
   }
   return p;
+}
+
+/** Paths under RESERVED_PREFIX belong to the lander lease: no landing or symbol change may name them (403 forbidden). */
+export function assertNotReserved(path: string): string {
+  if (path.startsWith(RESERVED_PREFIX)) {
+    throw new HubError('forbidden', `${path} is under ${RESERVED_PREFIX}, which is reserved for the lander lease`, 403);
+  }
+  return path;
 }
 
 function invalidPath(p: string, reason: string): HubError {

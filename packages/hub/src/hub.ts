@@ -92,6 +92,9 @@ import {
   type ReleaseResult,
   type ScopeEntry,
   type StatusResult,
+  type SymbolChangesRequest,
+  type SymbolChangesResult,
+  type SymbolChangeStatus,
   type Task,
   type TaskCreateRequest,
   type TaskStatus,
@@ -99,6 +102,7 @@ import {
 import { phase1Landing } from './landing-row.js';
 import { claimMapper, groupByFile, inOrderOf, overlapping, requestScope, sameScope, scopesOverlap, type RequestScope } from './scope.js';
 import type { AgentTouch, Store } from './store.js';
+import { linkDecisions, listSymbolChanges, parseListing, parseSymbolChangesRequest, recordSymbolChanges } from './symbol-changes.js';
 
 export { HubError, NO_AUTH, cleanText, normalizeRepoPath, type HubAuth } from './common.js';
 
@@ -189,6 +193,7 @@ export class Hub {
       touch: (project, agent, now) => this.touch(project, agent, now),
       withBlocked: (project, task) => this.withBlocked(project, task),
       assertUnblocked: (project, task, what) => this.assertUnblocked(project, task, what),
+      resolveTaskId: (project, agent, taskId) => this.resolveTaskId(project, agent, taskId),
     };
   }
 
@@ -710,6 +715,32 @@ export class Hub {
 
   listDecisions(project: string, limit = 20): Decision[] {
     return this.read(project, () => this.store.listDecisions(project, clampInt(limit, 20, 1, 500, 'limit')));
+  }
+
+  // -------------------------------------------------------- symbol changes
+  // Phase 3 (design §2.5): signature changes, in progress (agents) and landed
+  // (the lander, through advance and resolve landed), read with their decisions.
+
+  /**
+   * POST /symbol-changes: the agent's in-progress signature changes, each an
+   * upsert of its (agent, file, symbol) row; `after == before` withdraws it.
+   * 400 invalid_symbol for a key that isn't a declaration's, and nothing is
+   * written when any change is refused.
+   */
+  postSymbolChanges(project: string, agent: string, req: SymbolChangesRequest): SymbolChangesResult {
+    assertAgent(agent);
+    const changes = parseSymbolChangesRequest(req);
+    return this.write(project, (now) => {
+      this.touch(project, agent, now);
+      const rows = recordSymbolChanges(this.ix, project, agent, changes, now);
+      return { changes: linkDecisions(this.store, project, rows), now, seq: this.store.latestSeq(project) };
+    });
+  }
+
+  /** GET /symbol-changes?since_ms=&status=: by default the last 24 hours, in progress and landed, newest first. */
+  listSymbolChanges(project: string, opts: { since_ms?: number | string; statuses?: SymbolChangeStatus[] } = {}): SymbolChangesResult {
+    const filter = parseListing(opts);
+    return this.read(project, (now) => ({ changes: listSymbolChanges(this.store, project, filter, now), now, seq: this.store.latestSeq(project) }));
   }
 
   // --------------------------------------------------------------- landing
