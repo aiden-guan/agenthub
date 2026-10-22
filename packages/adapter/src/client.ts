@@ -25,6 +25,7 @@ import type {
   RejectRequest,
   ReleaseRequest,
   ReleaseResult,
+  ScopeEntry,
   StatusResult,
   SymbolChangeStatus,
   SymbolChangesRequest,
@@ -195,22 +196,41 @@ export class HubClient {
    * without it.
    */
   async check(files: string[], mode?: ClaimRequestMode): Promise<CheckResult> {
-    const batches: string[][] = [[]];
+    return this.checkInBatches(
+      files.map((f) => [f]),
+      (batch) => (mode ? { files: batch, mode } : { files: batch }),
+    );
+  }
+
+  /**
+   * The same check for scope entries (Phase 3): symbol entries compare with
+   * other claims' entries under the same `mapper` (design §1.10). Each file's
+   * entries stay in one request, since with `mode` the hub decides per file.
+   */
+  async checkScope(entries: ScopeEntry[], mapper: string | null, mode?: ClaimRequestMode): Promise<CheckResult> {
+    const byFile = new Map<string, ScopeEntry[]>();
+    for (const e of entries) (byFile.get(e.file) ?? byFile.set(e.file, []).get(e.file)!).push(e);
+    return this.checkInBatches([...byFile.values()], (batch) => ({ scope: batch, ...(mapper ? { mapper } : {}), ...(mode ? { mode } : {}) }));
+  }
+
+  /** POST /claims/check in requests small enough for the hub's body limit, each a run of whole groups, and the answers merged. */
+  private async checkInBatches<T>(groups: T[][], body: (batch: T[]) => object): Promise<CheckResult> {
+    const batches: T[][] = [[]];
     let size = 0;
-    for (const f of files) {
-      const bytes = Buffer.byteLength(JSON.stringify(f)) + 1;
+    for (const group of groups) {
+      const bytes = Buffer.byteLength(JSON.stringify(group)) + 1;
       if (size + bytes > CHECK_BATCH_BYTES && batches[batches.length - 1].length > 0) {
         batches.push([]);
         size = 0;
       }
-      batches[batches.length - 1].push(f);
+      batches[batches.length - 1].push(...group);
       size += bytes;
     }
     let result: CheckResult | null = null;
     let deadlock: string | undefined;
     const byClaim = new Map<string, ClaimConflict>();
     for (const batch of batches) {
-      result = await this.request<CheckResult>('POST', '/claims/check', mode ? { files: batch, mode } : { files: batch });
+      result = await this.request<CheckResult>('POST', '/claims/check', body(batch));
       deadlock ??= typeof result.deadlock === 'string' ? result.deadlock : undefined;
       for (const c of result.conflicts) {
         const seen = byClaim.get(c.claim_id);
@@ -226,6 +246,14 @@ export class HubClient {
     }
     const { deadlock: _last, ...rest } = result!;
     return { ...rest, conflicts: [...byClaim.values()], ...(deadlock ? { deadlock } : {}) };
+  }
+  /** Active and queued claims, all of them or those of one holder or one file (GET /claims). */
+  async claims(filter: { holder?: string; file?: string } = {}): Promise<Claim[]> {
+    const q = new URLSearchParams();
+    if (filter.holder) q.set('holder', filter.holder);
+    if (filter.file) q.set('file', filter.file);
+    const qs = q.toString();
+    return (await this.request<{ claims: Claim[] }>('GET', `/claims${qs ? `?${qs}` : ''}`)).claims;
   }
   async getClaim(id: string): Promise<Claim> {
     return (await this.request<{ claim: Claim }>('GET', `/claims/${encodeURIComponent(id)}`)).claim;

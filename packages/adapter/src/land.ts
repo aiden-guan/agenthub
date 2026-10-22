@@ -5,7 +5,7 @@
 
 import { landRef, protectedMatches, humanOf } from '@agenthub/contract';
 import { gitops, GitError, type Git } from '@agenthub/gitops';
-import type { ClaimConflict, HubEvent, Landing, LandResult } from '@agenthub/hub/protocol';
+import type { ClaimConflict, HubEvent, Landing, LandResult, ScopeEntry } from '@agenthub/hub/protocol';
 import { HubApiError, HubUnavailableError, type HubClient } from './client.js';
 import { AGENT_ID_RE, teamSections, type HubConfig, type TeamConfig } from './config.js';
 import { Feed } from './feed.js';
@@ -23,6 +23,7 @@ import {
   type OtherLanding,
 } from './format.js';
 import { currentBranch, fullHead, gitOperation, headCommit } from './git.js';
+import { MAX_LAND_SYMBOL_ENTRIES, diffScope } from './symbol-scope.js';
 
 export interface LandDeps {
   cfg: HubConfig;
@@ -188,6 +189,7 @@ async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig, f
   const matches = protectedMatches(files, land.protected);
   const protectedPaths = [...new Set(matches.flatMap((m) => m.paths))].sort();
   const commits = Number((await g.run(['rev-list', '--count', `${base}..${head}`])).stdout.trim()) || 1;
+  const symbols = await landScope(root, base, head, team);
 
   // 6. Push the land ref: a plain push of a name that is its own content, never forced.
   const ref = landRef(land.refPrefix, head);
@@ -211,6 +213,7 @@ async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig, f
       summary,
       // Advisory (the lander recomputes them): at most what the hub takes.
       files: files.slice(0, MAX_ADVISORY_FILES),
+      ...symbols,
       preview: { trunk_seen: trunkSha, conflicts: conflicts.map((c) => c.file), protected: protectedPaths },
     });
   } catch (err) {
@@ -327,6 +330,34 @@ function landingIdOf(value: string | null, project: string): string | null {
 }
 
 /** Paths git already sees conflicting with trunk, each with the trunk landings that changed it since the base. */
+/**
+ * Phase 3, advisory (design §2.3.2 steps 5 and 7; the lander maps the change
+ * again at admission): the declarations the change touches, with this
+ * adapter's mapper. With them the hub holds those declarations rather than
+ * whole files, and the agent's own symbol claims carry into the holds as
+ * symbols (the hub compares them under the request's mapper): without a
+ * mapper every one of them would become its whole file, and collide with
+ * other agents' claims on other declarations of those files. Files that
+ * aren't mapped go in `files`, which the hub holds whole. Never fails a land.
+ */
+async function landScope(root: string, base: string, head: string, team: TeamConfig): Promise<{ scope?: ScopeEntry[]; mapper?: string }> {
+  try {
+    const mapped = await diffScope(root, base, head, { symbols: team.sections.symbols, wantMapper: true });
+    if (!mapped.mapper) return {};
+    // Whole files' worth of symbol entries, within what one request should carry.
+    const byFile = new Map<string, ScopeEntry[]>();
+    for (const e of mapped.scope) if (e.symbol !== undefined) (byFile.get(e.file) ?? byFile.set(e.file, []).get(e.file)!).push(e);
+    const scope: ScopeEntry[] = [];
+    for (const entries of byFile.values()) {
+      if (scope.length + entries.length > MAX_LAND_SYMBOL_ENTRIES) break;
+      scope.push(...entries);
+    }
+    return { ...(scope.length ? { scope } : {}), mapper: mapped.mapper };
+  } catch {
+    return {}; // the whole files, as in Phase 2
+  }
+}
+
 async function previewConflicts(g: Git, trunkSha: string, head: string, base: string, project: string): Promise<LandContext['conflicts']> {
   const files = await gitops.forecastConflicts(g, trunkSha, head, base);
   if (files.length === 0) return [];

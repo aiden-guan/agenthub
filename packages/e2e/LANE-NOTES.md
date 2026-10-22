@@ -61,3 +61,7 @@ The A5 verifier's minors, fixed by the integrator (each shown to bite):
 - The `--stats` expectation accepts seconds (`median 1 s`), after the CP2 `minutes()` change.
 
 `scripts/demo.sh` (Part 2) reuses `fixtures/stub-resolver.mjs` and `fixtures/repo/check.mjs`; keep their command-line contract (config as the first argument; `node check.mjs` failing on the marker) or update the demo with them.
+
+## A3 (lane A): the Phase 2 world turns symbol claims off
+
+From A3 on, the adapter maps edits to declarations unless `agenthub.json` says `symbols.enabled: false`. The suite's Phase 2 world (scenario 1 and 2 skipped, "1-2 without symbol claims" in their place) now writes that into the seeded `agenthub.json`, so it keeps claiming whole files whatever the build has, as it says. The Phase 3 world (`SYMBOLS`: A4's `dist/impact.js`, or `AGENTHUB_E2E_PHASE=3`) leaves symbols on. Detection is unchanged: the Phase 3 scenarios need A4 (impacts) and, for scenario 3 onwards, lane L's symbol admission (L6; see the adapter's LANE-NOTES, A3, "For lane L"), so they are run at CP3 with `AGENTHUB_E2E_PHASE=3`.

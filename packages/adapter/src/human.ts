@@ -5,13 +5,14 @@ import type { Landing, LandingStats, TaskStatus } from '@agenthub/hub/protocol';
 import { approverCredentials, decideCommand, landerCommand, processTerminal } from './approve.js';
 import { HubApiError, HubClient, classifyFailure } from './client.js';
 import { hasOwnSettings, loadConfig, teamSections, type HubConfig } from './config.js';
-import { claimFiles, formatDecision, formatMessage, formatTask, landingLine, landingsText, statsText, statusText, syncToolText, UNTRUSTED_NOTE } from './format.js';
+import { claimNames, formatConflict, formatDecision, formatMessage, formatTask, landingLine, landingsText, statsText, statusText, syncToolText, UNTRUSTED_NOTE } from './format.js';
 import { claimKey, lendIdentity, lendingSessions } from './checkout.js';
 import { fullHead, headCommit } from './git.js';
 import { commitGuardOff } from './guard-status.js';
 import { landWork, renderLanding } from './land.js';
 import { adoptClaims } from './pending.js';
 import { syncWorkspace } from './sync.js';
+import { claimTargets, splitTarget, symbolsModule, targetEntries } from './symbol-scope.js';
 import type { HookOutcome } from './hooks.js';
 
 const ok = (stdout: string): HookOutcome => ({ stdout, stderr: '', exitCode: 0 });
@@ -87,8 +88,12 @@ async function command(cfg: HubConfig, cmd: string, argv: string[]): Promise<Hoo
         options: { intent: { type: 'string' }, shared: { type: 'boolean' }, queue: { type: 'boolean' } },
       });
       need();
+      // FILE or FILE#Symbol (Phase 3): a declaration is claimed with this adapter's mapper.
+      const targets = claimTargets(positionals, process.cwd(), (f) => files([f])[0]!);
+      const mapper = targets.some((t) => t.symbol !== null) ? (await symbolsModule())?.MAPPER_VERSION : undefined;
+      if (targets.some((t) => t.symbol !== null) && !mapper) return fail('symbol claims (FILE#Symbol) need @agenthub/symbols, which could not be loaded; claim the whole file');
       const res = await client.claim({
-        files: files(positionals),
+        ...(mapper ? { scope: targetEntries(targets), mapper } : { files: targets.map((t) => t.file) }),
         intent: values.intent,
         mode: values.shared ? 'shared' : 'exclusive',
         queue: values.queue ?? false,
@@ -96,15 +101,17 @@ async function command(cfg: HubConfig, cmd: string, argv: string[]): Promise<Hoo
       });
       adoptClaims(cfg.root, res.claims);
       if (res.status === 'denied') {
-        return fail(`denied: ${res.conflicts.map((c) => `${c.files.join(', ')} held by ${c.holder} (${c.claim_id})`).join('; ')}`);
+        return fail(`denied: ${res.conflicts.map((c) => formatConflict(c, res.now)).join('; ')}`);
       }
       const c = res.claim!;
-      return ok(`${res.status}${res.renewed ? ' (renewed)' : ''}: ${c.id} ${claimFiles(c).join(', ')} [${c.mode}] "${c.intent}"`);
+      return ok(`${res.status}${res.renewed ? ' (renewed)' : ''}: ${c.id} ${claimNames(c)} [${c.mode}] "${c.intent}"`);
     }
 
     case 'release': {
       const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { all: { type: 'boolean' }, claim: { type: 'string' } } });
       need();
+      const symbolic = positionals.filter((f) => splitTarget(f, process.cwd()).symbol !== null);
+      if (symbolic.length) return fail(`release takes files or --claim C-n, not a declaration (${symbolic.join(', ')}): release the claim that holds it with --claim`, 2);
       const res = await client.release({ all: values.all, claim_id: values.claim, files: positionals.length ? files(positionals) : undefined });
       return ok(`released ${res.released.length}, trimmed ${res.trimmed.length}, granted from queue ${res.promoted.length}`);
     }

@@ -26,8 +26,9 @@
 // adapter's dist/impact.js, the lander's dist/resolver.js), and are reported
 // as skipped otherwise. AGENTHUB_E2E_PHASE=3 runs all of them whatever the
 // build has (the CP3 gate); AGENTHUB_E2E_PHASE=2 runs only the Phase 2 ones.
-// Without Phase 3 the same flow runs with file-level claims instead, so the
-// later scenarios find the state they expect either way. No network, no API key.
+// Without Phase 3 the same flow runs with file-level claims instead (agenthub.json
+// turns symbol claims off), so the later scenarios find the state they expect
+// either way. No network, no API key.
 // AGENTHUB_E2E_KEEP=1 keeps the temporary directory (and says where it is).
 
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
@@ -609,6 +610,10 @@ beforeAll(async () => {
     project: PROJECT,
     url: hubUrl,
     land: { check: CHECK, protected: ['migrations/**'], resolver: { enabled: true }, checkEnv: { AGENTHUB_E2E_RUNS: runsLog } },
+    // The Phase 2 world claims whole files, whatever the build has: an adapter with symbol claims (A3) maps
+    // edits to declarations unless agenthub.json turns that off, and a lander without symbol admission (L6)
+    // would then hold whole files at admission over the other agent's declarations.
+    ...(SYMBOLS ? {} : { symbols: { enabled: false } }),
   };
   writeFileSync(path.join(seed, 'agenthub.json'), `${JSON.stringify(team, null, 2)}\n`);
   const seedIdentity = cleanEnv({ GIT_AUTHOR_NAME: 'Shop Founder', GIT_AUTHOR_EMAIL: 'founder@example.com', GIT_COMMITTER_NAME: 'Shop Founder', GIT_COMMITTER_EMAIL: 'founder@example.com' });

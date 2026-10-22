@@ -12,6 +12,8 @@
 //   G/agenthub/sync.lock            {pid, at}, linked into place (O_EXCL); stale after 120 s or when its pid is dead
 //   G/agenthub/sync.json            the write-ahead record {pid, orig_head, target, branch, backup_ref, at}
 //   G/agenthub/inflight/<s>~<tool>  one marker per edit tool call the pre-edit hook let through
+//   G/agenthub/edits/<s>~<tool>     beside each marker of a symbol-level edit: the file before it and the
+//                                   simulated result (Phase 3), for post-edit's check; it goes with its marker
 //   G/agenthub/mergebase            the merge base of (HEAD, trunk), cached for the stale-base heads-up
 //   G/agenthub/stale-shown          (session, file, trunk) heads-ups already given
 //   G/agenthub/sync-said            the last notice settle printed, so an unchanged state isn't repeated
@@ -55,6 +57,8 @@ export interface SyncPaths {
   staleShown: string;
   said: string;
   elsewhere: string;
+  /** The saved edit states (symbol-scope edits, Phase 3), one beside each marker, under the same name. */
+  edits: string;
 }
 
 /** Where this worktree's sync files live, or null outside a git checkout. */
@@ -71,10 +75,21 @@ export function syncPaths(root: string): SyncPaths | null {
     staleShown: path.join(dir, 'stale-shown'),
     said: path.join(dir, 'sync-said'),
     elsewhere: path.join(dir, 'elsewhere'),
+    edits: path.join(dir, 'edits'),
   };
 }
 
 const safe = (id: string): string => id.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128) || '_';
+
+/** The file name of an edit call's marker, and of the edit state saved beside it. */
+export function markerName(call: { session: string; tool: string }): string {
+  return `${safe(call.session)}~${safe(call.tool)}`;
+}
+
+/** The edit state saved beside a marker (same name, in the sibling `edits` directory). */
+function editStateOf(marker: string): string {
+  return path.join(path.dirname(path.dirname(marker)), 'edits', path.basename(marker));
+}
 
 function readJson<T>(file: string): T | null {
   try {
@@ -290,7 +305,7 @@ interface Marker extends EditCall {
 export function writeMarker(p: SyncPaths, call: EditCall): string | null {
   try {
     mkdirSync(p.inflight, { recursive: true });
-    const file = path.join(p.inflight, `${safe(call.session)}~${safe(call.tool ?? `call-${process.pid}-${randomBytes(4).toString('hex')}`)}`);
+    const file = path.join(p.inflight, markerName({ session: call.session, tool: call.tool ?? `call-${process.pid}-${randomBytes(4).toString('hex')}` }));
     const m: Marker = { ...call, pid: process.pid, at: Date.now() };
     writeFileSync(file, JSON.stringify(m));
     return file;
@@ -300,7 +315,9 @@ export function writeMarker(p: SyncPaths, call: EditCall): string | null {
 }
 
 export function removeMarker(file: string | null): void {
-  if (file) rmSync(file, { force: true });
+  if (!file) return;
+  rmSync(file, { force: true });
+  rmSync(editStateOf(file), { force: true });
 }
 
 /**
@@ -321,7 +338,7 @@ export function clearMarkers(p: Pick<SyncPaths, 'inflight'>, match: { session: s
     if (!m || m.session !== match.session) continue;
     if (match.tool !== undefined && m.tool !== match.tool) continue;
     if (match.thread !== undefined && m.thread !== match.thread) continue;
-    rmSync(file, { force: true });
+    removeMarker(file);
     n++;
   }
   return n;
@@ -403,7 +420,7 @@ export function liveMarkers(p: SyncPaths, now = Date.now()): string[] {
       continue; // removed meanwhile
     }
     if (now - mtime < MARKER_STALE_MS) live.push(name);
-    else rmSync(file, { force: true });
+    else removeMarker(file);
   }
   return live;
 }

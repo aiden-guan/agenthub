@@ -1,14 +1,28 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { ClaimResult } from '@agenthub/hub/protocol';
+import type { SymbolsConfig } from '@agenthub/contract';
+import type { ClaimConflict, ClaimResult, Landing } from '@agenthub/hub/protocol';
 import { claimRoot, lendIdentity, recordLending } from './checkout.js';
-import { HubClient, classifyFailure, type HubFailure } from './client.js';
+import { HubApiError, HubClient, classifyFailure, type HubFailure } from './client.js';
 import { hasOwnSettings, loadConfig, sameHub, teamSections, type HubConfig } from './config.js';
-import { denyReason, digestText, inline, showName, showNames, syncDigestLine, syncNoticeKey, syncPromptText } from './format.js';
+import {
+  denyReason,
+  digestText,
+  inline,
+  postEditConflictText,
+  scopeNames,
+  showName,
+  showNames,
+  syncDigestLine,
+  syncNoticeKey,
+  syncPromptText,
+  type DenyContext,
+} from './format.js';
 import { currentBranch, headCommit, isIgnored, toRepoPath, unclaimableReason } from './git.js';
 import { commitGuardOff } from './guard-status.js';
 import { PendingClaims, type StoredClaim } from './pending.js';
 import { HOOK_SYNC_BUDGET_MS, clearMarkers, clearMarkersElsewhere, enterEdit, noteMarkerElsewhere, removeMarker, staleFiles, syncPaths, syncWorkspace, type SyncPaths, type SyncResult } from './sync.js';
+import { editScope, missingAfterEdit, saveEditState, symbolsModule, takeEditState, wholeFileWhy, type EditScope, type EditState } from './symbol-scope.js';
 
 export interface HookIO {
   stdin: string;
@@ -164,6 +178,13 @@ function callIds(input: Record<string, any>): { session: string; thread: string;
  * lock: an edit while a sync runs waits up to 3 s, then is denied with "retry
  * this edit"; an interrupted sync blocks edits until hub_sync recovers), and
  * on a newly granted claim the stale-base heads-up as additionalContext.
+ *
+ * Phase 3 (design §1.10, §2.3.6): an Edit or MultiEdit of an existing file in
+ * a mapped language claims only the declarations it changes, found by
+ * simulating the edit and diffing the two outlines, with the mapper version;
+ * anything else claims the whole file. The file as it was is saved beside the
+ * marker for post-edit. A denial names the symbols, what of the file is free,
+ * and where a landing that holds them is.
  */
 export async function preEditHook(io: HookIO): Promise<HookOutcome> {
   const input = parseInput(io.stdin);
@@ -229,10 +250,36 @@ async function claimForEdit(input: Record<string, any>, io: HookIO, edited: { ro
 
   // The guard in that checkout then acts as the same agent (see recordLending).
   if (cfg.lentBy) recordLending(target.root, cfg.lentBy, callIds(input)?.session ?? null);
+  // Phase 3: the declarations the edit changes, or the whole file (design §1.10). Never fails an edit:
+  // anything it can't map is the whole file.
+  const symbols = teamSections(target.root, { strict: false }).sections.symbols;
+  const abs = editedPath(input, io);
+  const tool = typeof input.tool_name === 'string' ? input.tool_name : '';
+  const scope: EditScope | null =
+    target.files.length === 1 && abs
+      ? await editScope({ tool, input: (input.tool_input ?? {}) as Record<string, unknown>, abs, file: target.files[0], config: symbols }).catch(() => null)
+      : null;
+  const base_commit = headCommit(target.root) ?? undefined;
   try {
-    const res = await hookClient(cfg).claim({ files: target.files, mode: 'auto', queue: false, base_commit: headCommit(target.root) ?? undefined });
+    let symbolic = scope?.symbols != null;
+    let res: ClaimResult;
+    try {
+      res = await hookClient(cfg).claim(
+        symbolic
+          ? { scope: scope!.symbols!.map((symbol) => ({ file: target.files[0], symbol })), mapper: scope!.mapper!, mode: 'auto', queue: false, base_commit }
+          : { files: target.files, mode: 'auto', queue: false, base_commit },
+      );
+    } catch (err) {
+      // A hub that refuses a key this mapper produced (another version): the whole file is the safe side.
+      if (!symbolic || !(err instanceof HubApiError) || err.code !== 'invalid_symbol') throw err;
+      symbolic = false;
+      res = await hookClient(cfg).claim({ files: target.files, mode: 'auto', queue: false, base_commit });
+    }
     if (res.status === 'granted') {
       trackClaim(input, target.root, cfg, res);
+      // For post-edit: the file as it was, and what the edit should leave, beside this call's marker.
+      const ids = callIds(input);
+      if (symbolic && scope && abs && ids?.tool) saveEditState(target.root, { session: ids.session, tool: ids.tool }, scope, abs);
       // On a new claim: has trunk changed the file since this worktree's base? (Said once per file and trunk tip.)
       const stale = res.renewed ? null : staleBaseNote(target.root, target.files, input, cfg);
       if (unclaimed) {
@@ -249,7 +296,13 @@ async function claimForEdit(input: Record<string, any>, io: HookIO, edited: { ro
     // Every claim in the way of that file: with shared holders and an exclusive waiter, the waiter is why.
     const file = first.files[0] ?? target.files[0];
     const inTheWay = res.conflicts.filter((c) => c.files.includes(file) || c.files.length === 0);
-    return deny(denyReason(file, inTheWay.length ? inTheWay : [first], res.now, res.deadlock));
+    const shown = inTheWay.length ? inTheWay : [first];
+    // Symbols on either side, or a landing's hold: say so in Phase 3's words. Otherwise Phase 1's.
+    const ctx =
+      symbolic || shown.some((c) => c.landing_id || c.scope?.some((e) => e.symbol !== undefined))
+        ? await denyContext(cfg, file, shown, scope, symbolic, symbols)
+        : undefined;
+    return deny(denyReason(file, shown, res.now, res.deadlock, ctx));
   } catch (err) {
     const failure = classifyFailure(err, cfg);
     if (failure.kind !== 'unreachable') return deny(`Edit blocked: ${failureText(failure, cfg)}. Tell your human; edits stay blocked until the hub accepts the claim.`);
@@ -258,6 +311,51 @@ async function claimForEdit(input: Record<string, any>, io: HookIO, edited: { ro
     }
     return allowWithWarning(`${failure.message}; edit allowed without a claim`);
   }
+}
+
+/** The absolute path of the file an edit tool call writes (Edit, MultiEdit, Write, NotebookEdit). */
+function editedPath(input: Record<string, any>, io: HookIO): string | null {
+  const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
+  const raw = [toolInput.file_path, toolInput.notebook_path].find((p): p is string => typeof p === 'string' && p.length > 0);
+  return raw ? path.resolve(cwdFor(input, io), raw) : null;
+}
+
+/**
+ * What a Phase 3 deny reason says beyond the hub's answer (design §2.3.6
+ * (6)), all best effort: where each landing holding the file is, and which
+ * top-level declarations of the file no other agent holds or waits for (only
+ * for an edit mapped to declarations; others' symbols count only under this
+ * mapper, design §1.10).
+ */
+async function denyContext(cfg: HubConfig, file: string, conflicts: ClaimConflict[], scope: EditScope | null, symbolic: boolean, symbols: SymbolsConfig): Promise<DenyContext> {
+  const mapped = symbolic ? scope : null;
+  const ctx: DenyContext = {
+    wanted: mapped?.symbols ?? null,
+    wholeReason: mapped ? null : (scope?.reason ?? null),
+    wholeWhy: mapped ? null : wholeFileWhy(scope?.reason ?? null, symbols.maxSymbolsPerEdit),
+  };
+  const client = hookClient(cfg);
+  const landings = new Map<string, Landing>();
+  for (const id of [...new Set(conflicts.flatMap((c) => (c.landing_id ? [c.landing_id] : [])))].slice(0, 3)) {
+    try {
+      landings.set(id, await client.landing(id));
+    } catch {
+      // the place in the queue is a nicety
+    }
+  }
+  ctx.landings = landings;
+  if (mapped?.before != null && mapped.mapper) {
+    try {
+      const sym = await symbolsModule();
+      const theirs = (await client.claims({ file })).filter((c) => c.holder !== cfg.agent && (c.status === 'active' || c.status === 'queued'));
+      // A claim under another mapper (or none) counts as its whole file.
+      const held = theirs.flatMap((c) => c.scope.filter((e) => e.file === file).map((e) => (c.mapper === mapped.mapper && e.symbol !== undefined ? { symbol: e.symbol } : {})));
+      ctx.free = sym ? await sym.freeKeys(file, mapped.before, held) : null;
+    } catch {
+      ctx.free = null;
+    }
+  }
+  return ctx;
 }
 
 /**
@@ -386,15 +484,57 @@ export async function postEditHook(io: HookIO): Promise<HookOutcome> {
   const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
   const file = [toolInput.file_path, toolInput.notebook_path].find((p): p is string => typeof p === 'string' && p.length > 0);
   const root = file ? claimRoot(path.dirname(path.resolve(cwdFor(input, io), file)), sessionDir(input, io)) : null;
+  // What pre-edit saved for a symbol-level edit; taken before the marker goes, which takes it along.
+  const state = root ? takeEditState(root, { session: ids.session, tool: ids.tool }) : null;
   // The edit ran: its in-flight marker goes, so a sync may run again.
   const marks = root ? syncPaths(root) : null;
   if (marks) clearMarkers(marks, { session: ids.session, tool: ids.tool });
   const store = root ? PendingClaims.open(root) : null;
-  if (!store) return ALLOW;
-  const thread = store.list(ids.session).filter((e) => e.thread === ids.thread);
-  for (const e of thread) if (e.tool === ids.tool) store.remove(e);
-  await releasePending(store, thread.filter((e) => e.tool !== ids.tool), input, io);
-  return ALLOW;
+  if (store) {
+    const thread = store.list(ids.session).filter((e) => e.thread === ids.thread);
+    for (const e of thread) if (e.tool === ids.tool) store.remove(e);
+    await releasePending(store, thread.filter((e) => e.tool !== ids.tool), input, io);
+  }
+  const context = state && root ? await verifyEdit(state, root, input, io) : null;
+  if (!context) return ALLOW;
+  return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: context } }), stderr: '', exitCode: 0 };
+}
+
+/**
+ * Post-edit's check of a symbol-level edit (design §2.3.6, §4.2 #2): when the
+ * file is not what pre-edit simulated (the tool normalized something), claim
+ * what the edit really changed beyond pre-edit's claim. Null when nothing is
+ * missing or it was granted; otherwise the PostToolUse context: whose code
+ * the edit also changed, or that it couldn't be claimed.
+ */
+async function verifyEdit(state: EditState, root: string, input: Record<string, any>, io: HookIO): Promise<string | null> {
+  let cfg: HubConfig;
+  try {
+    cfg = configFor(root, input, io);
+  } catch {
+    return null; // pre-edit said why
+  }
+  if (!cfg.agent) return null;
+  const symbols = teamSections(root, { strict: false }).sections.symbols;
+  const missing = await missingAfterEdit(state, symbols).catch(() => null);
+  if (!missing) return null;
+  const names = scopeNames(missing.entries);
+  // What the tool wrote maps only to the whole file: say so, rather than that the edit changed others' declarations.
+  const whole = missing.mapper === null ? wholeFileWhy(missing.reason, symbols.maxSymbolsPerEdit) : null;
+  try {
+    const res = await hookClient(cfg).claim({
+      ...(missing.mapper ? { scope: missing.entries, mapper: missing.mapper } : { files: [state.file] }),
+      mode: 'auto',
+      queue: false,
+      base_commit: headCommit(root) ?? undefined,
+    });
+    if (res.status === 'granted') return null;
+    const inTheWay = res.conflicts.filter((c) => c.files.includes(state.file) || c.files.length === 0);
+    if (!inTheWay.length) return `agenthub: your edit also changed ${names}, which the hub didn't grant you without naming a conflict; tell your human.`;
+    return postEditConflictText(state.file, inTheWay, res.now, whole);
+  } catch (err) {
+    return `agenthub: your edit also changed ${names}, which isn't claimed: ${inline(classifyFailure(err, cfg).message, 300)}.`;
+  }
 }
 
 /**
