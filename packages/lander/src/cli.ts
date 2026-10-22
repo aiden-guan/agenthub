@@ -16,6 +16,7 @@ import { HubClient } from './hub-client.js';
 import { initWorkdir } from './init.js';
 import { Lander } from './lander.js';
 import { LeaseRefused } from './lease.js';
+import { AiResolver } from './resolver.js';
 import { trunkLocalRef } from './trunk.js';
 
 const HELP = `hub-lander: lands queued changes onto trunk (agenthub Phase 2)
@@ -28,7 +29,10 @@ const HELP = `hub-lander: lands queued changes onto trunk (agenthub Phase 2)
       Claim the lander lease (or stand by) and land queued changes. --once
       processes at most one landing and exits.
   hub-lander doctor [run flags]
-      Check git, the remote, trunk's agenthub.json, the hub and the lander token.
+      Check git, the remote, trunk's agenthub.json, the resolver, the hub and the lander token.
+  hub-lander resolve-anthropic
+      The built-in AI resolver command: ResolverInput JSON on stdin, ResolverOutput
+      JSON on stdout (the lander runs it; ANTHROPIC_API_KEY comes from the lander).
 
 Environment: HUB_URL, HUB_PROJECT, HUB_TOKEN, HUB_LANDER_TOKEN, HUB_LANDER_ID,
 ANTHROPIC_API_KEY. The workdir defaults to ~/.agenthub/lander/<project>.
@@ -70,11 +74,27 @@ async function runCommand(flags: LanderFlags): Promise<number> {
   if (!cfg.hub || !cfg.project) throw new ConfigError('no hub URL or project: pass --hub and --project, or set "url" and "project" in trunk\'s agenthub.json');
   const agent = landerId(cfg.idPrefix);
   const git = open(mirror, { isolated: true, bare: true });
+  const hub = new HubClient({ url: cfg.hub, project: cfg.project, agent, token: cfg.token, landerToken: cfg.landerToken });
+  const gitPort = openGitPort({ mirror: git, remote: 'origin' });
+  // design §2.6 "Activation": trunk's land.resolver.enabled, and a working command here (the built-in one needs the key).
+  const resolver =
+    cfg.resolverCommand !== null || cfg.anthropicApiKey !== null
+      ? new AiResolver({
+          git: gitPort,
+          hub,
+          project: cfg.project,
+          command: cfg.resolverCommand,
+          apiKey: cfg.anthropicApiKey,
+          maxPerHour: cfg.resolverMaxPerHour,
+          scratchDir: path.join(cfg.dir, 'runs'),
+          log: say,
+        })
+      : null;
   const lander = new Lander({
-    hub: new HubClient({ url: cfg.hub, project: cfg.project, agent, token: cfg.token, landerToken: cfg.landerToken }),
-    git: openGitPort({ mirror: git, remote: 'origin' }),
+    hub,
+    git: gitPort,
     checks: new ChecksRunner({ workdir: cfg.dir, mirror: git, passEnv: cfg.passEnv, checkWrapper: cfg.checkWrapper, secrets: landerSecrets(cfg) }),
-    resolver: null,
+    resolver,
     faults: faultsFromEnv(),
     agent,
     project: cfg.project,
@@ -97,6 +117,7 @@ async function runCommand(flags: LanderFlags): Promise<number> {
   process.on('SIGTERM', onSignal);
   process.on('SIGINT', onSignal);
   say(`${agent} for ${cfg.project} at ${cfg.hub}, landing onto ${branch}`);
+  say(`AI resolver: ${cfg.resolverCommand !== null ? `the command ${cfg.resolverCommand}` : cfg.anthropicApiKey !== null ? 'the built-in resolve-anthropic' : "none (no ANTHROPIC_API_KEY and no --resolver-command): conflicts git can't merge go back to their authors"}`);
   try {
     await lander.run({ once: flags.once === true });
   } finally {
@@ -129,10 +150,10 @@ async function initCommand(flags: LanderFlags): Promise<number> {
   return 0;
 }
 
-/** The built-in resolver command arrives with the AI resolver; until then it always answers cannot_resolve (which is always safe). */
+/** The built-in resolver command (design §2.6); the SDK is loaded only for it. */
 async function resolveAnthropicCommand(): Promise<number> {
-  process.stdout.write(`${JSON.stringify({ status: 'cannot_resolve', explanation: 'this hub-lander build has no AI resolver yet' })}\n`);
-  return 0;
+  const { resolveAnthropicMain } = await import('./resolve-anthropic.js');
+  return resolveAnthropicMain();
 }
 
 export async function main(argv: string[]): Promise<number> {

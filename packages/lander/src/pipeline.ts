@@ -14,7 +14,7 @@
 // - I8: agent text reaches the commit message only through the sanitizing
 //   builders in report.ts.
 
-import { candidateRef, FULL_SHA_RE, landingKey, landRef, type LandConfig } from '@agenthub/contract';
+import { candidateRef, FULL_SHA_RE, landRef, type LandConfig } from '@agenthub/contract';
 import type { ConflictEntry } from '@agenthub/gitops';
 import type {
   ApprovalRequirement,
@@ -33,9 +33,9 @@ import { isLive } from './admission.js';
 import { AttemptStale, bestEffort, HubUnavailable, hubWrite, LeaseLost, Stopping, type LanderContext } from './context.js';
 import { failureReport, sendbackContext, tellIfFailed, tellParked, tellSendback } from './messages.js';
 import { isHubError, type ResolveResult } from './ports.js';
-import { commitMessage, ConflictReporter, emptyReport, LISTED_COMMITS, type SendbackContext } from './report.js';
+import { aiLandedMessage, commitMessage, ConflictReporter, emptyReport, LISTED_COMMITS, type SendbackContext } from './report.js';
 import { approversOf, missingApprovals, mergedRequirements, protectedPaths, protectedRequirements, uniqueRequirements } from './requirements.js';
-import { descends, fetchTrunk, localLandRef, policyOf, scanTrunk, trunkLocalRef } from './trunk.js';
+import { descends, fetchTrunk, findOnTrunk, localCandidateRef, localLandRef, policyOf, scanTrunk, trunkLocalRef } from './trunk.js';
 
 /** How an attempt (or an in-doubt resolution) ended, for the loops. */
 export type AttemptOutcome =
@@ -67,12 +67,6 @@ const TERMINAL_UNLANDED = ['failed', 'superseded', 'cancelled'] as const;
 export function prefixOfCandidateRef(ref: string): string | null {
   const i = ref.indexOf('cand/');
   return i > 0 ? ref.slice(0, i) : null;
-}
-
-/** The mirror's copy of a staged candidate ref (`<P>cand/<rest>` → `refs/agenthub/cand/<rest>`). */
-export function localCandidateRef(ref: string): string | null {
-  const i = ref.indexOf('cand/');
-  return i > 0 ? `refs/agenthub/${ref.slice(i)}` : null;
 }
 
 export type PushResult = { kind: 'pushed' } | { kind: 'stale' } | { kind: 'rejected'; detail: string } | { kind: 'unknown'; detail: string } | { kind: 'unfresh' };
@@ -123,6 +117,8 @@ export class Attempt {
   private alsoLanded: string[] = [];
   /** The hub has accepted `pushing` for this attempt: from here on only landed or resolve move it on. */
   private pushing = false;
+  /** The AI resolver resolved every conflict of this attempt: both sides are told once it lands. */
+  private aiDone: ResolveResult | null = null;
   private staged: string | null = null;
   private readonly started: number;
   private timings = { merge_ms: 0, check_ms: 0, push_ms: 0 };
@@ -146,7 +142,8 @@ export class Attempt {
       return await this.steps();
     } catch (err) {
       if (err instanceof LeaseLost) {
-        ctx.log(`${this.id}: lease lost; dropping attempt ${this.n} without pushing`);
+        // In pushing, the push may have gone out (refused or up to date if another lander got there first): the next lease holder resolves it.
+        ctx.log(this.pushing ? `${this.id}: lease lost in pushing; the next lease holder resolves it in doubt` : `${this.id}: lease lost; dropping attempt ${this.n} without pushing`);
         return { kind: 'lost' };
       }
       if (err instanceof AttemptStale) {
@@ -248,8 +245,7 @@ export class Attempt {
     this.checkpoint();
 
     // ---------------- P2: already landed? the stacked landing it waited for?
-    const key = { landing: landingKey(ctx.project, id), hub: ctx.lease.epoch, source: H };
-    const found = await ctx.git.findLandingCommit(this.cur.first_base, T0, key);
+    const found = await findOnTrunk(ctx, this.cur, T0);
     if (found) {
       ctx.log(`${id} is already on trunk as ${found.slice(0, 12)}`);
       return this.landed(found, { resolved: 'none', message: `${id} is already on ${ctx.trunk.branch} as ${found.slice(0, 12)}.`, check: null, resolver: null, filesVia: [] });
@@ -281,8 +277,22 @@ export class Attempt {
     let ai: ResolveResult | null = null;
     if (conflicts.length > 0 && land.resolver.enabled) {
       if (ctx.resolver) {
-        await this.advance({ to: 'running', phase: 'resolving', deadline_ms: RESOLVE_DEADLINE_PER_FILE_MS * Math.min(conflicts.length, land.resolver.maxFiles) + RESOLVE_DEADLINE_SLACK_MS });
-        ai = await ctx.resolver.resolve({ landing: this.cur, conflicts, tree, base: this.base, trunk: T0, head: H, config: land.resolver, protectedRules: land.protected, approved: [] });
+        this.cur = (await this.advance({ to: 'running', phase: 'resolving', deadline_ms: RESOLVE_DEADLINE_PER_FILE_MS * Math.min(conflicts.length, land.resolver.maxFiles) + RESOLVE_DEADLINE_SLACK_MS })).landing;
+        ai = await ctx.resolver.resolve({
+          landing: this.cur,
+          conflicts,
+          tree,
+          base: this.base,
+          trunk: T0,
+          head: H,
+          config: land.resolver,
+          protectedRules: land.protected,
+          distinct: land.approval.distinct,
+          epoch: ctx.lease.epoch,
+          // An earlier attempt's resolution, approved by a human, is reused on byte-identical stages (design §2.6).
+          reuse: { candidate: this.cur.candidate, candidateRef: this.cur.candidate_ref, approved: this.cur.approvals.filter((a) => a.kind === 'ai_resolution').map((a) => a.digest) },
+          signal: this.signal,
+        });
         this.checkpoint();
         tried.push('ai');
         tree = ai.tree;
@@ -293,19 +303,38 @@ export class Attempt {
         resolver = { model: land.resolver.model, outcome: 'skipped', files: [], novel_lines: 0, input_tokens: 0, output_tokens: 0, explanations: {} };
       }
     }
+    const aiWarnings = [...(ai?.warnings ?? [])];
+    let aiPaths = ai?.resolved ?? [];
+    let unresolvedByAi = ai?.unresolved ?? [];
+    // An AI resolution that leaves the merged tree equal to trunk's (it kept trunk's side of every hunk, and the
+    // change has nothing else) would throw the change away as a P5 no-op: landed without the Agenthub-Resolved
+    // trailer, the messages to both sides, the checks or requireApproval's review (design §2.6, §4.1 row 10).
+    // The lander refuses such an output like any other it rejects (design §3.5: resolver_failed).
+    if (ai && aiPaths.length > 0 && conflicts.length === 0 && tree === (await ctx.git.treeOf(T0))) {
+      ctx.log(`${id}: the AI resolution of ${aiPaths.join(', ')} keeps trunk's version: refused (nothing of the change would land)`);
+      aiWarnings.push(`${aiPaths.join(', ')}: the AI resolver's output was rejected: it keeps ${ctx.trunk.branch}'s version of every conflicted file, and nothing else of this change is left, so nothing of it would land`);
+      unresolvedByAi = aiPaths.map((path) => ({ path, eligible: true, explanation: null }));
+      conflicts = merge.conflicts.filter((c) => aiPaths.includes(c.path));
+      resolver = { ...ai.report, outcome: 'rejected_output' };
+      tree = merge.tree;
+      aiPaths = [];
+      ai = null;
+    }
     this.timings.merge_ms = Math.round(ctx.clock.monotonic() - mergeStart);
     const structural = merge.structural;
-    const aiPaths = ai?.resolved ?? [];
     const filesVia = [...structural.map((file) => ({ file, via: 'structural' as const })), ...aiPaths.map((file) => ({ file, via: 'ai' as const }))];
     const resolvedBy: ResolvedBy = aiPaths.length > 0 ? 'ai' : structural.length > 0 ? 'structural' : 'clean';
     if (conflicts.length > 0) {
       const reporter = new ConflictReporter({ git: ctx.git, hub: ctx.hub, project: ctx.project, epoch: ctx.lease.epoch, base: this.base, trunk: T0, onError: (what, err) => ctx.log(`${id}: report: ${what}: ${firstLineOf(err)}`) });
-      const unresolved = new Map((ai?.unresolved ?? []).map((u) => [u.path, u]));
+      const unresolved = new Map(unresolvedByAi.map((u) => [u.path, u]));
       const reports = await Promise.all(
         conflicts.map((c) => reporter.report(c, { tried, aiEligible: unresolved.get(c.path)?.eligible ?? false, explanation: unresolved.get(c.path)?.explanation ?? resolver?.explanations[c.path] ?? null })),
       );
       const code: LandingFailureCode = resolver && (resolver.outcome === 'rejected_output' || resolver.outcome === 'error') ? 'resolver_failed' : 'conflict';
-      const warnings = land.resolver.enabled && !ctx.resolver ? ["the AI resolver is on in trunk's agenthub.json, but this lander has none: the AI stage was skipped"] : [];
+      const warnings = [
+        ...aiWarnings,
+        ...(land.resolver.enabled && !ctx.resolver ? ["the AI resolver is on in trunk's agenthub.json, but this lander has none (no ANTHROPIC_API_KEY in its environment and no --resolver-command): the AI stage was skipped"] : []),
+      ];
       return this.fail(code, { conflicts: reports, resolver, files_via: filesVia, warnings }, { conflictFiles: conflicts.map((c) => c.path) });
     }
 
@@ -324,11 +353,11 @@ export class Attempt {
       ({ candidate: C, required, check } = fast);
       ctx.log(`${id}: approved, on an unchanged trunk: pushing the candidate ${C.slice(0, 12)} that passed its checks before`);
     } else {
-      C = await this.buildCandidate(tree, structural, aiPaths);
+      C = await this.buildCandidate(tree, structural, aiPaths.length > 0 && ai ? { model: ai.report.model, paths: aiPaths } : null);
       required = uniqueRequirements([
         ...protectedReqs,
         ...(await mergedRequirements(ctx.git, land.protected, paths, { head: H, trunk: T0, merged: tree, candidate: C, candidateRef: this.candRef(C) })),
-        ...(ai?.requirement ? [ai.requirement] : []),
+        ...aiRequirement(ai, C, this.candRef(C), T0),
       ]);
 
       // ---------------- P7: the checks
@@ -366,9 +395,11 @@ export class Attempt {
         const code: LandingFailureCode = aiPaths.length > 0 ? 'resolver_failed' : result.status === 'timed_out' ? 'check_timeout' : result.status === 'modified_tree' ? 'checks_modified_tree' : 'checks_failed';
         // Staged so the author can reproduce the exact tree; the send-back doesn't wait on it.
         await this.stage(C).catch((err: unknown) => ctx.log(`${id}: staging the failed candidate for reproduce failed: ${firstLineOf(err)}`));
+        // After an AI resolution, its proposal stays in the report as a suggestion (design §2.6 step 8).
+        const proposal = resolver && ai && aiPaths.length > 0 ? { ...resolver, explanations: withSuggestions(resolver.explanations, ai.suggestions) } : resolver;
         return this.fail(
           code,
-          { check, resolver, resolved_by: resolvedBy, files_via: filesVia },
+          { check, resolver: proposal, resolved_by: resolvedBy, files_via: filesVia, warnings: aiWarnings },
           { exitCode: check.exit_code, durationMs: check.duration_ms, failedTests: check.failed_tests, reproduce: check.reproduce, conflictFiles: aiPaths },
         );
       }
@@ -376,6 +407,7 @@ export class Attempt {
       this.checkpoint();
     }
     const resolvedReport = { resolved_by: resolvedBy, files_via: filesVia, check, resolver };
+    if (ai && aiPaths.length > 0 && conflicts.length === 0) this.aiDone = ai;
 
     // ---------------- P8: approvals still missing → park the checked candidate
     const latest = await ctx.hub.landing(id).catch(() => this.cur);
@@ -465,7 +497,7 @@ export class Attempt {
     const required = uniqueRequirements([
       ...protectedReqs,
       ...(await mergedRequirements(ctx.git, this.land.protected, paths, { head: this.H, trunk: this.T0, merged: tree, candidate: C, candidateRef: ref })),
-      ...(ai?.requirement ? [ai.requirement] : []),
+      ...aiRequirement(ai, C, ref, this.T0),
     ]);
     const latest = await ctx.hub.landing(this.id).catch(() => this.cur);
     if (missingApprovals(required, latest.approvals, latest.agent).length > 0) return null;
@@ -473,7 +505,7 @@ export class Attempt {
   }
 
   /** P6: the squash commit C = commit-tree R -p T0, with the lander's message and the author of H; C^1 == T0 is asserted. */
-  private async buildCandidate(tree: string, structural: string[], aiPaths: string[]): Promise<string> {
+  private async buildCandidate(tree: string, structural: string[], ai: { model: string; paths: string[] } | null): Promise<string> {
     const { ctx, land, H, T0 } = this;
     const [info, squashed, taskTitle] = await Promise.all([ctx.git.commitInfo(H), ctx.git.commits(this.base, H, LISTED_COMMITS), this.taskTitle()]);
     const latest = await ctx.hub.landing(this.id).catch(() => this.cur);
@@ -488,7 +520,7 @@ export class Attempt {
       taskTitle,
       summary: this.cur.summary,
       commits: squashed,
-      resolved: { structural, ai: aiPaths.length > 0 ? { model: land.resolver.model, paths: aiPaths } : null },
+      resolved: { structural, ai },
       checkCommand: land.check,
       approvals: latest.approvals.map((a) => ({ kind: a.kind, by: a.by })),
     });
@@ -565,10 +597,10 @@ export class Attempt {
     const { ctx, id } = this;
     const t = await fetchTrunk(ctx, trunkLocalRef);
     if (t.kind !== 'ok') return { kind: 'in_doubt' };
-    const key = { landing: landingKey(ctx.project, id), hub: ctx.lease.epoch, source: this.H };
-    const on = (await descends(ctx, C, t.tip)) ? C : await ctx.git.findLandingCommit(this.cur.first_base, t.tip, key);
+    const on = (await descends(ctx, C, t.tip)) ? C : await findOnTrunk(ctx, this.cur, t.tip);
     if (on) {
       const r = await hubWrite(ctx, `resolve ${id}`, () => ctx.hub.resolve(id, { lease: ctx.lease.auth(), outcome: 'landed', trunk_sha: on, symbol_changes: [] }));
+      if (!r.replayed && on === C) await this.tellAiLanded(r.landing, C);
       await this.cleanup(r.landing);
       return { kind: 'landed', trunkSha: on, noop: false };
     }
@@ -623,8 +655,19 @@ export class Attempt {
     const r = await this.advance({ to: 'landed', trunk_sha: trunkSha, base_sha: this.base || this.T0, files: this.files, report, also_landed: this.alsoLanded, symbol_changes: [] });
     await ctx.faults.at('after-landed-ack', id);
     ctx.log(`${id} landed as ${trunkSha.slice(0, 12)}${o.noop ? ' (no-op)' : ''}`);
+    if (!r.replayed && !o.noop) await this.tellAiLanded(r.landing, trunkSha);
     await this.cleanup(r.landing, o.noop === true);
     return { kind: 'landed', trunkSha, noop: o.noop === true };
+  }
+
+  /** P11 (design §2.2.9, §3.4 step 5): an AI-resolved landing is reported to its author and to each trunk-side author (best effort). */
+  private async tellAiLanded(landing: Landing, sha: string): Promise<void> {
+    const ai = this.aiDone;
+    if (!ai || landing.status !== 'landed' || ai.resolved.length === 0) return;
+    const body = aiLandedMessage({ landingId: landing.id, sha, paths: ai.resolved, trunkLandings: ai.trunkSide.map((t) => t.landingId) });
+    for (const agent of [...new Set([landing.agent, ...ai.trunkSide.map((t) => t.agent)])]) {
+      await bestEffort(this.ctx, `message to ${agent}`, () => this.ctx.hub.post(agent, body));
+    }
   }
 
   /** P11: the staged candidate and the land ref go (the land ref went with the trunk push unless this was a no-op). */
@@ -662,6 +705,18 @@ export class StageFailed extends Error {
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/** The AI resolver's ai_resolution requirement, bound to the candidate that carries the resolution (design §1.4). */
+function aiRequirement(ai: ResolveResult | null, candidate: string, candidateRef: string, trunkBase: string): ApprovalRequirement[] {
+  return ai?.requirement ? [{ ...ai.requirement, candidate, candidate_ref: candidateRef, trunk_base: trunkBase }] : [];
+}
+
+/** The resolver's explanations with its proposal appended per path (kept as a suggestion when the checks fail on it). */
+function withSuggestions(explanations: Record<string, string>, suggestions: Record<string, string>): Record<string, string> {
+  const out = { ...explanations };
+  for (const [p, text] of Object.entries(suggestions)) out[p] = out[p] ? `${out[p]}\n\n${text}` : text;
+  return out;
+}
 
 function firstLineOf(err: unknown): string {
   const s = err instanceof Error ? err.message : String(err);

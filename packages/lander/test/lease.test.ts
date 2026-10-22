@@ -1,11 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { LANDER_LEASE_KEY } from '@agenthub/contract';
-import { Hub, SqliteStore } from '@agenthub/hub';
+import { Hub, SqliteStore, startServer, type RunningServer } from '@agenthub/hub';
 import { HubClient } from '../src/hub-client.js';
 import { Lease } from '../src/lease.js';
 import { systemClock, type Clock, type HubPort } from '../src/ports.js';
 import { override } from './helpers.js';
-import { startHubFront, type HubFront } from './hub-http.js';
 import { waitFor } from './scenario.js';
 
 // The lander lease (design §1.5, §2.2.3): a claim on LANDER_LEASE_KEY with
@@ -13,7 +12,7 @@ import { waitFor } from './scenario.js';
 // long-polling for the grant; self-fencing reads both clocks.
 
 const P = 'acme/web';
-let front: HubFront | null = null;
+let front: RunningServer | null = null;
 const leases: Lease[] = [];
 
 afterEach(async () => {
@@ -31,7 +30,7 @@ function lease(agent: string, o: { clock?: Clock; ttlMs?: number } = {}): Lease 
 describe('Lease', () => {
   it('one active lander, one standby that heartbeats its place and is promoted when the active one releases', async () => {
     const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: 60_000 });
-    front = await startHubFront(hub, { sweepMs: 50 });
+    front = await startServer({ hub, port: 0, host: '127.0.0.1', sweepIntervalMs: 50 });
     const one = lease('lander/box-1-aaaa');
     const two = lease('lander/box-2-bbbb');
     expect(await one.acquire()).toBe(true);
@@ -56,7 +55,7 @@ describe('Lease', () => {
 
   it('a lease that lapses is lost: its signal aborts, and claiming again gives a new claim', async () => {
     const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: 60_000 });
-    front = await startHubFront(hub, { sweepMs: 50 });
+    front = await startServer({ hub, port: 0, host: '127.0.0.1', sweepIntervalMs: 50 });
     const l = lease('lander/box-1-cccc', { ttlMs: 400 });
     expect(await l.acquire()).toBe(true);
     const first = l.claim!;
@@ -72,7 +71,7 @@ describe('Lease', () => {
 
   it('self-fencing: fresh only while the last acknowledgement is younger than ttl/3 on both clocks', async () => {
     const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: 60_000 });
-    front = await startHubFront(hub);
+    front = await startServer({ hub, port: 0, host: '127.0.0.1', sweepIntervalMs: 200 });
     const t = { wall: 1_000_000, mono: 5_000 };
     const clock: Clock = { now: () => t.wall, monotonic: () => t.mono, sleep: systemClock.sleep };
     const l = lease('lander/box-1-dddd', { clock, ttlMs: 60_000 });
@@ -90,7 +89,7 @@ describe('Lease', () => {
 
   it('self-fencing dates an acknowledgement from when its heartbeat was sent, not from when the answer came', async () => {
     const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: 60_000 });
-    front = await startHubFront(hub);
+    front = await startServer({ hub, port: 0, host: '127.0.0.1', sweepIntervalMs: 200 });
     const t = { wall: 1_000_000, mono: 5_000 };
     const advance = (ms: number): void => {
       t.wall += ms;

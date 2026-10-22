@@ -8,12 +8,12 @@
 
 import { existsSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { landingKey, landRef } from '@agenthub/contract';
+import { landRef } from '@agenthub/contract';
 import type { Landing, LanderControl } from '@agenthub/hub/protocol';
 import { bestEffort, HubUnavailable, hubWrite, LeaseLost, AttemptStale, type LanderContext } from './context.js';
 import { tellIfFailed } from './messages.js';
-import { localCandidateRef, prefixOfCandidateRef, pushCandidate, type AttemptOutcome } from './pipeline.js';
-import { descends, fetchTrunk, localLandRef, trunkLocalRef } from './trunk.js';
+import { prefixOfCandidateRef, pushCandidate, type AttemptOutcome } from './pipeline.js';
+import { descends, fetchTrunk, findOnTrunk, localCandidateRef, localLandRef, trunkLocalRef } from './trunk.js';
 
 /**
  * resolveInDoubt (design §2.2.7), for a landing next returned with
@@ -40,7 +40,6 @@ async function resolve(ctx: LanderContext, L: Landing, control: LanderControl): 
   const ref = L.candidate_ref;
   const H = L.commit ?? '';
   const prefix = ref ? prefixOfCandidateRef(ref) : null;
-  const key = { landing: landingKey(ctx.project, L.id), hub: ctx.lease.epoch, source: H };
 
   for (let round = 0; round < 3; round++) {
     // 1. Trunk and the staged candidate, as the remote has them now.
@@ -52,7 +51,7 @@ async function resolve(ctx: LanderContext, L: Landing, control: LanderControl): 
     const tip = t.tip;
 
     // 2. Already on trunk?
-    const on = C && (await descends(ctx, C, tip)) ? C : await ctx.git.findLandingCommit(L.first_base, tip, key);
+    const on = C && (await descends(ctx, C, tip)) ? C : await findOnTrunk(ctx, L, tip);
     if (on) {
       ctx.log(`${L.id} is on trunk as ${on.slice(0, 12)}: resolved as landed`);
       const r = await hubWrite(ctx, `resolve ${L.id}`, () => ctx.hub.resolve(L.id, { lease: ctx.lease.auth(), outcome: 'landed', trunk_sha: on, symbol_changes: [] }));

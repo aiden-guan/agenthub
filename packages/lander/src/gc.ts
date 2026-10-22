@@ -14,8 +14,7 @@ import path from 'node:path';
 import type { Landing } from '@agenthub/hub/protocol';
 import { bestEffort, type LanderContext } from './context.js';
 import { isLive } from './admission.js';
-import { localCandidateRef } from './pipeline.js';
-import { readTrunkConfig, trunkLocalRef } from './trunk.js';
+import { localCandidateRef, readTrunkConfig, trunkLocalRef } from './trunk.js';
 
 const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;

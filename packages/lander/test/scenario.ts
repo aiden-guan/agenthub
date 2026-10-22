@@ -4,14 +4,15 @@
 // authenticated pusher, so the committer stands in for it), seeded with
 // agenthub.json (check `node check.mjs`, migrations/** protected, the
 // resolver on); agent clones; a real hub (in-process, served over HTTP by
-// hub-http.ts); and a real lander over its real HubClient, GitPort and
-// ChecksRunner, run in-process (`run --once` or in the background).
+// @agenthub/hub's own startServer on loopback); and a real lander over its
+// real HubClient, GitPort and ChecksRunner, run in-process (`run --once` or
+// in the background), or as a child process (crash.test.ts).
 
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Hub, SqliteStore, type HubAuth, type HubEvent } from '@agenthub/hub';
+import { Hub, SqliteStore, startServer, type HubAuth, type HubEvent, type RunningServer } from '@agenthub/hub';
 import type { Landing, LandRequest } from '@agenthub/hub/protocol';
 import { ChecksRunner } from '../src/checks.js';
 import { landerId } from '../src/config.js';
@@ -20,8 +21,9 @@ import { openGitPort } from '../src/git-port.js';
 import { HubClient } from '../src/hub-client.js';
 import { initWorkdir } from '../src/init.js';
 import { Lander } from '../src/lander.js';
-import type { Faults, GitPort, HubPort } from '../src/ports.js';
-import { startHubFront, type HubFront } from './hub-http.js';
+import type { Faults, GitPort, HubPort, ResolverPort } from '../src/ports.js';
+import { AiResolver } from '../src/resolver.js';
+import type { ResolverInput } from '../src/resolver-protocol.js';
 import { BASE_TIME, LANDER, PROJECT, sh, testEnv, tmp, type Tmp } from './helpers.js';
 
 export const P = PROJECT;
@@ -102,6 +104,11 @@ export interface ScenarioOptions {
   wrapHub?: (hub: HubPort) => HubPort;
   /** Wraps the lander's git port. */
   wrapGit?: (git: GitPort) => GitPort;
+  /**
+   * The AI resolver as `--resolver-command "node stub-resolver.mjs <config>"`
+   * with this stub config (design §5 "The stub resolver"); none by default.
+   */
+  resolver?: { stub: Record<string, unknown>; maxPerHour?: number };
 }
 
 const SEED_FILES: Record<string, string> = {
@@ -122,9 +129,11 @@ export class Scenario {
   readonly workdir: string;
   readonly events: HubEvent[] = [];
   readonly logs: string[] = [];
-  front!: HubFront;
+  front!: RunningServer;
   lander!: Lander;
   binDir: string;
+  /** The stub resolver's config file (its call counter is <file>.calls). */
+  readonly stubConfig: string;
   private clones = 0;
   private bg: Promise<unknown> | null = null;
 
@@ -134,6 +143,8 @@ export class Scenario {
     this.gate = path.join(this.t.dir, 'gate');
     this.workdir = path.join(this.t.dir, 'lander');
     this.binDir = path.join(this.t.dir, 'bin');
+    this.stubConfig = path.join(this.t.dir, 'stub-resolver.json');
+    if (o.resolver) writeFileSync(this.stubConfig, JSON.stringify(o.resolver.stub));
     mkdirSync(this.gate);
     mkdirSync(this.binDir);
     this.hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: 60_000, heartbeatIntervalMs: 15_000 });
@@ -163,7 +174,8 @@ export class Scenario {
       writeFileSync(wrapper, `#!/bin/sh\nexec "${process.execPath}" "${path.join(FIXTURES, 'fake-mergiraf.mjs')}" "$@"\n`);
       chmodSync(wrapper, 0o755);
     }
-    this.front = await startHubFront(this.hub);
+    // Loopback: the lander routes are open without a lander token; approvals in the tests go to the hub in-process.
+    this.front = await startServer({ hub: this.hub, port: 0, host: '127.0.0.1', sweepIntervalMs: 100 });
     await initWorkdir({ dir: this.workdir, remote: this.remote });
     this.lander = await this.makeLander();
   }
@@ -185,18 +197,34 @@ export class Scenario {
     const mirror = path.join(this.workdir, 'mirror.git');
     const agent = o.agent ?? landerId('lander/test');
     const env = { ...process.env, PATH: this.PATH };
-    const hub: HubPort = new HubClient({ url: this.front.url, project: P, agent });
-    const git: GitPort = openGitPort({ mirror, remote: 'origin', env: { PATH: this.PATH } });
+    const client: HubPort = new HubClient({ url: this.front.url, project: P, agent });
+    const plainGit: GitPort = openGitPort({ mirror, remote: 'origin', env: { PATH: this.PATH } });
+    const hub = this.o.wrapHub ? this.o.wrapHub(client) : client;
+    const git = this.o.wrapGit ? this.o.wrapGit(plainGit) : plainGit;
+    const log = (line: string) => {
+      this.logs.push(line);
+      this.o.onLog?.(line);
+    };
+    const resolver: ResolverPort | null = this.o.resolver
+      ? new AiResolver({
+          git,
+          hub,
+          project: P,
+          command: `${process.execPath} ${path.join(FIXTURES, 'stub-resolver.mjs')} ${this.stubConfig}`,
+          apiKey: null,
+          maxPerHour: this.o.resolver.maxPerHour ?? 20,
+          scratchDir: path.join(this.workdir, 'runs'),
+          env: { PATH: this.PATH },
+          log,
+        })
+      : null;
     return new Lander({
-      hub: this.o.wrapHub ? this.o.wrapHub(hub) : hub,
-      git: this.o.wrapGit ? this.o.wrapGit(git) : git,
+      hub,
+      git,
       checks: new ChecksRunner({ workdir: this.workdir, mirror, env, killGraceMs: 2_000 }),
-      resolver: null,
+      resolver,
       faults: o.faults ?? this.o.faults,
-      log: (line) => {
-        this.logs.push(line);
-        this.o.onLog?.(line);
-      },
+      log,
       agent,
       project: P,
       committer: LANDER,
@@ -302,6 +330,22 @@ export class Scenario {
     return this.hub.getLanding(P, id);
   }
 
+  /** Rewrites the stub resolver's config (its mode) for the next calls. */
+  stub(config: Record<string, unknown>): void {
+    writeFileSync(this.stubConfig, JSON.stringify(config));
+  }
+
+  /** The stub resolver's calls so far: one conflicted path per call. */
+  resolverCalls(): string[] {
+    const f = `${this.stubConfig}.calls`;
+    return existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean) : [];
+  }
+
+  /** The ResolverInput of the stub resolver's last call. */
+  resolverInput(): ResolverInput {
+    return JSON.parse(readFileSync(`${this.stubConfig}.last.json`, 'utf8')) as ResolverInput;
+  }
+
   /** The check-run log: one line per run, "<landing> <cwd>". */
   checkRuns(landingId?: string): string[] {
     const f = path.join(this.gate, 'runs.log');
@@ -340,6 +384,8 @@ export class Scenario {
   async close(): Promise<void> {
     if (this.bg) await this.stop().catch(() => undefined);
     await this.front.close();
+    // The server answers the long-polls it cut off as their sockets close (a tick later): only then close the store.
+    await new Promise((r) => setTimeout(r, 50));
     (this.hub.store as { close?: () => void }).close?.();
     this.t.cleanup();
   }
