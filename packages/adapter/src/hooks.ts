@@ -9,6 +9,7 @@ import {
   denyReason,
   digestText,
   editImpactNote,
+  holdTurnReason,
   inline,
   isLanderLease,
   postEditConflictText,
@@ -27,6 +28,7 @@ import { commitGuardOff } from './guard-status.js';
 import { PendingClaims, type StoredClaim } from './pending.js';
 import { HOOK_SYNC_BUDGET_MS, clearMarkers, clearMarkersElsewhere, enterEdit, noteMarkerElsewhere, removeMarker, staleFiles, syncPaths, syncWorkspace, type SyncPaths, type SyncResult } from './sync.js';
 import { cachedChanges, editImpacts, firstTimeInSession, isNews, readAcks, relevantAll, sortImpacts, whoUses, type WhoUses } from './impact.js';
+import { HOLD_STATUSES, endRow, heldBefore, holdPaths, markHeld, pickHold, startRow, type HoldPaths } from './hold.js';
 import {
   MAX_MAPPED_BYTES,
   editScope,
@@ -74,6 +76,8 @@ const DIGEST_RESERVE_MS = 4_000;
 const MIN_REQUEST_MS = 200;
 /** Phase 3 impacts from the edit hooks are best effort within this (design §2.3.6: posting, and who_uses, 2 s each). */
 const IMPACT_BUDGET_MS = 2_000;
+/** The Stop hold's one hub request (the agent's live landings): a hub slower than this means no hold, not a slow Stop. */
+const HOLD_REQUEST_MS = 3_000;
 
 /**
  * Let the edit through, and make sure someone sees that it isn't coordinated.
@@ -667,7 +671,9 @@ async function verifyEdit(state: EditState, root: string, input: Record<string, 
  * point) it then syncs the workspace with trunk, and prints additionalContext
  * (which is added to the prompt) only when that changed the worktree, found a
  * conflict, found it behind with uncommitted changes, or found an interrupted
- * sync; otherwise it prints nothing.
+ * sync; otherwise it prints nothing. On Stop, with trunk's land.holdTurn on,
+ * it may keep the agent in its turn once per landing ({"decision":"block"})
+ * while its landing is in the queue (stopHold).
  */
 export async function settleHook(io: HookIO): Promise<HookOutcome> {
   const started = Date.now();
@@ -677,6 +683,8 @@ export async function settleHook(io: HookIO): Promise<HookOutcome> {
   if (!input || !ids) return ALLOW;
   const wholeSession = input.hook_event_name === 'SessionEnd';
   const prompt = input.hook_event_name === 'UserPromptSubmit';
+  // A new prompt (or the session's end) ends the Stop hold's row: the next Stop isn't the one right after a hold.
+  if (prompt || wholeSession) endHoldRow(input, io, ids.session);
   // First the in-flight markers of the thread's (or session's) edit calls: none of them is mid-edit now. Those in
   // other checkouts too (an edit of a file in another worktree), which the session's checkouts keep a note of.
   const match = wholeSession ? { session: ids.session } : { session: ids.session, thread: ids.thread };
@@ -695,6 +703,11 @@ export async function settleHook(io: HookIO): Promise<HookOutcome> {
     const entries = store.list(ids.session).filter((e) => wholeSession || e.thread === ids.thread);
     await releasePending(store, entries, input, io, releaseUntil);
   }
+  // The opt-in hold (land.holdTurn): the one other time settle prints, on Stop only.
+  if (input.hook_event_name === 'Stop') {
+    const reason = await stopHold(input, io, ids.session, until);
+    return reason ? { stdout: JSON.stringify({ decision: 'block', reason }), stderr: '', exitCode: 0 } : ALLOW;
+  }
   // The safe point: a new prompt, so no tool call of the session can be mid-edit. Never on Stop or
   // SubagentStop. The one time settle prints: the agent must know when its files changed under it.
   if (!prompt) return ALLOW;
@@ -702,6 +715,57 @@ export async function settleHook(io: HookIO): Promise<HookOutcome> {
   const text = synced && syncPromptText(synced.result);
   if (!synced || !text || !freshNotice(synced.root, synced.result)) return ALLOW;
   return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: text } }), stderr: '', exitCode: 0 };
+}
+
+/** The hold's files in the session's own checkout (the one its landings come from), or null. */
+function sessionHoldPaths(input: Record<string, any>, io: HookIO): { root: string; paths: HoldPaths } | null {
+  const dir = sessionDir(input, io);
+  const root = claimRoot(dir, dir);
+  const paths = root ? holdPaths(root) : null;
+  return root && paths ? { root, paths } : null;
+}
+
+function endHoldRow(input: Record<string, any>, io: HookIO, session: string): void {
+  const own = sessionHoldPaths(input, io);
+  if (own) endRow(own.paths, session);
+}
+
+/**
+ * The opt-in Stop-hook hold (design §2.3.6): with trunk's land.holdTurn on,
+ * when this agent has a live landing that isn't parked for an approval and
+ * hasn't held it before, and the Stop isn't already a continuation
+ * (stop_hook_active), the reason to keep the agent in its turn and wait for
+ * it. At most once per landing (G/agenthub/held/<landing>), and never twice
+ * in a row: the session's Stop after a hold passes, whatever
+ * stop_hook_active says. Anything that fails (config, hub, files) means no
+ * hold.
+ */
+async function stopHold(input: Record<string, any>, io: HookIO, session: string, until: number): Promise<string | null> {
+  const own = sessionHoldPaths(input, io);
+  if (!own) return null;
+  const { root, paths } = own;
+  if (endRow(paths, session)) return null;
+  if (input.stop_hook_active) return null;
+  let cfg: HubConfig;
+  try {
+    cfg = configFor(root, input, io);
+    if (!cfg.agent || !teamSections(root, { strict: false }).sections.land?.holdTurn) return null;
+  } catch {
+    return null;
+  }
+  const me = cfg.agent;
+  const by = Math.min(until, Date.now() + HOLD_REQUEST_MS);
+  if (by - Date.now() < MIN_REQUEST_MS) return null;
+  let live: Landing[];
+  try {
+    live = await hookClient(cfg, by).landings({ statuses: [...HOLD_STATUSES], agent: me });
+  } catch {
+    return null;
+  }
+  const l = pickHold(live, me, (x) => heldBefore(paths, x, cfg.project));
+  if (!l || !markHeld(paths, l, cfg.project, session)) return null;
+  if (!startRow(paths, session)) return null; // the next Stop couldn't be let through: no hold at all
+  return holdTurnReason(l);
 }
 
 /**

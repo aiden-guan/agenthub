@@ -1394,6 +1394,29 @@ function genericBrief(l: Landing, c: BriefContext): string {
   return lines.join('\n');
 }
 
+// ------------------------------------------------------------------ the Stop-hook hold (design §2.3.6, opt-in land.holdTurn)
+
+/** Where a live landing is, for the hold: `checking`, `queued, position 2`, `waiting for admission`. */
+function holdState(l: Pick<Landing, 'status' | 'phase' | 'position'>): string {
+  if (l.status === 'running') return word(l.phase) || 'running';
+  if (l.status === 'queued') return l.position !== null ? `queued, position ${l.position}` : 'queued';
+  if (l.status === 'submitted') return 'waiting for admission';
+  return word(l.status);
+}
+
+/**
+ * The Stop hook's reason for keeping the agent in its turn once: its landing
+ * is still in the queue. Only hub-made ids and states, no agent's text.
+ */
+export function holdTurnReason(l: Pick<Landing, 'id' | 'task_id' | 'status' | 'phase' | 'position'>): string {
+  const id = word(l.id);
+  const forTask = l.task_id ? ` for ${word(l.task_id)}` : '';
+  return (
+    `Your landing ${id}${forTask} is still in the queue (${holdState(l)}). ` +
+    `Call hub_wait ${JSON.stringify({ landing_id: id })} and stay until it lands or comes back, so you can fix it with the context you have now.`
+  );
+}
+
 // ------------------------------------------------------------------ workspace sync (design §2.3.5)
 
 /** `3 landings` when every incoming trunk commit is a landing, else `3 commits`. */
