@@ -12,8 +12,9 @@ import { Feed } from '../src/feed.js';
 import { syncDigestLine, syncPromptText, syncToolText } from '../src/format.js';
 import { landWork } from '../src/land.js';
 import { createMcpServer } from '../src/mcp.js';
+import { PendingClaims } from '../src/pending.js';
 import { HOOK_SYNC_BUDGET_MS, syncPaths, syncWorkspace, writeMarker, type SyncResult } from '../src/sync.js';
-import { A, B, downUrl, git, hubCli, postToolUseInput, preToolUseInput, sessionEventInput, sleep, testEnv } from './helpers.js';
+import { A, B, downUrl, fakeHub, git, hubCli, postToolUseInput, preToolUseInput, sessionEventInput, sleep, testEnv } from './helpers.js';
 import { PROJECT, TestLander, commit, makeLandingRepo, report, startLandingHub, TEAM_CONFIG, type LandingHub, type LandingRepo } from './landing-hub.js';
 
 // Step A2 (design §2.3.5, §3.10): workspace sync against real repositories,
@@ -367,17 +368,23 @@ describe('sync: every reason it changes nothing', () => {
     );
   });
 
-  it('changed_meanwhile: an untracked file the target would overwrite makes git reset --keep refuse, and it stays as it was', async () => {
+  it('changed_meanwhile: an untracked file where the target has one is never overwritten, and it stays as it was', async () => {
     const a = await landForReal(repo.a, A, { 'src/new.ts': 'export const fromTrunk = 1;\n' });
     writeFileSync(path.join(repo.b, 'src', 'new.ts'), 'my untracked work\n');
     const before = snapshot(repo.b);
     const r = await sync(B, repo.b);
-    expect(r).toMatchObject({ kind: 'skipped', reason: 'changed_meanwhile', trunk: 'main' });
+    expect(r).toEqual({ kind: 'skipped', reason: 'changed_meanwhile', detail: 'untracked or ignored files in the way: src/new.ts', paths: ['src/new.ts'], trunk: 'main' });
     expect({ ...snapshot(repo.b), '<refs>': '' }).toEqual({ ...before, '<refs>': '' });
     expect(readFileSync(path.join(repo.b, 'src', 'new.ts'), 'utf8')).toBe('my untracked work\n');
     expect(backupRefs(repo.b)).toEqual({}); // the backup of a move that didn't happen goes again
     expect(existsSync(syncPaths(repo.b)!.record)).toBe(false);
     expect(rev(repo.b, 'refs/remotes/origin/main')).toBe(a.trunk);
+    expect(syncToolText(r)).toBe(
+      "src/new.ts is untracked or ignored in your worktree, and main now has files there; sync never overwrites or removes such files, so nothing was changed. Move it aside (or delete it if you don't need it), then call hub_sync again.",
+    );
+    expect(syncPromptText(r)).toBe(
+      "agenthub: your workspace wasn't synced to main: src/new.ts is untracked or ignored in your worktree, and main now has files there; sync never overwrites or removes such files. Move it aside (or delete it if you don't need it); it syncs at a later prompt, or call hub_sync.",
+    );
   });
 
   it('timeout: a spent budget stops it before anything changes', async () => {
@@ -385,6 +392,179 @@ describe('sync: every reason it changes nothing', () => {
     const before = rev(repo.b);
     expect(await sync(B, repo.b, { budgetMs: 0 })).toEqual({ kind: 'skipped', reason: 'timeout', detail: null, trunk: 'main' });
     expect(rev(repo.b)).toBe(before);
+  });
+
+  it('sync_running: a lock still being written (unreadable) counts as held until 120 s after it was written', async () => {
+    await landForReal(repo.a, A, { 'src/users.ts': 'export const users = [];\n' });
+    const p = syncPaths(repo.b)!;
+    mkdirSync(p.dir, { recursive: true });
+    writeFileSync(p.lock, ''); // created (O_EXCL) by another sync that hasn't written its pid yet
+    expect(await sync(B, repo.b)).toEqual({ kind: 'skipped', reason: 'sync_running', detail: null, trunk: 'main' });
+    expect(readFileSync(p.lock, 'utf8')).toBe('');
+    const old = (Date.now() - 121_000) / 1000;
+    utimesSync(p.lock, old, old);
+    expect((await sync(B, repo.b)).kind).toBe('synced');
+    expect(readdirSync(p.dir).filter((n) => n.startsWith('sync.lock'))).toEqual([]);
+  });
+
+  it("sync_running: recovery waits for the lock, so a running sync's write-ahead record is never cleared under it", async () => {
+    await landForReal(repo.a, A, { 'src/users.ts': 'export const users = [];\n' });
+    const p = syncPaths(repo.b)!;
+    mkdirSync(p.dir, { recursive: true });
+    // A live sync holds the lock; the record on disk (a dead pid, HEAD its old tip) is one recovery would clear.
+    writeFileSync(p.lock, JSON.stringify({ pid: process.pid, at: Date.now() }));
+    const record = { pid: 2 ** 22 + 12345, orig_head: rev(repo.b), target: rev(repo.b), branch: 'agent-b', backup_ref: 'refs/agenthub/backup/agent-b/1', at: Date.now() };
+    writeFileSync(p.record, JSON.stringify(record));
+    expect(await sync(B, repo.b)).toEqual({ kind: 'skipped', reason: 'sync_running', detail: null, trunk: 'main' });
+    expect(JSON.parse(readFileSync(p.record, 'utf8'))).toEqual(record);
+    rmSync(p.lock);
+    expect(await sync(B, repo.b)).toMatchObject({ kind: 'synced', recovered: 'unapplied' });
+    expect(existsSync(p.record)).toBe(false);
+  });
+});
+
+describe('sync: untracked and ignored files are never overwritten or removed', () => {
+  // git reset --keep (like checkout and merge) refuses to overwrite an untracked file, but treats an ignored one, and an
+  // ignored directory where the target has a file, as expendable. Sync checks for both first and refuses (design §2.3.5, §4.3).
+  const exclude = (wt: string, ...patterns: string[]) => writeFileSync(path.join(wt, '.git', 'info', 'exclude'), patterns.map((p) => `${p}\n`).join(''));
+
+  it('an ignored file at a path trunk starts tracking stays as it was (changed_meanwhile)', async () => {
+    exclude(repo.b, '.env');
+    writeFileSync(path.join(repo.b, '.env'), 'MY_SECRET=hunter2\n');
+    foreignPush({ '.env': 'DEFAULTS=1\n' });
+    const before = snapshot(repo.b);
+    const r = await sync(B, repo.b);
+    expect(r).toEqual({ kind: 'skipped', reason: 'changed_meanwhile', detail: 'untracked or ignored files in the way: .env', paths: ['.env'], trunk: 'main' });
+    expect({ ...snapshot(repo.b), '<refs>': '' }).toEqual({ ...before, '<refs>': '' });
+    expect(readFileSync(path.join(repo.b, '.env'), 'utf8')).toBe('MY_SECRET=hunter2\n');
+    expect(backupRefs(repo.b)).toEqual({});
+    expect(existsSync(syncPaths(repo.b)!.record)).toBe(false);
+  });
+
+  it('a file a committed .gitignore ignored, which trunk now tracks, stays as it was', async () => {
+    foreignPush({ '.gitignore': 'config/local.json\n' });
+    expect((await sync(B, repo.b)).kind).toBe('synced');
+    mkdirSync(path.join(repo.b, 'config'), { recursive: true });
+    writeFileSync(path.join(repo.b, 'config', 'local.json'), '{"mine": true}\n');
+    expect(git(repo.b, 'status', '--porcelain').trim()).toBe('');
+    foreignPush({ '.gitignore': '\n', 'config/local.json': '{"team": true}\n' });
+    const r = await sync(B, repo.b);
+    expect(r).toMatchObject({ kind: 'skipped', reason: 'changed_meanwhile', paths: ['config/local.json'] });
+    expect(readFileSync(path.join(repo.b, 'config', 'local.json'), 'utf8')).toBe('{"mine": true}\n');
+    expect(readFileSync(path.join(repo.b, '.gitignore'), 'utf8')).toBe('config/local.json\n');
+  });
+
+  it('an ignored directory where trunk has a file, and an ignored file where trunk has a directory', async () => {
+    exclude(repo.b, 'cache/', 'vendor');
+    mkdirSync(path.join(repo.b, 'cache'));
+    writeFileSync(path.join(repo.b, 'cache', 'one'), '1\n');
+    writeFileSync(path.join(repo.b, 'cache', 'two'), '2\n');
+    writeFileSync(path.join(repo.b, 'vendor'), 'my notes\n');
+    foreignPush({ cache: 'a file now\n', 'vendor/lib.js': 'export {};\n' });
+    const before = snapshot(repo.b);
+    const r = await sync(B, repo.b);
+    expect(r).toMatchObject({ kind: 'skipped', reason: 'changed_meanwhile', paths: ['cache/', 'vendor'] });
+    expect({ ...snapshot(repo.b), '<refs>': '' }).toEqual({ ...before, '<refs>': '' });
+    expect(syncToolText(r)).toMatch(/^cache\/ and vendor are untracked or ignored in your worktree, and main now has files there; .* Move them aside \(or delete them if you don't need them\), then call hub_sync again\.$/);
+  });
+
+  it('ignored files trunk has no file at stay, and a new file inside an ignored directory is no collision', async () => {
+    exclude(repo.b, 'build/', '.env.local');
+    mkdirSync(path.join(repo.b, 'build'));
+    writeFileSync(path.join(repo.b, 'build', 'a.js'), 'built\n');
+    writeFileSync(path.join(repo.b, '.env.local'), 'LOCAL=1\n');
+    const f = foreignPush({ 'build/b.js': 'checked in\n', 'docs/x.md': 'x\n' });
+    expect(await sync(B, repo.b)).toMatchObject({ kind: 'synced', to: f, files: ['build/b.js', 'docs/x.md'] });
+    expect(readFileSync(path.join(repo.b, 'build', 'a.js'), 'utf8')).toBe('built\n');
+    expect(readFileSync(path.join(repo.b, 'build', 'b.js'), 'utf8')).toBe('checked in\n');
+    expect(readFileSync(path.join(repo.b, '.env.local'), 'utf8')).toBe('LOCAL=1\n');
+  });
+
+  it('a tracked file trunk replaces with a directory, and a tracked directory it replaces with a file, still sync', async () => {
+    foreignPush({ 'lib/util.ts': 'export {};\n', notes: 'a file\n' });
+    expect((await sync(B, repo.b)).kind).toBe('synced');
+    git(landerWt, 'rm', '-q', '-r', 'lib', 'notes');
+    git(landerWt, 'commit', '-q', '-m', 'swap');
+    const f = commit(landerWt, { lib: 'now a file\n', 'notes/today.md': 'now a directory\n' }, 'swap');
+    git(landerWt, 'push', '-q', 'origin', 'main');
+    expect(await sync(B, repo.b)).toMatchObject({ kind: 'synced', to: f });
+    expect(readFileSync(path.join(repo.b, 'lib'), 'utf8')).toBe('now a file\n');
+  });
+
+  it('merge mode refuses (merge_refused) rather than overwrite an ignored file, in a fast-forward and in a merge', async () => {
+    exclude(repo.b, '.env', 'cache/');
+    writeFileSync(path.join(repo.b, '.env'), 'MY_SECRET=hunter2\n');
+    mkdirSync(path.join(repo.b, 'cache'));
+    writeFileSync(path.join(repo.b, 'cache', 'one'), '1\n');
+    foreignPush({ '.env': 'DEFAULTS=1\n', cache: 'a file now\n' });
+    // A fast-forward (git merge --no-overwrite-ignore refuses this one itself) …
+    const ff = await sync(B, repo.b, { mode: 'merge' });
+    expect(ff).toEqual({ kind: 'skipped', reason: 'merge_refused', detail: 'untracked or ignored files in the way: .env, cache/', paths: ['.env', 'cache/'], trunk: 'main' });
+    // … and a real merge (where git 2.43's ort merge overwrites ignored files whatever the flag says).
+    const head = commit(repo.b, { 'src/routes.ts': 'export {};\n' });
+    const before = snapshot(repo.b);
+    const r = await sync(B, repo.b, { mode: 'merge' });
+    expect(r).toMatchObject({ kind: 'skipped', reason: 'merge_refused', paths: ['.env', 'cache/'] });
+    expect({ ...snapshot(repo.b), '<refs>': '' }).toEqual({ ...before, '<refs>': '' });
+    expect(readFileSync(path.join(repo.b, '.env'), 'utf8')).toBe('MY_SECRET=hunter2\n');
+    expect(rev(repo.b)).toBe(head);
+    expect(git(repo.b, 'status', '--porcelain').trim()).toBe('');
+    expect(syncToolText(r)).toBe(
+      ".env and cache/ are untracked or ignored in your worktree, and main now has files there; sync never overwrites or removes such files, so nothing was changed. " +
+        "Move them aside (or delete them if you don't need them), then call hub_sync {\"mode\": \"merge\"} again.",
+    );
+  });
+});
+
+describe('sync: git older than 2.40 (no merge-tree --merge-base) fast-forwards only, and says so', () => {
+  /** A PATH directory whose git is the real one, except that it is "2.39.2": merge-tree has no --merge-base. */
+  function oldGitPath(): string {
+    const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    const dir = path.join(repo.dir, 'old-git');
+    mkdirSync(dir);
+    writeFileSync(
+      path.join(dir, 'git'),
+      `#!/bin/sh\nfor a in "$@"; do case "$a" in --merge-base*) echo "error: unknown option \\\`merge-base'" >&2; exit 129;; esac; done\n` +
+        `if [ "$1" = version ] || [ "$1" = --version ]; then echo "git version 2.39.2"; exit 0; fi\nexec "${real}" "$@"\n`,
+      { mode: 0o755 },
+    );
+    return `${dir}${path.delimiter}${process.env.PATH ?? ''}`;
+  }
+
+  it('fast-forwards, refuses a replay with a notice once, and reports behind_dirty without a forecast', async () => {
+    const PATH = oldGitPath();
+    const y = commit(repo.b, { 'src/routes.ts': 'export {};\n' });
+    await landForReal(repo.a, A, { 'src/users.ts': 'export const users = [];\n' });
+    const before = snapshot(repo.b);
+
+    const r = await hubCli(['sync'], { cwd: repo.b, env: envFor(B, { PATH }) });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toBe(
+      'Your git (2.39.2) is too old to replay your unlanded commits onto main (sync needs git 2.40 or newer for that), so it only fast-forwards. ' +
+        'Nothing was changed. Update git, or call hub_sync {"mode": "merge"} to merge main into your branch.\n',
+    );
+    expect({ ...snapshot(repo.b), '<refs>': '' }).toEqual({ ...before, '<refs>': '' });
+    expect(rev(repo.b)).toBe(y);
+
+    const settle = () => hubCli(['hook', 'settle'], { cwd: repo.b, env: envFor(B, { PATH }), input: sessionEventInput(repo.b, 'UserPromptSubmit', 'sess-g') });
+    expect(JSON.parse((await settle()).stdout).hookSpecificOutput.additionalContext).toBe(
+      'agenthub: main moved, and your workspace wasn\'t updated: your git (2.39.2) is too old to replay your unlanded commits onto main (sync needs git 2.40 or newer for that), so it only fast-forwards. ' +
+        'Update git, or call hub_sync {"mode": "merge"} to merge main into your branch.',
+    );
+    expect((await settle()).stdout).toBe(''); // said once
+
+    writeFileSync(path.join(repo.b, 'src', 'auth.ts'), AUTH_TRIM);
+    const dirty = await hubCli(['sync'], { cwd: repo.b, env: envFor(B, { PATH }) });
+    expect(dirty.code).toBe(0);
+    expect(dirty.stdout).toBe(
+      "main moved (L-1). Your workspace wasn't updated because you have uncommitted changes (M src/auth.ts); " +
+        'merging them may conflict (your git is too old to forecast it: that needs git 2.40 or newer). It updates at a later prompt once you commit, or call hub_sync after committing.\n',
+    );
+
+    // A worktree with nothing of its own fast-forwards as with any git.
+    const ff = await hubCli(['sync'], { cwd: repo.a, env: envFor(A, { PATH }) });
+    expect(ff.code, ff.stdout).toBe(0);
+    expect(rev(repo.a)).toBe(remoteMain());
   });
 });
 
@@ -601,6 +781,64 @@ describe('the safe points: settle on UserPromptSubmit, the digest at SessionStar
     expect(took).toBeLessThan(15_000);
     expect(took).toBeGreaterThanOrEqual(HOOK_SYNC_BUDGET_MS - 3000);
   }, 30_000);
+
+  /** A hub that accepts connections and never answers. */
+  async function silentHub(): Promise<string> {
+    const h = await fakeHub((req) => req.resume());
+    cleanups.push(() => h.close());
+    return h.url;
+  }
+
+  it('settle stays within 15 s with pending claims to release and a hub that never answers, whatever HUB_TIMEOUT_MS says', async () => {
+    const url = await silentHub();
+    const f = foreignPush({ 'docs/x.md': 'x\n' });
+    const store = PendingClaims.open(repo.b)!;
+    for (const tool of ['toolu_p1', 'toolu_p2']) store.add({ session: 'sess-t', thread: 'main', tool, claim_id: `C-${tool}`, root: repo.b, url, project: PROJECT, created_at: 1 });
+    const started = Date.now();
+    const r = await hubCli(['hook', 'settle'], { cwd: repo.b, env: envFor(B, { HUB_URL: url, HUB_TIMEOUT_MS: '30000' }), input: sessionEventInput(repo.b, 'UserPromptSubmit', 'sess-t') });
+    const took = Date.now() - started;
+    expect(took).toBeLessThan(15_000);
+    // Without the hub only a fast-forward may go ahead, and this is one.
+    expect(JSON.parse(r.stdout).hookSpecificOutput.additionalContext).toMatch(/^agenthub synced your workspace to main /);
+    expect(rev(repo.b)).toBe(f);
+    expect(store.list('sess-t')).toHaveLength(2); // kept for the next try
+  }, 30_000);
+
+  it('the digest stays within 15 s with a hub that never answers, whatever HUB_TIMEOUT_MS says', async () => {
+    const url = await silentHub();
+    const f = foreignPush({ 'docs/x.md': 'x\n' });
+    const started = Date.now();
+    const r = await hubCli(['hook', 'digest'], {
+      cwd: repo.b,
+      env: envFor(B, { HUB_URL: url, HUB_TIMEOUT_MS: '30000' }),
+      input: JSON.stringify({ session_id: 'sess-d2', cwd: repo.b, hook_event_name: 'SessionStart', source: 'startup' }),
+    });
+    expect(Date.now() - started).toBeLessThan(15_000);
+    const text = JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string;
+    expect(text).toMatch(/^agenthub: the team hub is unavailable \(/);
+    // The sync went ahead (a fast-forward needs no hub), and the agent hears of it all the same.
+    expect(text).toMatch(new RegExp(`\\nTrunk: your worktree was clean and is now at main ${f.slice(0, 7)} \\(1 commit\\)\\. Re-read docs/x\\.md before editing it\\. `));
+    expect(rev(repo.b)).toBe(f);
+  }, 30_000);
+
+  it("settle clears the thread's edit markers in other checkouts too (an edit in another worktree rejected at the permission prompt)", async () => {
+    const other = path.join(repo.dir, 'wt-b2');
+    git(repo.b, 'worktree', 'add', '-q', other, '-b', 'agent-b2');
+    const env = envFor(B, { CLAUDE_PROJECT_DIR: repo.b });
+    const preEdit = (tool: string, agentId?: string) =>
+      hubCli(['hook', 'pre-edit'], { cwd: repo.b, env, input: preToolUseInput(repo.b, path.join(other, 'src', 'users.ts'), 'Edit', { session: 'sess-o', toolUseId: tool, agentId }) });
+    expect((await preEdit('toolu_o1')).stdout).toBe('');
+    expect((await preEdit('toolu_o2', 'agent-9')).stdout).toBe('');
+    const p = syncPaths(other)!;
+    expect(readdirSync(p.inflight).sort()).toEqual(['sess-o~toolu_o1', 'sess-o~toolu_o2']);
+    // No post-edit for either: the main thread's turn ends, then the subagent's, then the session.
+    await hubCli(['hook', 'settle'], { cwd: repo.b, env, input: sessionEventInput(repo.b, 'UserPromptSubmit', 'sess-o') });
+    expect(readdirSync(p.inflight)).toEqual(['sess-o~toolu_o2']);
+    await hubCli(['hook', 'settle'], { cwd: repo.b, env, input: sessionEventInput(repo.b, 'SubagentStop', 'sess-o', 'agent-9') });
+    expect(readdirSync(p.inflight)).toEqual([]);
+    await hubCli(['hook', 'settle'], { cwd: repo.b, env, input: sessionEventInput(repo.b, 'SessionEnd', 'sess-o') });
+    expect(readdirSync(syncPaths(repo.b)!.elsewhere)).toEqual([]);
+  });
 
   it('the digest syncs first and says where the worktree is now', async () => {
     const a = await landForReal(repo.a, A, { 'src/users.ts': 'export const users = [];\n' });

@@ -9,16 +9,17 @@
 // create`, which writes no refs and changes nothing, to forecast conflicts).
 //
 // Its files live under the worktree's own git dir, G = gitDir(root):
-//   G/agenthub/sync.lock            {pid, at}, O_EXCL; stale after 120 s or when its pid is dead
+//   G/agenthub/sync.lock            {pid, at}, linked into place (O_EXCL); stale after 120 s or when its pid is dead
 //   G/agenthub/sync.json            the write-ahead record {pid, orig_head, target, branch, backup_ref, at}
 //   G/agenthub/inflight/<s>~<tool>  one marker per edit tool call the pre-edit hook let through
 //   G/agenthub/mergebase            the merge base of (HEAD, trunk), cached for the stale-base heads-up
 //   G/agenthub/stale-shown          (session, file, trunk) heads-ups already given
 //   G/agenthub/sync-said            the last notice settle printed, so an unchanged state isn't repeated
+//   G/agenthub/elsewhere/<s>~<hash> where this session's edits in other checkouts have markers, for settle
 
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
-import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync, type Stats } from 'node:fs';
 import path from 'node:path';
 import { gitops, GitError, type Git } from '@agenthub/gitops';
 import type { LandConfig } from '@agenthub/contract';
@@ -38,6 +39,8 @@ const EXPLICIT_BUDGET_MS = 90_000;
 const FETCH_TIMEOUT_MS = 15_000;
 /** Time kept back for the write-ahead, the reset and the verify, which always run to the end once begun. */
 const APPLY_RESERVE_MS = 2_000;
+/** The hub's answer (step 5) leaves this much more for the plan, so a hub that never answers still lets a fast-forward through. */
+const PLAN_RESERVE_MS = 1_000;
 const BACKUP_PREFIX = 'refs/agenthub/backup/';
 const BACKUP_KEEP_MS = 14 * 24 * 60 * 60_000;
 
@@ -51,6 +54,7 @@ export interface SyncPaths {
   mergebase: string;
   staleShown: string;
   said: string;
+  elsewhere: string;
 }
 
 /** Where this worktree's sync files live, or null outside a git checkout. */
@@ -66,6 +70,7 @@ export function syncPaths(root: string): SyncPaths | null {
     mergebase: path.join(dir, 'mergebase'),
     staleShown: path.join(dir, 'stale-shown'),
     said: path.join(dir, 'sync-said'),
+    elsewhere: path.join(dir, 'elsewhere'),
   };
 }
 
@@ -100,8 +105,13 @@ function ownerLive(o: Partial<Owner> | null, now = Date.now()): boolean {
   return !!o && pidAlive(o.pid) && typeof o.at === 'number' && now - o.at < LOCK_STALE_MS;
 }
 
-/** The lock's owner as written; an unreadable lock (half-written) counts by its file time, with no live pid. */
-function readOwner(file: string): { owner: Partial<Owner>; raw: string } | null {
+/**
+ * The lock as written. One whose contents can't be read as an owner (another
+ * adapter's lock created but not yet written, or a damaged one) names no pid,
+ * so it counts by its file time alone: held until LOCK_STALE_MS after it was
+ * written, never taken for abandoned at once.
+ */
+function readOwner(file: string): { owner: Partial<Owner>; raw: string; unreadable: boolean } | null {
   let raw: string;
   try {
     raw = readFileSync(file, 'utf8');
@@ -109,40 +119,83 @@ function readOwner(file: string): { owner: Partial<Owner>; raw: string } | null 
     return null;
   }
   try {
-    return { owner: JSON.parse(raw) as Owner, raw };
+    const owner = JSON.parse(raw) as Partial<Owner>;
+    if (owner && typeof owner === 'object' && typeof owner.pid === 'number' && typeof owner.at === 'number') return { owner, raw, unreadable: false };
   } catch {
-    let at = 0;
-    try {
-      at = statSync(file).mtimeMs;
-    } catch {
-      // gone meanwhile
-    }
-    return { owner: { pid: 0, at }, raw };
+    // below
   }
+  let at = Date.now();
+  try {
+    at = statSync(file).mtimeMs;
+  } catch {
+    // gone meanwhile: then it counts as just written
+  }
+  return { owner: { at }, raw, unreadable: true };
+}
+
+function lockLive(o: { owner: Partial<Owner>; unreadable: boolean }, now = Date.now()): boolean {
+  return o.unreadable ? now - (o.owner.at ?? now) < LOCK_STALE_MS : ownerLive(o.owner, now);
 }
 
 /** Whether a sync holds this worktree's lock right now. */
 export function lockHeld(p: SyncPaths): boolean {
   const o = readOwner(p.lock);
-  return !!o && ownerLive(o.owner);
+  return !!o && lockLive(o);
 }
 
-/** Take the lock (O_EXCL); a stale one is moved aside first. False when a live sync holds it. */
+/**
+ * Take the lock; a stale one is moved aside first. False when a live sync
+ * holds it. The lock is written in full under a temporary name and then
+ * hard-linked into place: link fails when the lock exists, as O_EXCL does,
+ * and no other process ever sees it half-written.
+ */
 function takeLock(p: SyncPaths): boolean {
   mkdirSync(p.dir, { recursive: true });
-  for (let i = 0; i < 3; i++) {
-    try {
-      writeFileSync(p.lock, JSON.stringify({ pid: process.pid, at: Date.now() }), { flag: 'wx' });
-      return true;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+  const body = JSON.stringify({ pid: process.pid, at: Date.now() });
+  const tmp = `${p.lock}.${process.pid}-${randomBytes(4).toString('hex')}.tmp`;
+  writeFileSync(tmp, body);
+  try {
+    for (let i = 0; i < 3; i++) {
+      try {
+        linkSync(tmp, p.lock);
+        pruneLitter(p);
+        return true;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EEXIST') {
+          // A file system without hard links: create it with O_EXCL instead (it may then be seen empty for an instant).
+          if (code !== 'EPERM' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP' && code !== 'ENOSYS') throw err;
+          try {
+            writeFileSync(p.lock, body, { flag: 'wx' });
+            return true;
+          } catch (e) {
+            if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+          }
+        }
+      }
+      const seen = readOwner(p.lock);
+      if (!seen) continue; // released meanwhile
+      if (lockLive(seen)) return false;
+      breakStale(p.lock, seen.raw);
     }
-    const seen = readOwner(p.lock);
-    if (!seen) continue; // released meanwhile
-    if (ownerLive(seen.owner)) return false;
-    breakStale(p.lock, seen.raw);
+    return false;
+  } finally {
+    rmSync(tmp, { force: true });
   }
-  return false;
+}
+
+/** Temporary files of syncs that died while writing one (older than LOCK_STALE_MS): the lock holder sweeps them. */
+function pruneLitter(p: SyncPaths): void {
+  try {
+    const cutoff = Date.now() - LOCK_STALE_MS;
+    for (const name of readdirSync(p.dir)) {
+      if (!/^sync\.(?:lock|json)\..+\.tmp$|^sync\.lock\.stale-/.test(name)) continue;
+      const file = path.join(p.dir, name);
+      if (statSync(file).mtimeMs < cutoff) rmSync(file, { force: true });
+    }
+  } catch {
+    // housekeeping only
+  }
 }
 
 /**
@@ -254,7 +307,7 @@ export function removeMarker(file: string | null): void {
  * Remove the markers of the tool calls a hook confirms or settles: one call
  * (`tool`), a thread's (`thread`), or the whole session's. Returns how many.
  */
-export function clearMarkers(p: SyncPaths, match: { session: string; thread?: string; tool?: string }): number {
+export function clearMarkers(p: Pick<SyncPaths, 'inflight'>, match: { session: string; thread?: string; tool?: string }): number {
   let names: string[];
   try {
     names = readdirSync(p.inflight);
@@ -270,6 +323,64 @@ export function clearMarkers(p: SyncPaths, match: { session: string; thread?: st
     if (match.thread !== undefined && m.thread !== match.thread) continue;
     rmSync(file, { force: true });
     n++;
+  }
+  return n;
+}
+
+/** A marker directory: `<git dir>/agenthub/inflight`, and nothing else. */
+const isInflightDir = (dir: unknown): dir is string => typeof dir === 'string' && path.isAbsolute(dir) && dir.endsWith(`${path.sep}agenthub${path.sep}inflight`);
+
+/**
+ * Note, in the session's own checkout (`p`), that an edit of the session has
+ * a marker in another checkout's `inflight` directory (a file in another
+ * worktree or repository): settle looks in the session's checkouts only, and
+ * clears the markers there too (clearMarkersElsewhere). Best effort.
+ */
+export function noteMarkerElsewhere(p: SyncPaths, session: string, inflight: string): void {
+  if (!isInflightDir(inflight) || path.resolve(inflight) === path.resolve(p.inflight)) return;
+  try {
+    mkdirSync(p.elsewhere, { recursive: true });
+    const file = path.join(p.elsewhere, `${safe(session)}~${createHash('sha256').update(inflight).digest('hex').slice(0, 16)}`);
+    writeFileSync(file, JSON.stringify({ session, inflight })); // rewritten each time: its age is the last edit's
+  } catch {
+    // then that marker goes stale in MARKER_STALE_MS, or post-edit removes it
+  }
+}
+
+/**
+ * Clear the markers that match in the other checkouts noted for this session
+ * (see noteMarkerElsewhere), skipping `done` (inflight directories already
+ * cleared); for the whole session the notes go too. Returns how many markers.
+ */
+export function clearMarkersElsewhere(p: SyncPaths, match: { session: string; thread?: string }, done: Set<string> = new Set()): number {
+  let names: string[];
+  try {
+    names = readdirSync(p.elsewhere);
+  } catch {
+    return 0;
+  }
+  let n = 0;
+  const now = Date.now();
+  for (const name of names) {
+    const file = path.join(p.elsewhere, name);
+    const note = readJson<{ session?: unknown; inflight?: unknown }>(file);
+    let mtime = 0;
+    try {
+      mtime = statSync(file).mtimeMs;
+    } catch {
+      continue; // removed meanwhile
+    }
+    if (!note || !isInflightDir(note.inflight)) {
+      rmSync(file, { force: true });
+      continue;
+    }
+    if (note.session === match.session) {
+      if (!done.has(note.inflight)) {
+        done.add(note.inflight);
+        n += clearMarkers({ inflight: note.inflight }, match);
+      }
+      if (match.thread === undefined || now - mtime >= MARKER_STALE_MS) rmSync(file, { force: true });
+    } else if (now - mtime >= MARKER_STALE_MS) rmSync(file, { force: true }); // its markers are stale by now
   }
   return n;
 }
@@ -352,11 +463,14 @@ export type SyncSkipReason =
   | 'hub_unavailable'
   | 'lander_paused'
   | 'merges_in_branch'
+  /** HEAD or the tracked files changed while the sync was being prepared, untracked or ignored files are where the target has files (`paths`), or git reset --keep refused. */
   | 'changed_meanwhile'
   | 'timeout'
+  /** git older than 2.40 (no merge-tree --merge-base): only fast-forwards and fully landed branches move (design §4.5). `detail`: git's version. */
+  | 'old_git'
   /** Merge mode: uncommitted tracked changes. */
   | 'dirty'
-  /** Merge mode: git merge refused to start (an untracked file it would overwrite), and changed nothing. */
+  /** Merge mode: git merge refused to start (an untracked file it would overwrite), or untracked or ignored files are where the merge has files (`paths`); nothing changed. */
   | 'merge_refused';
 
 /** Where trunk is: its branch name and the sha the sync compared against. */
@@ -382,13 +496,15 @@ export type SyncOutcome =
       backup_ref: string;
       undo: string;
     } & At)
-  | ({ kind: 'behind_dirty'; behind: number; landings: string[]; conflicts: string[]; uncommitted: string[] } & At)
+  /** `conflicts`: the forecast, or null when this git can't make one (older than 2.40). */
+  | ({ kind: 'behind_dirty'; behind: number; landings: string[]; conflicts: string[] | null; uncommitted: string[] } & At)
   | ({ kind: 'conflict'; commit: string; files: string[]; behind: number; landings: string[] } & At)
   | ({ kind: 'merged'; from: string; to: string; files: string[]; behind: number; landings: string[] } & At)
   | ({ kind: 'merge_conflict'; files: string[]; behind: number; landings: string[] } & At)
   /** A sync was interrupted and HEAD is neither its old tip nor its target: nothing is touched. `cleared`: `hub sync --recover` cleared the record. */
   | { kind: 'needs_human'; head: string | null; orig_head: string; target: string; backup_ref: string; cleared: boolean }
-  | { kind: 'skipped'; reason: SyncSkipReason; detail: string | null; trunk: string | null };
+  /** `paths` (changed_meanwhile, merge_refused): the untracked or ignored files and directories (`dir/`) where the target has files. */
+  | { kind: 'skipped'; reason: SyncSkipReason; detail: string | null; trunk: string | null; paths?: string[] };
 
 /** The outcome, and what recovery found of an interrupted sync before it: nothing had happened, or it had finished. */
 export type SyncResult = SyncOutcome & { recovered?: 'unapplied' | 'finished' };
@@ -415,6 +531,8 @@ const skipped = (reason: SyncSkipReason, detail: string | null = null, trunk: st
  * `syncWorkspace` (design §2.3.5), steps 0 to 10:
  * recover, lock, markers, fetch, git operation, own landings in flight, the
  * dirty forecast, the plan, the write-ahead, the CAS apply, verify.
+ * The recovery (step 0) runs once the lock is taken: only the lock holder
+ * writes a record, so no sync can clear the record of one that is running.
  */
 export async function syncWorkspace(root: string, cfg: HubConfig, client: HubClient, opts: SyncOptions): Promise<SyncResult> {
   const deadline = Date.now() + (opts.budgetMs ?? EXPLICIT_BUDGET_MS);
@@ -422,29 +540,29 @@ export async function syncWorkspace(root: string, cfg: HubConfig, client: HubCli
   const p = syncPaths(root);
   if (!p) throw new Error(`${root} is not a git checkout`);
   const g = gitops.open(root, { isolated: false });
-
-  // 0. Recover an interrupted sync: nothing is ever undone here, a record is only cleared.
-  let recovered: SyncResult['recovered'];
-  const record = readRecord(p);
-  if (record) {
-    if (ownerLive(record)) return skipped('sync_running');
-    const head = fullHead(root);
-    if (head === record.orig_head) recovered = 'unapplied';
-    else if (head === record.target) recovered = 'finished';
-    else {
-      if (opts.recover) clearRecord(p);
-      return { kind: 'needs_human', head, orig_head: record.orig_head, target: record.target, backup_ref: record.backup_ref, cleared: !!opts.recover };
-    }
-    clearRecord(p);
-  }
-  const done = (o: SyncOutcome): SyncResult => (recovered ? { ...o, recovered } : o);
-
   const land = teamSections(root, { strict: false }).sections.land;
-  if (!land) return done(skipped('no_queue'));
 
-  // 1. Lock, then 2. markers: the sync side of the exclusion.
-  if (!takeLock(p)) return done(skipped('sync_running', null, land.trunk));
+  // 1. Lock: the sync side of the exclusion.
+  if (!takeLock(p)) return skipped('sync_running', null, land?.trunk ?? null);
   try {
+    // 0. Recover an interrupted sync: nothing is ever undone here, a record is only cleared.
+    let recovered: SyncResult['recovered'];
+    const record = readRecord(p);
+    if (record) {
+      if (ownerLive(record)) return skipped('sync_running', null, land?.trunk ?? null); // a sync whose lock was taken for stale still runs
+      const head = fullHead(root);
+      if (head === record.orig_head) recovered = 'unapplied';
+      else if (head === record.target) recovered = 'finished';
+      else {
+        if (opts.recover) clearRecord(p);
+        return { kind: 'needs_human', head, orig_head: record.orig_head, target: record.target, backup_ref: record.backup_ref, cleared: !!opts.recover };
+      }
+      clearRecord(p);
+    }
+    const done = (o: SyncOutcome): SyncResult => (recovered ? { ...o, recovered } : o);
+    if (!land) return done(skipped('no_queue'));
+
+    // 2. Markers.
     const markers = liveMarkers(p);
     if (markers.length) return done(skipped('edit_in_flight', `${markers.length}`, land.trunk));
     return done(await (opts.mode === 'merge' ? mergeTrunk : updateToTrunk)({ root, cfg, client, g, p, land, left }));
@@ -509,9 +627,12 @@ async function updateToTrunk(c: Ctx): Promise<SyncOutcome> {
   const incoming = await incomingOf(c, head, at.tip);
   const uncommitted = await trackedChanges(g);
   if (uncommitted.length) {
-    const work = await gitops.stashCreate(g);
-    const base = (await gitops.landedBase(g, at.tip, head)).base;
-    const conflicts = await gitops.forecastConflicts(g, at.tip, work ?? head, base);
+    let conflicts: string[] | null = null;
+    if (await mergeTreeBase(g)) {
+      const work = await gitops.stashCreate(g);
+      const base = (await gitops.landedBase(g, at.tip, head)).base;
+      conflicts = await gitops.forecastConflicts(g, at.tip, work ?? head, base);
+    }
     return { kind: 'behind_dirty', ...at, behind: incoming.commits, landings: incoming.landings, conflicts, uncommitted };
   }
 
@@ -526,6 +647,8 @@ async function updateToTrunk(c: Ctx): Promise<SyncOutcome> {
     if (commits.length === 0) target = at.tip; // everything on the branch has landed
     else {
       if (hub.paused) return no('lander_paused', hub.paused);
+      // Old git: fast-forward only, and say so (design §4.5).
+      if (!(await mergeTreeBase(g))) return no('old_git', await gitVersion(g));
       // Unsigned: a signing prompt (commit.gpgSign) would hang a hook; the originals stay in the backup ref, and the lander squashes them anyway.
       const r = await gitops.replay(g.with({ 'commit.gpgSign': 'false' }), commits, at.tip);
       if (r.kind === 'merges') return no('merges_in_branch', r.commit);
@@ -540,7 +663,7 @@ async function updateToTrunk(c: Ctx): Promise<SyncOutcome> {
   const ms = Date.now();
   const backup = `${BACKUP_PREFIX}${branch}/${ms}`;
   writeRecord(p, { pid: process.pid, orig_head: head, target, branch, backup_ref: backup, at: ms });
-  let applied: { ok: true } | { ok: false; detail: string };
+  let applied: { ok: true } | { ok: false; detail: string; paths?: string[] };
   try {
     await g.run(['update-ref', '-m', 'agenthub sync: backup before moving the branch', backup, head]);
     fault('after-write-ahead');
@@ -548,9 +671,14 @@ async function updateToTrunk(c: Ctx): Promise<SyncOutcome> {
     if (fullHead(root) !== head) applied = { ok: false, detail: 'HEAD moved while the sync was being prepared' };
     else if ((await trackedChanges(g)).length) applied = { ok: false, detail: 'tracked files changed while the sync was being prepared' };
     else {
-      // --keep refuses, changing nothing, rather than overwrite a modified tracked file or an untracked one the target adds.
-      const r = await g.run(['reset', '--quiet', '--keep', target], { ok: [0, 1, 128] });
-      applied = r.code === 0 ? { ok: true } : { ok: false, detail: firstLine(`${r.stderr}\n${r.stdout}`) || `git reset --keep exited ${r.code}` };
+      // --keep refuses, changing nothing, rather than overwrite a modified tracked file or an untracked one the target
+      // adds, but it overwrites an ignored file and removes an ignored directory in the way: those are checked first.
+      const blocking = await inTheWay(g, root, head, target);
+      if (blocking.length) applied = { ok: false, detail: `untracked or ignored files in the way: ${capped(blocking)}`, paths: blocking };
+      else {
+        const r = await g.run(['reset', '--quiet', '--keep', target], { ok: [0, 1, 128] });
+        applied = r.code === 0 ? { ok: true } : { ok: false, detail: firstLine(`${r.stderr}\n${r.stdout}`) || `git reset --keep exited ${r.code}` };
+      }
     }
     fault('after-reset');
   } catch (err) {
@@ -568,7 +696,8 @@ async function updateToTrunk(c: Ctx): Promise<SyncOutcome> {
   if (now === head) {
     clearRecord(p);
     await g.run(['update-ref', '-d', backup, head], { ok: [0, 1, 128] });
-    return no('changed_meanwhile', applied.ok ? 'HEAD did not move' : applied.detail);
+    const out = { kind: 'skipped' as const, reason: 'changed_meanwhile' as const, detail: applied.ok ? 'HEAD did not move' : applied.detail, trunk: land.trunk };
+    return !applied.ok && applied.paths ? { ...out, paths: applied.paths } : out;
   }
   // Neither: leave the record (abandoned, so pre-edit stops edits until hub_sync or a human looks).
   writeRecord(p, { pid: 0, orig_head: head, target, branch, backup_ref: backup, at: ms });
@@ -587,7 +716,14 @@ async function mergeTrunk(c: Ctx): Promise<SyncOutcome> {
   if (uncommitted.length) return no('dirty', uncommitted.join(', '));
   if (await gitops.isAncestor(g, at.tip, head)) return { kind: 'up_to_date', ...at };
   const incoming = await incomingOf(c, head, at.tip);
-  const r = await g.run(['merge', '--no-edit', `refs/remotes/${land.remote}/${land.trunk}`], { ok: [0, 1, 2, 128], timeoutMs: 120_000 });
+  // git merge overwrites ignored files (an ort merge does even with --no-overwrite-ignore, in git 2.43): refuse
+  // first when any is where the merge result (or trunk) has a file. Residual: one written between here and the merge.
+  const blocking = await mergeInTheWay(g, root, head, at.tip);
+  if (blocking.length) {
+    return { kind: 'skipped', reason: 'merge_refused', detail: `untracked or ignored files in the way: ${capped(blocking)}`, trunk: land.trunk, paths: blocking };
+  }
+  // --no-overwrite-ignore: git merge refuses, as for an untracked file, rather than overwrite an ignored one.
+  const r = await g.run(['merge', '--no-edit', '--no-overwrite-ignore', `refs/remotes/${land.remote}/${land.trunk}`], { ok: [0, 1, 2, 128], timeoutMs: 120_000 });
   const now = fullHead(root);
   if (r.code === 0 && now && now !== head) {
     return { kind: 'merged', ...at, from: head, to: now, files: await gitops.diffNames(g, head, now), behind: incoming.commits, landings: incoming.landings };
@@ -601,7 +737,7 @@ async function mergeTrunk(c: Ctx): Promise<SyncOutcome> {
 
 /** The agent's own live landings and the pause flag, from the hub within the budget; an error when it can't say. */
 async function hubState(c: Ctx): Promise<{ ok: true; mine: Landing[]; paused: string | null } | { ok: false; error: string }> {
-  const timeoutMs = Math.max(100, Math.min(c.client.cfg.timeoutMs, c.left() - APPLY_RESERVE_MS));
+  const timeoutMs = Math.max(100, Math.min(c.client.cfg.timeoutMs, c.left() - APPLY_RESERVE_MS - PLAN_RESERVE_MS));
   const client = new HubClient({ ...c.client.cfg, timeoutMs });
   try {
     const s = await client.status();
@@ -653,6 +789,103 @@ async function trackedChanges(g: Git): Promise<string[]> {
     if (xy[0] === 'R' || xy[0] === 'C') i++; // a rename or copy is followed by its source
   }
   return changes;
+}
+
+/**
+ * The untracked or ignored files and directories (`dir/`) of the worktree in
+ * the way of moving HEAD to `target`, sorted: at a path `target` adds (a file,
+ * a symlink, or a directory with anything untracked in it), or at a leading
+ * directory of one (a file or symlink there, which isn't a tracked file the
+ * target removes). git reset --keep refuses for an untracked file, but would
+ * overwrite an ignored one and remove an ignored directory: sync never does.
+ * Tracked files are clean here (the CAS just checked), so a path HEAD doesn't
+ * have is untracked or ignored.
+ */
+async function inTheWay(g: Git, root: string, head: string, target: string): Promise<string[]> {
+  const out = (await g.run(['diff-tree', '-r', '-z', '--no-renames', '--no-commit-id', '--name-status', head, target])).stdout.split('\0');
+  const added: string[] = [];
+  const removed = new Set<string>();
+  for (let i = 0; i + 1 < out.length; i += 2) {
+    if (out[i] === 'A') added.push(out[i + 1]!);
+    else if (out[i] === 'D') removed.add(out[i + 1]!);
+  }
+  const lstat = (rel: string): Stats | null => {
+    try {
+      return lstatSync(path.join(root, rel));
+    } catch {
+      return null;
+    }
+  };
+  const found = new Set<string>();
+  const dirs: string[] = [];
+  const seen = new Map<string, 'free' | 'dir' | 'stop'>(); // leading directories looked at: absent, a directory, or nothing below to check
+  for (const file of added) {
+    const parts = file.split('/');
+    let below = true;
+    for (let i = 1; i < parts.length && below; i++) {
+      const lead = parts.slice(0, i).join('/');
+      let state = seen.get(lead);
+      if (state === undefined) {
+        const st = lstat(lead);
+        if (!st) state = 'free';
+        else if (st.isDirectory()) state = 'dir';
+        else {
+          if (!removed.has(lead)) found.add(lead); // an untracked or ignored file (or symlink) where the target has a directory
+          state = 'stop';
+        }
+        seen.set(lead, state);
+      }
+      if (state !== 'dir') below = false; // absent: nothing below it exists; a file: nothing below it to look at (lstat would follow a symlink)
+    }
+    if (!below) continue;
+    const st = lstat(file);
+    if (!st) continue;
+    if (st.isDirectory()) dirs.push(file); // tracked files in it the target removes are fine; anything else isn't
+    else found.add(file);
+  }
+  for (let i = 0; i < dirs.length; i += 200) {
+    const r = await g.run(['ls-files', '-z', '--others', '--directory', '--no-empty-directory', '--', ...dirs.slice(i, i + 200).map((d) => `:(literal)${d}`)]);
+    for (const entry of r.stdout.split('\0').filter(Boolean)) {
+      const dir = dirs.find((d) => entry === `${d}/` || entry.startsWith(`${d}/`));
+      if (dir) found.add(`${dir}/`);
+    }
+  }
+  return [...found].map((f) => f.normalize('NFC')).sort();
+}
+
+/**
+ * inTheWay for a merge of `tip` into `head`: against the merge's own result
+ * (`merge-tree --write-tree`, git 2.38; it places renames and conflict files
+ * where the merge would) and against `tip` (all a merge without it can add).
+ */
+async function mergeInTheWay(g: Git, root: string, head: string, tip: string): Promise<string[]> {
+  const found = new Set(await inTheWay(g, root, head, tip));
+  const r = await g.run(['merge-tree', '--write-tree', '--no-messages', head, tip], { ok: [0, 1, 128, 129] });
+  const tree = r.stdout.split('\n')[0]!.trim();
+  if ((r.code === 0 || r.code === 1) && /^[0-9a-f]{40,64}$/.test(tree)) for (const f of await inTheWay(g, root, head, tree)) found.add(f);
+  return [...found].sort();
+}
+
+function capped(paths: readonly string[], max = 20): string {
+  return `${paths.slice(0, max).join(', ')}${paths.length > max ? ` +${paths.length - max} more` : ''}`;
+}
+
+/** Whether this git has merge-tree --merge-base (2.40): replays and forecasts need it. */
+async function mergeTreeBase(g: Git): Promise<boolean> {
+  try {
+    return (await gitops.features(g)).mergeTreeBase;
+  } catch {
+    return false;
+  }
+}
+
+/** git's version, as `2.39.2`. */
+async function gitVersion(g: Git): Promise<string | null> {
+  try {
+    return /^git version (\S+)/.exec((await g.run(['version'])).stdout)?.[1] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /** Backup refs older than 14 days go (any branch's); the one just written stays. */

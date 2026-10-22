@@ -106,7 +106,8 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
 /**
  * `hub guard --pre-push` — git pre-push hook (design §2.3.6). git passes the
  * remote's name and URL as arguments and one line per ref on stdin:
- * `<local ref> <local sha> <remote ref> <remote sha>`. With a landing queue
+ * `<local ref> <local sha> <remote ref> <remote sha>` (the local ref as typed,
+ * so it may hold spaces; the remote ref is read from the end). With a landing queue
  * (a land section in trunk's agenthub.json), it refuses any update of
  * `refs/heads/<trunk>`, deletion included, and of the lander's candidate refs
  * (`<P>cand/…`); land refs and every other ref go through. A speed bump: the
@@ -125,8 +126,12 @@ export function prePushGuard(io: { cwd: string; env: NodeJS.ProcessEnv; stdin: s
   const trunk: string[] = [];
   const cand: string[] = [];
   for (const line of io.stdin.split('\n')) {
-    const remoteRef = line.trim().split(/\s+/)[2];
-    if (!remoteRef) continue;
+    // The remote ref is the second field from the end: git writes the local ref as typed, so a source expression
+    // with spaces in it (`HEAD^{/fix the bug}`, `main@{1 minute ago}`) shifts the fields before it. Ref names and
+    // object names never hold whitespace.
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 4) continue;
+    const remoteRef = fields[fields.length - 2]!;
     if (remoteRef === trunkRef) trunk.push(remoteRef);
     else if (candPrefixes.some((p) => remoteRef.startsWith(p))) cand.push(remoteRef);
   }

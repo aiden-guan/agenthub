@@ -1216,6 +1216,27 @@ const RECOVERED_TEXT = {
 
 const MERGE_HINT = 'call hub_sync {"mode": "merge"}';
 
+/** Untracked or ignored files where trunk now has files (changed_meanwhile with `paths`): what they are, and that sync leaves them be. */
+function inTheWaySentence(paths: readonly string[], trunk: string): string {
+  const one = paths.length === 1;
+  return `${fileAnd(paths)} ${one ? 'is' : 'are'} untracked or ignored in your worktree, and ${trunk} now has files there; sync never overwrites or removes such files`;
+}
+
+function moveAside(paths: readonly string[]): string {
+  return paths.length === 1 ? "Move it aside (or delete it if you don't need it)" : "Move them aside (or delete them if you don't need them)";
+}
+
+/** Old git (design §4.5): no replay, so only fast-forwards. */
+function oldGitSentence(r: Extract<SyncResult, { kind: 'skipped' }>): string {
+  const trunk = r.trunk ?? 'trunk';
+  const version = r.detail ? ` (${word(r.detail)})` : '';
+  return `git${version} is too old to replay your unlanded commits onto ${trunk} (sync needs git 2.40 or newer for that), so it only fast-forwards`;
+}
+
+function oldGitAdvice(trunk: string | null): string {
+  return `Update git, or ${MERGE_HINT} to merge ${trunk ?? 'trunk'} into your branch.`;
+}
+
 /** Why a sync changed nothing, and what to do (hub_sync and `hub sync`). */
 function skippedText(r: Extract<SyncResult, { kind: 'skipped' }>): string {
   const trunk = r.trunk ?? 'trunk';
@@ -1245,12 +1266,16 @@ function skippedText(r: Extract<SyncResult, { kind: 'skipped' }>): string {
     case 'merges_in_branch':
       return `Your branch has unlanded merge commits, which sync does not replay; ${MERGE_HINT} to merge ${trunk} into your branch instead. Nothing was changed.`;
     case 'changed_meanwhile':
+      if (r.paths?.length) return `${inTheWaySentence(r.paths, trunk)}, so nothing was changed. ${moveAside(r.paths)}, then call hub_sync again.`;
       return `git refused to move the worktree (${detail}): something changed while the sync was being prepared, or an untracked file is in the way of one ${trunk} adds. Nothing was changed; move that file aside, or call hub_sync again.`;
+    case 'old_git':
+      return `Your ${oldGitSentence(r)}. Nothing was changed. ${oldGitAdvice(r.trunk)}`;
     case 'timeout':
       return 'The sync ran out of time before changing anything; it tries again at your next prompt (or call hub_sync).';
     case 'dirty':
       return `Commit first: merging ${trunk} needs a clean worktree. Uncommitted: ${detail}. Nothing was changed.`;
     case 'merge_refused':
+      if (r.paths?.length) return `${inTheWaySentence(r.paths, trunk)}, so nothing was changed. ${moveAside(r.paths)}, then ${MERGE_HINT} again.`;
       return `git merge refused (${detail}); nothing was changed.`;
   }
 }
@@ -1281,8 +1306,13 @@ function conflictSentence(r: Extract<SyncResult, { kind: 'conflict' }>, lead: st
 function behindDirtySentence(r: Extract<SyncResult, { kind: 'behind_dirty' }>): string {
   return (
     `${r.trunk} moved (${incomingIds(r.behind, r.landings)}). Your workspace wasn't updated because you have uncommitted changes (${listCapped(r.uncommitted, 5)}); ` +
-    `merging them ${r.conflicts.length ? `would conflict in ${fileAnd(r.conflicts)}` : 'would not conflict'}. It updates at a later prompt once you commit, or call hub_sync after committing.`
+    `merging them ${forecastText(r.conflicts)}. It updates at a later prompt once you commit, or call hub_sync after committing.`
   );
+}
+
+function forecastText(conflicts: readonly string[] | null): string {
+  if (conflicts === null) return 'may conflict (your git is too old to forecast it: that needs git 2.40 or newer)';
+  return conflicts.length ? `would conflict in ${fileAnd(conflicts)}` : 'would not conflict';
 }
 
 function syncedSentence(r: Extract<SyncResult, { kind: 'synced' }>, lead: string): string {
@@ -1332,6 +1362,13 @@ export function syncPromptText(r: SyncResult): string | null {
       return `agenthub: ${behindDirtySentence(r)}`;
     case 'needs_human':
       return r.cleared ? null : `agenthub: ${needsHumanText(r)}`;
+    case 'skipped':
+      // Neither goes away by itself: the agent has to act.
+      if (r.reason === 'changed_meanwhile' && r.paths?.length) {
+        return `agenthub: your workspace wasn't synced to ${r.trunk ?? 'trunk'}: ${inTheWaySentence(r.paths, r.trunk ?? 'trunk')}. ${moveAside(r.paths)}; it syncs at a later prompt, or call hub_sync.`;
+      }
+      if (r.reason === 'old_git') return `agenthub: ${r.trunk ?? 'trunk'} moved, and your workspace wasn't updated: your ${oldGitSentence(r)}. ${oldGitAdvice(r.trunk)}`;
+      return null;
     default:
       return null;
   }
@@ -1348,7 +1385,7 @@ export function syncDigestLine(r: SyncResult): string | null {
     case 'behind_dirty':
       return (
         `Trunk: your worktree is ${incomingCount(r.behind, r.landings)} behind ${r.trunk} and has uncommitted changes, so it wasn't touched; ` +
-        `merging would ${r.conflicts.length ? `conflict in ${fileAnd(r.conflicts)}` : 'not conflict'}.`
+        `merging ${r.conflicts === null ? 'may conflict (this git is too old to forecast it)' : r.conflicts.length ? `would conflict in ${fileAnd(r.conflicts)}` : 'would not conflict'}.`
       );
     case 'conflict':
       return (
@@ -1358,6 +1395,8 @@ export function syncDigestLine(r: SyncResult): string | null {
     case 'needs_human':
       return r.cleared ? null : `Trunk: ${needsHumanText(r)}`;
     case 'skipped':
+      if (r.reason === 'changed_meanwhile' && r.paths?.length) return `Trunk: your worktree wasn't synced to ${r.trunk ?? 'trunk'}: ${inTheWaySentence(r.paths, r.trunk ?? 'trunk')}. ${moveAside(r.paths)}.`;
+      if (r.reason === 'old_git') return `Trunk: your worktree is behind ${r.trunk ?? 'trunk'}, and your ${oldGitSentence(r)}. ${oldGitAdvice(r.trunk)}`;
       return r.reason === 'merges_in_branch' ? `Trunk: ${skippedText(r)}` : null;
     default:
       return null;
@@ -1373,11 +1412,13 @@ export function syncNoticeKey(r: SyncResult): string {
     case 'synced':
       return `synced ${r.to}`;
     case 'behind_dirty':
-      return `behind_dirty ${r.tip} ${r.conflicts.join(',')} ${r.uncommitted.join(',')}`;
+      return `behind_dirty ${r.tip} ${r.conflicts?.join(',') ?? '?'} ${r.uncommitted.join(',')}`;
     case 'conflict':
       return `conflict ${r.tip} ${r.commit}`;
     case 'needs_human':
       return `needs_human ${r.orig_head} ${r.head}`;
+    case 'skipped':
+      return r.paths?.length ? `in_the_way ${r.paths.join(',')}` : `skipped ${r.reason}`;
     default:
       return r.kind;
   }

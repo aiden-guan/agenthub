@@ -41,6 +41,13 @@ describe('hub guard --pre-push', () => {
     );
     const deleting = await prePush(repo.a, [`(delete) ${ZERO} refs/heads/main ${trunk}`]);
     expect(deleting.code).toBe(1);
+    // git writes the source as typed: an expression with spaces (HEAD^{/fix the bug}, main@{1 minute ago}) shifts the fields.
+    for (const source of ['HEAD^{/fix the bug}', 'main@{1 minute ago}', 'HEAD^{/a  b\tc}']) {
+      const spaced = await prePush(repo.a, [`${source} ${head} refs/heads/main ${trunk}`]);
+      expect(spaced.code, source).toBe(1);
+      expect(spaced.stderr).toContain('  refs/heads/main\n');
+    }
+    expect((await prePush(repo.a, [`HEAD^{/fix the bug} ${head} refs/heads/agent-a ${ZERO}`])).code).toBe(0);
 
     const cand = await prePush(repo.a, [`${head} ${head} refs/agenthub/cand/1b4e28ba/L-7/${head.slice(0, 12)} ${ZERO}`]);
     expect(cand.code).toBe(1);
@@ -97,12 +104,16 @@ describe('hub init installs the pre-push guard', () => {
     expect(report).toContain(`installed pre-push guard at ${path.join(hooksDir(repo.a), 'pre-push')}`);
     expect(readFileSync(path.join(hooksDir(repo.a), 'pre-push'), 'utf8')).toContain('guard --pre-push');
     git(repo.a, 'checkout', '-q', '--', 'agenthub.json'); // hub init added the url to the team file
-    const head = commit(repo.a, { 'src/users.ts': 'export const users = [];\n' });
+    const head = commit(repo.a, { 'src/users.ts': 'export const users = [];\n' }, 'add some users');
     const trunk = git(repo.remote, 'rev-parse', 'main').trim();
 
     const toMain = await run('git', ['push', 'origin', 'HEAD:main'], { cwd: repo.a, env: envFor() });
     expect(toMain.code).not.toBe(0);
     expect(toMain.stderr).toContain('hub guard: push blocked: main is updated only by the landing queue.');
+    expect(git(repo.remote, 'rev-parse', 'main').trim()).toBe(trunk);
+    const spaced = await run('git', ['push', 'origin', 'HEAD^{/add some}:refs/heads/main'], { cwd: repo.a, env: envFor() });
+    expect(spaced.code).not.toBe(0);
+    expect(spaced.stderr).toContain('hub guard: push blocked: main is updated only by the landing queue.');
     expect(git(repo.remote, 'rev-parse', 'main').trim()).toBe(trunk);
 
     const land = await run('git', ['push', 'origin', `${head}:refs/agenthub/land/${head}`], { cwd: repo.a, env: envFor() });
