@@ -35,7 +35,7 @@ import { failureReport, sendbackContext, tellIfFailed, tellParked, tellSendback 
 import { isHubError, type ResolveResult } from './ports.js';
 import { aiLandedMessage, commitMessage, ConflictReporter, emptyReport, LISTED_COMMITS, type SendbackContext } from './report.js';
 import { approversOf, missingApprovals, mergedRequirements, protectedPaths, protectedRequirements, uniqueRequirements } from './requirements.js';
-import { descends, fetchTrunk, findOnTrunk, localLandRef, policyOf, scanTrunk, trunkLocalRef } from './trunk.js';
+import { descends, fetchTrunk, findOnTrunk, localCandidateRef, localLandRef, policyOf, scanTrunk, trunkLocalRef } from './trunk.js';
 
 /** How an attempt (or an in-doubt resolution) ended, for the loops. */
 export type AttemptOutcome =
@@ -67,12 +67,6 @@ const TERMINAL_UNLANDED = ['failed', 'superseded', 'cancelled'] as const;
 export function prefixOfCandidateRef(ref: string): string | null {
   const i = ref.indexOf('cand/');
   return i > 0 ? ref.slice(0, i) : null;
-}
-
-/** The mirror's copy of a staged candidate ref (`<P>cand/<rest>` → `refs/agenthub/cand/<rest>`). */
-export function localCandidateRef(ref: string): string | null {
-  const i = ref.indexOf('cand/');
-  return i > 0 ? `refs/agenthub/${ref.slice(i)}` : null;
 }
 
 export type PushResult = { kind: 'pushed' } | { kind: 'stale' } | { kind: 'rejected'; detail: string } | { kind: 'unknown'; detail: string } | { kind: 'unfresh' };
@@ -309,15 +303,30 @@ export class Attempt {
         resolver = { model: land.resolver.model, outcome: 'skipped', files: [], novel_lines: 0, input_tokens: 0, output_tokens: 0, explanations: {} };
       }
     }
-    const aiWarnings = ai?.warnings ?? [];
+    const aiWarnings = [...(ai?.warnings ?? [])];
+    let aiPaths = ai?.resolved ?? [];
+    let unresolvedByAi = ai?.unresolved ?? [];
+    // An AI resolution that leaves the merged tree equal to trunk's (it kept trunk's side of every hunk, and the
+    // change has nothing else) would throw the change away as a P5 no-op: landed without the Agenthub-Resolved
+    // trailer, the messages to both sides, the checks or requireApproval's review (design §2.6, §4.1 row 10).
+    // The lander refuses such an output like any other it rejects (design §3.5: resolver_failed).
+    if (ai && aiPaths.length > 0 && conflicts.length === 0 && tree === (await ctx.git.treeOf(T0))) {
+      ctx.log(`${id}: the AI resolution of ${aiPaths.join(', ')} keeps trunk's version: refused (nothing of the change would land)`);
+      aiWarnings.push(`${aiPaths.join(', ')}: the AI resolver's output was rejected: it keeps ${ctx.trunk.branch}'s version of every conflicted file, and nothing else of this change is left, so nothing of it would land`);
+      unresolvedByAi = aiPaths.map((path) => ({ path, eligible: true, explanation: null }));
+      conflicts = merge.conflicts.filter((c) => aiPaths.includes(c.path));
+      resolver = { ...ai.report, outcome: 'rejected_output' };
+      tree = merge.tree;
+      aiPaths = [];
+      ai = null;
+    }
     this.timings.merge_ms = Math.round(ctx.clock.monotonic() - mergeStart);
     const structural = merge.structural;
-    const aiPaths = ai?.resolved ?? [];
     const filesVia = [...structural.map((file) => ({ file, via: 'structural' as const })), ...aiPaths.map((file) => ({ file, via: 'ai' as const }))];
     const resolvedBy: ResolvedBy = aiPaths.length > 0 ? 'ai' : structural.length > 0 ? 'structural' : 'clean';
     if (conflicts.length > 0) {
       const reporter = new ConflictReporter({ git: ctx.git, hub: ctx.hub, project: ctx.project, epoch: ctx.lease.epoch, base: this.base, trunk: T0, onError: (what, err) => ctx.log(`${id}: report: ${what}: ${firstLineOf(err)}`) });
-      const unresolved = new Map((ai?.unresolved ?? []).map((u) => [u.path, u]));
+      const unresolved = new Map(unresolvedByAi.map((u) => [u.path, u]));
       const reports = await Promise.all(
         conflicts.map((c) => reporter.report(c, { tried, aiEligible: unresolved.get(c.path)?.eligible ?? false, explanation: unresolved.get(c.path)?.explanation ?? resolver?.explanations[c.path] ?? null })),
       );

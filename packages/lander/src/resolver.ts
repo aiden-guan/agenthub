@@ -32,6 +32,7 @@ import type { ApprovalRequirement, Decision, Landing, ResolverReport, Task } fro
 import { z } from 'zod';
 import { systemClock, type Clock, type GitPort, type HubPort, type PathChange, type ResolveRequest, type ResolveResult, type ResolverPort } from './ports.js';
 import { redact } from './redact.js';
+import { localCandidateRef } from './trunk.js';
 import type { ResolverInput, ResolverIntent, ResolverOutput } from './resolver-protocol.js';
 
 /** Per file (design §2.6 "Limits and cost"). */
@@ -178,12 +179,20 @@ export type Verdict =
   | { kind: 'declined'; explanation: string; usage: Usage | null }
   | { kind: 'rejected'; gate: Gate; detail: string; explanation: string; usage: Usage | null };
 
-const OUTPUT_SCHEMA = z.object({
-  status: z.enum(['resolved', 'cannot_resolve']),
-  hunks: z.array(z.object({ id: z.number().int(), text: z.string() })).optional(),
-  explanation: z.string(),
-  usage: z.unknown().optional(),
-});
+/**
+ * Gate 1's schema: ResolverOutput (resolver-protocol.ts), closed like the
+ * design's RESOLUTION_SCHEMA (no unknown keys, the explanation at most 2000
+ * characters). `hunks` is optional for cannot_resolve. `usage` is the
+ * command's report, not model output: an invalid one is dropped, not refused.
+ */
+const OUTPUT_SCHEMA = z
+  .object({
+    status: z.enum(['resolved', 'cannot_resolve']),
+    hunks: z.array(z.object({ id: z.number().int(), text: z.string() }).strict()).optional(),
+    explanation: z.string().max(EXPLANATION_MAX),
+    usage: z.unknown().optional(),
+  })
+  .strict();
 
 const USAGE_SCHEMA = z.object({ model: z.string(), input_tokens: z.number().int().nonnegative(), output_tokens: z.number().int().nonnegative() });
 
@@ -297,6 +306,12 @@ function seconds(ms: number): string {
  * on stdin, the output as JSON from stdout, in its own process group so a
  * timeout or an abort kills everything it started. A non-zero exit, the
  * timeout, too much output or invalid JSON is a failure (cannot_resolve).
+ *
+ * The result never waits on the pipes alone: once the command itself has
+ * exited, anything it started gets PIPE_GRACE_MS to let go of them (or none,
+ * after a timeout or an abort), and then the lander stops reading. Its process
+ * group is killed then; something that left the group (a new session) can't
+ * hold a landing in `resolving`, though it may outlive the call.
  */
 export function runResolverCommand(
   argv: readonly string[],
@@ -315,12 +330,12 @@ export function runResolverCommand(
     let outBytes = 0;
     let stderr = '';
     let stopped: Extract<CommandResult, { kind: 'failed' }> | null = null;
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     let done = false;
-    const timers: NodeJS.Timeout[] = [];
-    const later = (ms: number, fn: () => void) => {
+    const later = (ms: number, fn: () => void): NodeJS.Timeout => {
       const t = setTimeout(fn, ms);
       t.unref?.();
-      timers.push(t);
+      return t;
     };
     const killGroup = (sig: NodeJS.Signals) => {
       try {
@@ -329,21 +344,42 @@ export function runResolverCommand(
         // already gone
       }
     };
-    const stop = (reason: Extract<CommandResult, { kind: 'failed' }>['reason'], detail: string) => {
+    /** The result from what is known when it ends. */
+    const outcome = (): CommandResult => {
+      if (stopped) return { ...stopped, stderr };
+      const code = exited?.code ?? null;
+      if (code !== 0) return { kind: 'failed', reason: 'exit', detail: code === null ? `was killed by ${exited?.signal ?? 'a signal'}` : `exited ${code}`, stderr };
+      const text = Buffer.concat(out).toString('utf8').trim();
+      try {
+        return { kind: 'output', value: JSON.parse(text) as unknown, stderr };
+      } catch {
+        return { kind: 'failed', reason: 'json', detail: 'printed something that is not JSON', stderr };
+      }
+    };
+    const onAbort = () => stop('aborted', 'stopped: the lander is stopping or lost its lease');
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(deadline);
+      o.signal?.removeEventListener('abort', onAbort);
+      // What is left of its group goes; whatever still holds the pipes from outside it is let go of.
+      killGroup('SIGKILL');
+      for (const s of [child.stdin, child.stdout, child.stderr]) s?.destroy();
+      resolve(outcome());
+    };
+    function stop(reason: Extract<CommandResult, { kind: 'failed' }>['reason'], detail: string): void {
       if (stopped || done) return;
       stopped = { kind: 'failed', reason, detail, stderr: '' };
       killGroup('SIGTERM');
-      later(KILL_GRACE_MS, () => killGroup('SIGKILL'));
-    };
-    const onAbort = () => stop('aborted', 'stopped: the lander is stopping or lost its lease');
-    const finish = (r: CommandResult) => {
-      if (done) return;
-      done = true;
-      for (const t of timers) clearTimeout(t);
-      o.signal?.removeEventListener('abort', onAbort);
-      resolve(r);
-    };
-    later(o.timeoutMs, () => stop('timeout', `timed out after ${seconds(o.timeoutMs)}`));
+      // It exited already, and only something holding its pipes is left: nothing to wait for.
+      if (exited) return finish();
+      // Else its exit ends it (below); SIGKILL after the grace, and a last bound in case even that isn't seen.
+      later(KILL_GRACE_MS, () => {
+        killGroup('SIGKILL');
+        later(PIPE_GRACE_MS, finish);
+      });
+    }
+    const deadline = later(o.timeoutMs, () => stop('timeout', `timed out after ${seconds(o.timeoutMs)}`));
     o.signal?.addEventListener('abort', onAbort, { once: true });
     if (o.signal?.aborted) onAbort();
     child.stdout!.on('data', (d: Buffer) => {
@@ -354,20 +390,21 @@ export function runResolverCommand(
     child.stderr!.on('data', (d: Buffer) => {
       if (stderr.length < STDERR_MAX) stderr += d.toString('utf8').slice(0, STDERR_MAX - stderr.length);
     });
-    // It may exit without reading its input.
-    child.stdin!.on('error', () => undefined);
-    child.on('error', (err) => finish({ kind: 'failed', reason: 'spawn', detail: `couldn't start it: ${err.message}`, stderr }));
-    // Something it started may hold the pipes open after it exited: the group is still there then, so it can be killed.
-    child.on('exit', () => later(PIPE_GRACE_MS, () => killGroup('SIGKILL')));
+    // It may exit without reading its input; destroyed pipes may report errors too.
+    for (const s of [child.stdin, child.stdout, child.stderr]) s?.on('error', () => undefined);
+    child.on('error', (err) => {
+      stopped ??= { kind: 'failed', reason: 'spawn', detail: `couldn't start it: ${err.message}`, stderr: '' };
+      finish();
+    });
+    child.on('exit', (code, signal) => {
+      exited = { code, signal };
+      if (stopped) return finish();
+      // Something it started may hold the pipes open after it exited: a moment to let go, then the output is what it printed.
+      later(PIPE_GRACE_MS, finish);
+    });
     child.on('close', (code, signal) => {
-      if (stopped) return finish({ ...stopped, stderr });
-      if (code !== 0) return finish({ kind: 'failed', reason: 'exit', detail: code === null ? `was killed by ${signal ?? 'a signal'}` : `exited ${code}`, stderr });
-      const text = Buffer.concat(out).toString('utf8').trim();
-      try {
-        finish({ kind: 'output', value: JSON.parse(text) as unknown, stderr });
-      } catch {
-        finish({ kind: 'failed', reason: 'json', detail: 'printed something that is not JSON', stderr });
-      }
+      exited ??= { code, signal };
+      finish();
     });
     child.stdin!.end(JSON.stringify(input));
   });
@@ -466,7 +503,7 @@ class Intents {
 export type ParseCheck = (file: { path: string; ours: string; theirs: string; result: string }) => Promise<string | null>;
 
 export interface AiResolverOptions {
-  git: Pick<GitPort, 'mergeFile' | 'catBlob' | 'spliceTree' | 'blobId' | 'pathHistory' | 'revParse' | 'fetch'>;
+  git: Pick<GitPort, 'mergeFile' | 'catBlob' | 'spliceTree' | 'blobId' | 'pathHistory' | 'revParse' | 'fetch' | 'trunkTrailers'>;
   hub: Pick<HubPort, 'landing' | 'tasks' | 'decisions' | 'getClaim'>;
   project: string;
   clock?: Clock;
@@ -559,13 +596,15 @@ export class AiResolver implements ResolverPort {
     const reused = await this.reusable(files, req);
     if (reused) {
       for (const f of files) warnings.push(`${f.path}: reused the resolution approved earlier (its conflict is byte-identical), without calling the AI resolver`);
-      const tree = await this.o.git.spliceTree(req.tree, reused.map((r) => ({ path: r.path, mode: r.mode, content: r.content })));
+      const tree = await this.o.git.spliceTree(req.tree, reused.blobs.map((r) => ({ path: r.path, mode: r.mode, content: r.content })));
+      // The model that made it (the trailer of the candidate it came from) goes into the new Agenthub-Resolved trailer.
+      const by: Usage | null = reused.model ? { model: reused.model, input_tokens: 0, output_tokens: 0 } : null;
       return {
         tree,
         resolved: files.map((f) => f.path),
         unresolved: [],
-        report: this.report(cfg, 'resolved', files.map((f) => f.path), [], 0),
-        requirement: cfg.requireApproval ? this.requirement(files, reused.map((r) => r.oid), req) : null,
+        report: this.report(cfg, 'resolved', files.map((f) => f.path), [by], 0),
+        requirement: cfg.requireApproval ? this.requirement(files, reused.blobs.map((r) => r.oid), req) : null,
         warnings,
         trunkSide: trunkSide.landings,
         suggestions: {},
@@ -695,7 +734,7 @@ export class AiResolver implements ResolverPort {
    * earlier attempt's resolution; it is reused when the ai_resolution digest
    * over the current stages and the candidate's blobs is one a human approved.
    */
-  private async reusable(files: PreparedFile[], req: ResolveRequest): Promise<Array<{ path: string; mode: string; oid: string; content: string }> | null> {
+  private async reusable(files: PreparedFile[], req: ResolveRequest): Promise<{ blobs: Array<{ path: string; mode: string; oid: string; content: string }>; model: string | null } | null> {
     const { candidate, candidateRef, approved } = req.reuse;
     if (!candidate || !FULL_SHA_RE.test(candidate) || approved.length === 0) return null;
     try {
@@ -714,9 +753,22 @@ export class AiResolver implements ResolverPort {
       for (const r of out) r.content = await this.o.git.catBlob(r.oid);
       // The content must round-trip exactly, or the splice would write other bytes than the ones approved.
       if (out.some((r) => gitBlobId(r.content, r.oid.length) !== r.oid)) return null;
-      return out;
+      return { blobs: out, model: await this.modelOf(candidate) };
     } catch (err) {
       this.log(`AI resolver: can't reuse the approved resolution of ${req.landing.id}: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /** The model in a candidate's `Agenthub-Resolved: … ai:<model> <paths>` trailer (the lander wrote it), or null. */
+  private async modelOf(candidate: string): Promise<string | null> {
+    try {
+      const parent = await this.o.git.revParse(`${candidate}^1`);
+      if (!parent) return null;
+      const t = (await this.o.git.trunkTrailers(parent, candidate, 1)).find((x) => x.sha === candidate);
+      const model = /(?:^|; )ai:(\S+) /.exec(t?.resolved ?? '')?.[1];
+      return model && MODEL_RE.test(model) ? model : null;
+    } catch {
       return null;
     }
   }
@@ -814,12 +866,6 @@ export function gitBlobId(text: string, oidLength: number): string {
     .update(`blob ${body.length}\0`)
     .update(body)
     .digest('hex');
-}
-
-/** The mirror's copy of a staged candidate ref (`<P>cand/<rest>` → `refs/agenthub/cand/<rest>`). */
-function localCandidateRef(ref: string): string | null {
-  const i = ref.indexOf('cand/');
-  return i > 0 ? `refs/agenthub/${ref.slice(i)}` : null;
 }
 
 // ------------------------------------------------------------------ doctor's probe

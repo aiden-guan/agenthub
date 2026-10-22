@@ -155,6 +155,59 @@ describe('hub-lander with the AI resolver (design §5.3, the AI rows)', () => {
     T,
   );
 
+  it.each([false, true])(
+    'AI keeps trunk’s side of every hunk, and nothing else of the change is left (requireApproval %s): resolver_failed, never a no-op landing',
+    async (requireApproval) => {
+      // The model's answer passes every gate, but with it the merged tree is trunk's: sam's change would be thrown away.
+      const explanation = 'Trunk already sets a; kept its value.';
+      const { sc, b, Ca, Lb } = await conflicted({ resolver: { stub: { mode: 'fixture', files: { 'src/a.ts': ['export const a = 2;\n'] }, explanation } }, land: { resolver: { enabled: true, requireApproval } } });
+      await sc.once();
+      const failed = sc.landing(Lb.id);
+      expect(failed.status).toBe('failed');
+      expect(failed.failure?.code).toBe('resolver_failed');
+      expect(failed.report?.resolver).toMatchObject({ outcome: 'rejected_output', files: ['src/a.ts'] });
+      expect(failed.report?.files_via).toEqual([]);
+      expect(failed.report?.conflicts).toEqual([expect.objectContaining({ file: 'src/a.ts', kind: 'content', tried: ['clean', 'ai'], ai_eligible: true, explanation })]);
+      expect(failed.report?.warnings.join('\n')).toMatch(/src\/a\.ts: the AI resolver's output was rejected: it keeps main's version of every conflicted file.*nothing of it would land/);
+      expect(sc.trunk()).toBe(Ca);
+      expect(sc.resolverCalls()).toEqual(['src/a.ts']);
+      expect(sc.checkRuns(Lb.id)).toEqual([]);
+      expect(sc.events.some((e) => e.type === 'landing.needs_approval' && e.data.landing_id === Lb.id)).toBe(false);
+      const told = landerMessages(sc, b.agent);
+      expect(told.some((m) => m.includes(Lb.id) && m.includes('resolver_failed'))).toBe(true);
+      expect(told.some((m) => m.includes('already on'))).toBe(false);
+    },
+    T,
+  );
+
+  it(
+    'AI keeps trunk’s side of the conflicted file while the change’s other file lands: landed with the trailer, and both authors are told',
+    async () => {
+      const sc = await scenario({ resolver: { stub: { mode: 'fixture', files: { 'src/a.ts': ['export const a = 2;\n'] } } } });
+      const a = sc.clone('maya/claude-1');
+      const b = sc.clone('sam/claude-1');
+      a.commit('a: a = 2', { 'src/a.ts': 'export const a = 2;\n' });
+      sc.land(a, { summary: 'a is 2 now' });
+      await sc.once();
+      const Ca = sc.trunk();
+      b.commit('b: a = 3, b = 2', { 'src/a.ts': 'export const a = 3;\n', 'src/b.ts': 'export const b = 2;\n' });
+      const Lb = sc.land(b, { summary: 'a is 3 now, b is 2' });
+      await sc.once();
+      const done = sc.landing(Lb.id);
+      expect(done.status).toBe('landed');
+      expect(done.report?.resolved_by).toBe('ai');
+      const C = done.trunk_sha!;
+      expect(C).not.toBe(Ca);
+      expect(sc.rev(`${C}^1`)).toBe(Ca);
+      expect(sc.show(C, 'src/a.ts')).toBe('export const a = 2;\n');
+      expect(sc.show(C, 'src/b.ts')).toBe('export const b = 2;\n');
+      expect(sc.trailers(C)['Agenthub-Resolved']).toBe('ai:claude-opus-5-5 src/a.ts');
+      expect(sc.checkRuns(Lb.id)).toHaveLength(1);
+      for (const agent of [a.agent, b.agent]) expect(landerMessages(sc, agent).filter((m) => m.includes('AI-resolved conflict in src/a.ts')), agent).toHaveLength(1);
+    },
+    T,
+  );
+
   it(
     'requireApproval: parks with an ai_resolution digest over the five blobs; approval lands the checked candidate without calling the stub again',
     async () => {

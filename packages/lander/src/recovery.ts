@@ -12,8 +12,8 @@ import { landRef } from '@agenthub/contract';
 import type { Landing, LanderControl } from '@agenthub/hub/protocol';
 import { bestEffort, HubUnavailable, hubWrite, LeaseLost, AttemptStale, type LanderContext } from './context.js';
 import { tellIfFailed } from './messages.js';
-import { localCandidateRef, prefixOfCandidateRef, pushCandidate, type AttemptOutcome } from './pipeline.js';
-import { descends, fetchTrunk, findOnTrunk, localLandRef, trunkLocalRef } from './trunk.js';
+import { prefixOfCandidateRef, pushCandidate, type AttemptOutcome } from './pipeline.js';
+import { descends, fetchTrunk, findOnTrunk, localCandidateRef, localLandRef, trunkLocalRef } from './trunk.js';
 
 /**
  * resolveInDoubt (design §2.2.7), for a landing next returned with

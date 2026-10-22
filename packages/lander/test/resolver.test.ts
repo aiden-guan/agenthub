@@ -14,9 +14,11 @@ import {
   MAX_RESOLVER_HUNKS,
   prepareFile,
   RESOLVER_TIMEOUT_MS,
+  runResolverCommand,
   spliceRegions,
   verifyOutput,
   type AiResolverOptions,
+  type CommandResult,
   type PreparedFile,
 } from '../src/resolver.js';
 import { MAX_TOKENS, RESOLUTION_SCHEMA, resolveWithAnthropic, SYSTEM_PROMPT, userPrompt } from '../src/resolve-anthropic.js';
@@ -311,6 +313,56 @@ describe('the AI resolver with the stub command (design §2.6, §5 "The stub res
   });
 });
 
+// ------------------------------------------------------------------ the command runner
+
+/** A command that starts a grandchild in a new session (out of its process group) holding its stdout and stderr. */
+const ESCAPER = `import { spawn } from 'node:child_process';
+const g = spawn('sleep', ['30'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });
+process.stderr.write('grandchild ' + g.pid + '\\n');
+g.unref();
+if (process.argv[2] === 'answer') process.stdout.write(JSON.stringify({ status: 'cannot_resolve', explanation: 'done' }) + '\\n');
+else setInterval(() => undefined, 1000);
+`;
+
+describe('the command runner (design §2.6 "Command protocol": 180 s per file)', () => {
+  const leftovers: number[] = [];
+  afterEach(() => {
+    for (const pid of leftovers.splice(0)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // gone
+      }
+    }
+  });
+
+  async function escaper(mode: 'hang' | 'answer', timeoutMs: number): Promise<{ r: CommandResult; ms: number }> {
+    const t = tmp('runner-');
+    temps.push(t);
+    const script = path.join(t.dir, 'escaper.mjs');
+    writeFileSync(script, ESCAPER);
+    const started = Date.now();
+    const r = await runResolverCommand([process.execPath, script, mode], { hello: 1 }, { env: { PATH: process.env.PATH ?? '/usr/bin:/bin' }, cwd: t.dir, timeoutMs, maxOutputBytes: 1 << 20 });
+    const pid = Number(/grandchild (\d+)/.exec(r.stderr)?.[1]);
+    if (pid > 0) leftovers.push(pid);
+    return { r, ms: Date.now() - started };
+  }
+
+  it('the timeout holds when something the command started in a new session keeps its pipes open', async () => {
+    const { r, ms } = await escaper('hang', 300);
+    expect(r).toMatchObject({ kind: 'failed', reason: 'timeout' });
+    expect(leftovers).toHaveLength(1);
+    expect(ms).toBeLessThan(5_000);
+  });
+
+  it('an answer counts once the command exits, though something it started in a new session still holds its stdout', async () => {
+    const { r, ms } = await escaper('answer', 60_000);
+    expect(r).toMatchObject({ kind: 'output', value: { status: 'cannot_resolve', explanation: 'done' } });
+    expect(leftovers).toHaveLength(1);
+    expect(ms).toBeLessThan(10_000);
+  });
+});
+
 // ------------------------------------------------------------------ the input
 
 describe('the resolver input (design §2.6 "Inputs", "User message")', () => {
@@ -355,12 +407,30 @@ describe('the resolver input (design §2.6 "Inputs", "User message")', () => {
     expect(r.trunkSide).toEqual([{ landingId: 'L-5', agent: 'sam/claude-1' }]);
   });
 
-  it('a trunk commit whose trailers name another hub is pushed outside the queue: no landing, its subject as the summary', async () => {
-    const w = authWorld({ trunkMessage: `hotfix by hand\n\n${trailers({ landing: `${PROJECT}/L-5`, hub: 'another-epoch', source: '5'.repeat(40) })}\n` });
+  it('a trunk commit attributed by anything but all three trailer keys (this hub’s epoch, a landing of it, that landing’s own commit as the source) carries no landing: just its subject', async () => {
+    const S5 = '5'.repeat(40);
+    // The hub has L-5, whose commit is S5: only the trailers decide.
+    const L5 = { id: 'L-5', agent: 'sam/claude-1', task_id: 'T-2', summary: 'Trims user names', commit: S5 } as Landing;
+    const foreign = (summary: string) => [{ landing_id: null, agent: null, task_title: null, task_description: null, summary, intents: [], decisions: [] }];
+    const cases: Array<[string, string]> = [
+      ['another hub', trailers({ landing: `${PROJECT}/L-5`, hub: 'another-epoch', source: S5 })],
+      ['another source', trailers({ landing: `${PROJECT}/L-5`, hub: EPOCH, source: '6'.repeat(40) })],
+      ['another project', trailers({ landing: 'other/L-5', hub: EPOCH, source: S5 })],
+      ['no source', `Agenthub-Landing: ${PROJECT}/L-5\nAgenthub-Hub: ${EPOCH}`],
+    ];
+    for (const [what, lines] of cases) {
+      const w = authWorld({ trunkMessage: `hotfix by hand (${what})\n\n${lines}\n` });
+      const cfg = stub(w, { mode: 'union' });
+      const r = await resolverFor(w, cfg, { hub: fakeHub({ landings: [L5] }) }).resolve(await request(w));
+      expect(lastInput(cfg).trunk, what).toEqual(foreign(`hotfix by hand (${what})`));
+      expect(r.trunkSide, what).toEqual([]);
+    }
+    // The control: all three keys hold, so L-5 is the trunk side.
+    const w = authWorld({ trunkMessage: `Trim user names (L-5)\n\n${trailers({ landing: `${PROJECT}/L-5`, hub: EPOCH, source: S5 })}\n` });
     const cfg = stub(w, { mode: 'union' });
-    const r = await resolverFor(w, cfg).resolve(await request(w));
-    expect(lastInput(cfg).trunk).toEqual([{ landing_id: null, agent: null, task_title: null, task_description: null, summary: 'hotfix by hand', intents: [], decisions: [] }]);
-    expect(r.trunkSide).toEqual([]);
+    const r = await resolverFor(w, cfg, { hub: fakeHub({ landings: [L5] }) }).resolve(await request(w));
+    expect(lastInput(cfg).trunk).toEqual([expect.objectContaining({ landing_id: 'L-5', agent: 'sam/claude-1' })]);
+    expect(r.trunkSide).toEqual([{ landingId: 'L-5', agent: 'sam/claude-1' }]);
   });
 
   it('draws the nonce again when it appears anywhere in the input', async () => {
@@ -519,6 +589,13 @@ describe('requireApproval (design §1.4 "Approvals", §2.6 "Approval binding")',
     expect(again.requirement?.digest).toBe(digest);
     expect(again.report.outcome).toBe('resolved');
     expect(again.warnings.join('\n')).toMatch(/reused the resolution approved earlier/);
+    // The model is the one that made the resolution, from the candidate's Agenthub-Resolved trailer (the server-side fallback may have answered); else trunk's.
+    expect(again.report.model).toBe(MODEL);
+    const C2 = sh(w.mirror, ['commit-tree', r.tree, '-p', w.T0, '-m', 'candidate\n\nAgenthub-Resolved: structural src/x.ts; ai:fallback-model-1 src/auth.ts'], IDENT_ENV).trim();
+    const byFallback = await resolver.resolve(await request(w, { config: { ...CONFIG, requireApproval: true }, reuse: { candidate: C2, candidateRef: null, approved: [digest] } }));
+    expect(byFallback.resolved).toEqual(['src/auth.ts']);
+    expect(byFallback.report.model).toBe('fallback-model-1');
+    expect(calls(cfg)).toHaveLength(1);
 
     // Another digest approved (not this content): the resolver runs again.
     await resolver.resolve(await request(w, { config: { ...CONFIG, requireApproval: true }, reuse: { candidate: C, candidateRef: null, approved: ['0'.repeat(64)] } }));
@@ -633,6 +710,13 @@ describe('the verification gates, in order (design §2.6 "Verification")', () =>
     expect(gate(ok([{ id: 0, text: 'one\n' }, { id: 1, text: 'two\n' }, { id: 2, text: 'x\n' }]))).toBe('ids');
     expect(gate({ status: 'cannot_resolve', explanation: 'no' })).toBe('declined');
     expect(gate(ok([{ id: 0, text: 'one\n' }, { id: 1, text: 'two\n' }]))).toBe('resolved');
+    // The schema is closed (RESOLUTION_SCHEMA's additionalProperties: false, and the protocol's usage), and the explanation is at most 2000 characters.
+    expect(gate({ ...ok([{ id: 0, text: 'one\n' }, { id: 1, text: 'two\n' }]), note: 'extra' })).toBe('schema');
+    expect(gate(ok([{ id: 0, text: 'one\n', why: 'extra' } as { id: number; text: string }, { id: 1, text: 'two\n' }]))).toBe('schema');
+    expect(gate(ok([{ id: 0, text: 'one\n' }, { id: 1, text: 'two\n' }], 'x'.repeat(2001)))).toBe('schema');
+    expect(gate({ status: 'cannot_resolve', explanation: 'x'.repeat(2001) })).toBe('schema');
+    expect(gate(ok([{ id: 0, text: 'one\n' }, { id: 1, text: 'two\n' }], 'x'.repeat(2000)))).toBe('resolved');
+    expect(gate({ ...ok([{ id: 0, text: 'one\n' }, { id: 1, text: 'two\n' }]), usage: { model: MODEL, input_tokens: 10, output_tokens: 5 } })).toBe('resolved');
   });
 
   it('gate 2: a conflict-marker line is refused unless that same line is in base, ours or theirs', () => {
@@ -677,11 +761,14 @@ describe('the verification gates, in order (design §2.6 "Verification")', () =>
     expect(verifyOutput(big, ok([{ id: 0, text: text(31) }]))).toMatchObject({ kind: 'rejected', gate: 'novelty' });
   });
 
-  it('the explanation is capped at 2000 characters and stripped of control characters', () => {
-    const v = verifyOutput(twoHunks(), { status: 'cannot_resolve', explanation: `why\u001b[31m${'x'.repeat(3000)}` });
-    expect(v.kind).toBe('declined');
-    expect(v.explanation.length).toBeLessThanOrEqual(2000);
-    expect(v.explanation).not.toContain('\u001b');
+  it('the explanation is stripped of control characters, and kept (capped at 2000 characters) even with an output gate 1 refuses', () => {
+    const v = verifyOutput(twoHunks(), { status: 'cannot_resolve', explanation: `why\u001b[31m not` });
+    expect(v).toMatchObject({ kind: 'declined', explanation: 'why[31m not' });
+    const long = verifyOutput(twoHunks(), { status: 'cannot_resolve', explanation: `why\u001b[31m${'x'.repeat(3000)}` });
+    expect(long).toMatchObject({ kind: 'rejected', gate: 'schema' });
+    expect(long.explanation.length).toBeLessThanOrEqual(2000);
+    expect(long.explanation.startsWith('why')).toBe(true);
+    expect(long.explanation).not.toContain('\u001b');
   });
 });
 

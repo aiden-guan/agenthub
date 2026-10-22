@@ -20,6 +20,12 @@ export function localLandRef(sha: string): string {
   return `refs/agenthub/land/${sha}`;
 }
 
+/** The mirror's copy of a staged candidate ref (`<P>cand/<rest>` → `refs/agenthub/cand/<rest>`). */
+export function localCandidateRef(ref: string): string | null {
+  const i = ref.indexOf('cand/');
+  return i > 0 ? `refs/agenthub/${ref.slice(i)}` : null;
+}
+
 export type TrunkConfig = { ok: true; land: LandConfig; sections: TeamSections; raw: Record<string, unknown> } | { ok: false; error: string };
 
 /** trunk's agenthub.json at `rev`, strictly (design §1.2): any problem, a missing land section or check included, is an error. */
