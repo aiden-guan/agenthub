@@ -1,19 +1,19 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
-import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { LANDER_LEASE_KEY, landRef } from '@agenthub/contract';
-import { Hub, HubError, SqliteStore, startServer, type HubAuth, type LandingReport } from '@agenthub/hub';
+import { Hub, SqliteStore, startServer, type LandingReport } from '@agenthub/hub';
 import { git } from './helpers.js';
 
-// Phase 2 test rig for the adapter (step A1). Lane H's HTTP routes for the
-// landing queue (H4) aren't merged yet, so a small front server serves the
-// design §1.7 routes over the real, merged `Hub` (H1-H3), computing `auth` from
-// the headers the way the design says the server will, and passes every other
-// request (Phase 1 routes, the WebSocket feed) through to the real server on
-// the same Hub. Once H4 is merged this can be the real server alone.
+// Phase 2 test rig for the adapter: the real Hub behind H4's real server,
+// with a lander token and, when given, approvers by token digest, so the
+// adapter's tests also cover the hub's HTTP layer for the landing queue
+// (design §1.7: the lander routes need x-hub-lander-token; approvals need
+// x-hub-approver plus a token whose sha256 the hub was given, else
+// approvals_disabled). Until CP1 this was a test front serving those routes
+// over the merged Hub; the integrator ran the suite against the real server at
+// CP1 and asked for the switch.
 
 export const LANDER = 'lander/testbox-4242-a1b2';
 export const LANDER_TOKEN = 'lander-secret-for-tests';
@@ -27,144 +27,12 @@ export interface LandingHub {
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
-type Ctx = { project: string; agent: string | null; body: any; query: URLSearchParams; params: string[]; auth: HubAuth };
-type Route = { method: string; pattern: RegExp; run: (c: Ctx) => unknown };
-
-function routes(hub: Hub): Route[] {
-  const r = (method: string, p: string, run: Route['run']): Route => ({ method, pattern: new RegExp(`^${p.replace(/:[a-z]+/g, '([^/]+)')}$`), run });
-  const me = (c: Ctx) => {
-    if (!c.agent) throw new HubError('bad_agent', 'send your agent id in the x-hub-agent header', 400);
-    return c.agent;
-  };
-  const list = (v: string | null) => (v ? v.split(',').filter(Boolean) : undefined);
-  return [
-    r('POST', '/claims', (c) => hub.claim(c.project, me(c), c.body, c.auth)),
-    r('GET', '/landings', (c) => ({
-      landings: hub.listLandings(c.project, {
-        statuses: list(c.query.get('status')) as any,
-        agent: c.query.get('agent') ?? undefined,
-        task_id: c.query.get('task') ?? undefined,
-        limit: c.query.has('limit') ? Number(c.query.get('limit')) : undefined,
-      }),
-    })),
-    r('GET', '/landings/stats', (c) => hub.landingStats(c.project, c.query.get('days') ?? undefined)),
-    r('GET', '/landings/:id', (c) => ({ landing: hub.getLanding(c.project, c.params[0]) })),
-    r('POST', '/landings/:id/cancel', (c) => hub.cancelLanding(c.project, c.auth.approver ? null : me(c), c.params[0], c.body, c.auth)),
-    r('POST', '/landings/:id/approve', (c) => hub.approveLanding(c.project, c.params[0], c.body, c.auth)),
-    r('POST', '/landings/:id/reject', (c) => hub.rejectLanding(c.project, c.params[0], c.body, c.auth)),
-    r('POST', '/landings/:id/admit', (c) => hub.admitLanding(c.project, me(c), c.params[0], c.body, c.auth)),
-    r('POST', '/landings/:id/advance', (c) => hub.advanceLanding(c.project, me(c), c.params[0], c.body, c.auth)),
-    r('POST', '/landings/:id/resolve', (c) => hub.resolveLanding(c.project, me(c), c.params[0], c.body, c.auth)),
-    r('POST', '/lander/next', (c) => hub.nextLanding(c.project, me(c), c.body, c.auth)),
-    r('POST', '/lander/trunk', (c) => hub.reportTrunk(c.project, me(c), c.body, c.auth)),
-    r('POST', '/lander/pause', (c) => hub.pauseLander(c.project, me(c), c.body, c.auth)),
-    r('POST', '/lander/resume', (c) => hub.resumeLander(c.project, c.body, c.auth)),
-    r('GET', '/lander', (c) => hub.landerStatus(c.project)),
-  ];
-}
-
-/** A real Hub behind the real server, with the Phase 2 routes in front. `approvers`: name → token (the hub keeps only digests). */
+/** A real Hub behind the real server, on a random port. `approvers`: name → token (the hub keeps only digests). */
 export async function startLandingHub(opts: { approvers?: Record<string, string>; leaseTtlMs?: number } = {}): Promise<LandingHub> {
   const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: opts.leaseTtlMs });
-  const backend = await startServer({ hub, port: 0, sweepIntervalMs: 100 });
-  const approvers = new Map(Object.entries(opts.approvers ?? {}).map(([name, token]) => [name, sha256(token)]));
-  const table = routes(hub);
-  const header = (req: IncomingMessage, name: string): string | null => {
-    const v = req.headers[name];
-    return typeof v === 'string' && v.length > 0 ? v : null;
-  };
-  const authOf = (req: IncomingMessage): HubAuth => {
-    const name = header(req, 'x-hub-approver');
-    let approver: string | null = null;
-    if (name !== null) {
-      if (approvers.size === 0) throw new HubError('approvals_disabled', 'this hub has no --approvers file', 403);
-      const want = approvers.get(name);
-      if (!want || want !== sha256(header(req, 'x-hub-approver-token') ?? '')) throw new HubError('not_approver', `wrong approver token for ${name}`, 403);
-      approver = name;
-    }
-    return { lander: header(req, 'x-hub-lander-token') === LANDER_TOKEN, approver };
-  };
-
-  const proxy = (req: IncomingMessage, res: ServerResponse) => {
-    const up = httpRequest({ host: '127.0.0.1', port: backend.port, method: req.method, path: req.url, headers: req.headers }, (r) => {
-      res.writeHead(r.statusCode ?? 502, r.headers);
-      r.pipe(res);
-    });
-    up.on('error', () => {
-      if (!res.headersSent) res.writeHead(502);
-      res.end();
-    });
-    res.on('close', () => up.destroy());
-    req.pipe(up);
-  };
-
-  const front = createServer((req, res) => {
-    const url = new URL(req.url ?? '/', 'http://hub.local');
-    const m = /^\/v1\/p\/([^/]+)(\/.*)$/.exec(url.pathname);
-    let hit: { route: Route; params: string[] } | null = null;
-    if (m) {
-      for (const route of table) {
-        const pm = route.method === req.method ? route.pattern.exec(m[2]) : null;
-        if (pm) {
-          hit = { route, params: pm.slice(1).map(decodeURIComponent) };
-          break;
-        }
-      }
-    }
-    if (!m || !hit) return proxy(req, res);
-    const chunks: Buffer[] = [];
-    req.on('data', (d: Buffer) => chunks.push(d));
-    req.on('end', () => {
-      try {
-        const text = Buffer.concat(chunks).toString('utf8');
-        const body = req.method === 'POST' && text ? JSON.parse(text) : {};
-        const result = hit.route.run({ project: decodeURIComponent(m[1]), agent: header(req, 'x-hub-agent'), body, query: url.searchParams, params: hit.params, auth: authOf(req) });
-        send(res, 200, result);
-      } catch (err) {
-        const e = err instanceof HubError ? err : new HubError('internal', (err as Error).message, 500);
-        send(res, e.status, { error: { code: e.code, message: e.message, ...(e.details ? { details: e.details } : {}) } });
-      }
-    });
-  });
-
-  const upgraded = new Set<Socket>();
-  front.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
-    socket.on('error', () => {});
-    upgraded.add(socket);
-    const up = connect(backend.port, '127.0.0.1', () => {
-      const lines = [`${req.method} ${req.url} HTTP/1.1`];
-      for (let i = 0; i < req.rawHeaders.length; i += 2) lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
-      up.write(`${lines.join('\r\n')}\r\n\r\n`);
-      if (head.length) up.write(head);
-      up.pipe(socket);
-      socket.pipe(up);
-    });
-    up.on('error', () => socket.destroy());
-    up.on('close', () => socket.destroy());
-    socket.on('close', () => {
-      up.destroy();
-      upgraded.delete(socket);
-    });
-  });
-
-  await new Promise<void>((resolve) => front.listen(0, '127.0.0.1', resolve));
-  const { port } = front.address() as { port: number };
-  return {
-    url: `http://127.0.0.1:${port}`,
-    hub,
-    close: async () => {
-      for (const s of upgraded) s.destroy();
-      front.closeAllConnections();
-      await new Promise<void>((resolve) => front.close(() => resolve()));
-      await backend.close();
-    },
-  };
-}
-
-function send(res: ServerResponse, status: number, value: unknown): void {
-  const body = JSON.stringify(value);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body) });
-  res.end(body);
+  const approvers = opts.approvers ? Object.fromEntries(Object.entries(opts.approvers).map(([name, token]) => [name, `sha256:${sha256(token)}`])) : undefined;
+  const server = await startServer({ hub, port: 0, sweepIntervalMs: 100, landerToken: LANDER_TOKEN, approvers });
+  return { url: server.url, hub, close: () => server.close() };
 }
 
 /** The lander's side, played by the test over HTTP with the lander token: lease, admit, next, advance. */
@@ -188,7 +56,7 @@ export class TestLander {
 
   async takeLease(): Promise<void> {
     const r = await this.call('POST', '/claims', { files: [LANDER_LEASE_KEY], queue: true, ttl_ms: 600_000, intent: 'lander on testbox' });
-    const epoch = (await (await fetch(`${this.url}/v1/p/${PROJECT}/events?wait_ms=0`)).json()).epoch as string;
+    const { epoch } = (await (await fetch(`${this.url}/v1/p/${PROJECT}/events?wait_ms=0`)).json()) as { epoch: string };
     this.lease = { lease_claim_id: r.claim.id, epoch };
   }
 
