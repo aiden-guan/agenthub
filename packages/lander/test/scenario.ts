@@ -4,14 +4,15 @@
 // authenticated pusher, so the committer stands in for it), seeded with
 // agenthub.json (check `node check.mjs`, migrations/** protected, the
 // resolver on); agent clones; a real hub (in-process, served over HTTP by
-// hub-http.ts); and a real lander over its real HubClient, GitPort and
-// ChecksRunner, run in-process (`run --once` or in the background).
+// @agenthub/hub's own startServer on loopback); and a real lander over its
+// real HubClient, GitPort and ChecksRunner, run in-process (`run --once` or
+// in the background), or as a child process (crash.test.ts).
 
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Hub, SqliteStore, type HubAuth, type HubEvent } from '@agenthub/hub';
+import { Hub, SqliteStore, startServer, type HubAuth, type HubEvent, type RunningServer } from '@agenthub/hub';
 import type { Landing, LandRequest } from '@agenthub/hub/protocol';
 import { ChecksRunner } from '../src/checks.js';
 import { landerId } from '../src/config.js';
@@ -21,7 +22,6 @@ import { HubClient } from '../src/hub-client.js';
 import { initWorkdir } from '../src/init.js';
 import { Lander } from '../src/lander.js';
 import type { Faults, GitPort, HubPort } from '../src/ports.js';
-import { startHubFront, type HubFront } from './hub-http.js';
 import { BASE_TIME, LANDER, PROJECT, sh, testEnv, tmp, type Tmp } from './helpers.js';
 
 export const P = PROJECT;
@@ -122,7 +122,7 @@ export class Scenario {
   readonly workdir: string;
   readonly events: HubEvent[] = [];
   readonly logs: string[] = [];
-  front!: HubFront;
+  front!: RunningServer;
   lander!: Lander;
   binDir: string;
   private clones = 0;
@@ -163,7 +163,8 @@ export class Scenario {
       writeFileSync(wrapper, `#!/bin/sh\nexec "${process.execPath}" "${path.join(FIXTURES, 'fake-mergiraf.mjs')}" "$@"\n`);
       chmodSync(wrapper, 0o755);
     }
-    this.front = await startHubFront(this.hub);
+    // Loopback: the lander routes are open without a lander token; approvals in the tests go to the hub in-process.
+    this.front = await startServer({ hub: this.hub, port: 0, host: '127.0.0.1', sweepIntervalMs: 100 });
     await initWorkdir({ dir: this.workdir, remote: this.remote });
     this.lander = await this.makeLander();
   }
@@ -340,6 +341,8 @@ export class Scenario {
   async close(): Promise<void> {
     if (this.bg) await this.stop().catch(() => undefined);
     await this.front.close();
+    // The server answers the long-polls it cut off as their sockets close (a tick later): only then close the store.
+    await new Promise((r) => setTimeout(r, 50));
     (this.hub.store as { close?: () => void }).close?.();
     this.t.cleanup();
   }

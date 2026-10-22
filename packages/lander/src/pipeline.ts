@@ -14,7 +14,7 @@
 // - I8: agent text reaches the commit message only through the sanitizing
 //   builders in report.ts.
 
-import { candidateRef, FULL_SHA_RE, landingKey, landRef, type LandConfig } from '@agenthub/contract';
+import { candidateRef, FULL_SHA_RE, landRef, type LandConfig } from '@agenthub/contract';
 import type { ConflictEntry } from '@agenthub/gitops';
 import type {
   ApprovalRequirement,
@@ -35,7 +35,7 @@ import { failureReport, sendbackContext, tellIfFailed, tellParked, tellSendback 
 import { isHubError, type ResolveResult } from './ports.js';
 import { commitMessage, ConflictReporter, emptyReport, LISTED_COMMITS, type SendbackContext } from './report.js';
 import { approversOf, missingApprovals, mergedRequirements, protectedPaths, protectedRequirements, uniqueRequirements } from './requirements.js';
-import { descends, fetchTrunk, localLandRef, policyOf, scanTrunk, trunkLocalRef } from './trunk.js';
+import { descends, fetchTrunk, findOnTrunk, localLandRef, policyOf, scanTrunk, trunkLocalRef } from './trunk.js';
 
 /** How an attempt (or an in-doubt resolution) ended, for the loops. */
 export type AttemptOutcome =
@@ -146,7 +146,8 @@ export class Attempt {
       return await this.steps();
     } catch (err) {
       if (err instanceof LeaseLost) {
-        ctx.log(`${this.id}: lease lost; dropping attempt ${this.n} without pushing`);
+        // In pushing, the push may have gone out (refused or up to date if another lander got there first): the next lease holder resolves it.
+        ctx.log(this.pushing ? `${this.id}: lease lost in pushing; the next lease holder resolves it in doubt` : `${this.id}: lease lost; dropping attempt ${this.n} without pushing`);
         return { kind: 'lost' };
       }
       if (err instanceof AttemptStale) {
@@ -248,8 +249,7 @@ export class Attempt {
     this.checkpoint();
 
     // ---------------- P2: already landed? the stacked landing it waited for?
-    const key = { landing: landingKey(ctx.project, id), hub: ctx.lease.epoch, source: H };
-    const found = await ctx.git.findLandingCommit(this.cur.first_base, T0, key);
+    const found = await findOnTrunk(ctx, this.cur, T0);
     if (found) {
       ctx.log(`${id} is already on trunk as ${found.slice(0, 12)}`);
       return this.landed(found, { resolved: 'none', message: `${id} is already on ${ctx.trunk.branch} as ${found.slice(0, 12)}.`, check: null, resolver: null, filesVia: [] });
@@ -565,8 +565,7 @@ export class Attempt {
     const { ctx, id } = this;
     const t = await fetchTrunk(ctx, trunkLocalRef);
     if (t.kind !== 'ok') return { kind: 'in_doubt' };
-    const key = { landing: landingKey(ctx.project, id), hub: ctx.lease.epoch, source: this.H };
-    const on = (await descends(ctx, C, t.tip)) ? C : await ctx.git.findLandingCommit(this.cur.first_base, t.tip, key);
+    const on = (await descends(ctx, C, t.tip)) ? C : await findOnTrunk(ctx, this.cur, t.tip);
     if (on) {
       const r = await hubWrite(ctx, `resolve ${id}`, () => ctx.hub.resolve(id, { lease: ctx.lease.auth(), outcome: 'landed', trunk_sha: on, symbol_changes: [] }));
       await this.cleanup(r.landing);

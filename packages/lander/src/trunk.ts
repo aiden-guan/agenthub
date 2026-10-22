@@ -4,8 +4,8 @@
 // is: reconcile (T16) and foreign commits, or a rewrite, which pauses landing
 // everywhere until an approver accepts the new tip.
 
-import { parseTeamSections, type LandConfig, type TeamSections } from '@agenthub/contract';
-import type { LandPolicy, LanderControl, TrunkReportRequest } from '@agenthub/hub/protocol';
+import { landingKey, parseTeamSections, type LandConfig, type TeamSections } from '@agenthub/contract';
+import type { Landing, LandPolicy, LanderControl, TrunkReportRequest } from '@agenthub/hub/protocol';
 import { hubWrite, type LanderContext } from './context.js';
 import type { GitPort } from './ports.js';
 
@@ -136,6 +136,22 @@ export async function scanTrunk(ctx: LanderContext, tip: string, control: Lander
 export async function descends(ctx: LanderContext, a: string, b: string): Promise<boolean> {
   if ((await ctx.git.revParse(a)) === null) return false;
   return ctx.git.isAncestor(a, b);
+}
+
+/**
+ * The first-parent commit of trunk up to `tip` that is landing `l` by the
+ * three-key identity (design §1.1: Agenthub-Landing, Agenthub-Hub and
+ * Agenthub-Source), searching after `l.first_base`. A mirror that never had
+ * first_base (another machine ran the first attempt, and trunk was rewound
+ * since, so no fetch brings it) searches trunk's whole first-parent history:
+ * git can't exclude what it doesn't have, and the identity alone decides
+ * what matches anyway.
+ */
+export async function findOnTrunk(ctx: LanderContext, l: Pick<Landing, 'id' | 'commit' | 'first_base'>, tip: string): Promise<string | null> {
+  if (!l.commit) return null;
+  const key = { landing: landingKey(ctx.project, l.id), hub: ctx.lease.epoch, source: l.commit };
+  const from = l.first_base !== null && (await ctx.git.revParse(l.first_base)) !== null ? l.first_base : null;
+  return ctx.git.findLandingCommit(from, tip, key);
 }
 
 /**

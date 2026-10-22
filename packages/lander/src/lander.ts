@@ -70,6 +70,8 @@ export class Lander {
   /** GC and admission rounds take turns on the mirror's land refs (see serially). */
   private mirrorTurn: Promise<unknown> = Promise.resolve();
   private recovered = false;
+  /** What startup did with a landing left in doubt (run --once counts it as its one landing). */
+  private startupStep: StepResult | null = null;
 
   constructor(o: LanderOptions) {
     const clock = o.clock ?? systemClock;
@@ -116,10 +118,14 @@ export class Lander {
     let last: StepResult | null = null;
     try {
       while (!this.stopping) {
-        if (!(await this.ensureLease())) break;
+        // Not held after all: lost again during startup (not_lander, a hub on a new database), so claim again.
+        if (!(await this.ensureLease())) continue;
+        const atStart = this.startupStep;
+        this.startupStep = null;
         if (o.once) {
           await this.admitRound();
-          last = await this.step();
+          // A landing left in doubt that startup resolved is this run's one landing.
+          last = atStart ?? (await this.step());
           break;
         }
         const tenure = this.lease.signal;
@@ -139,12 +145,31 @@ export class Lander {
     if (!this.recovered) {
       this.recovered = true;
       await startupRecovery(this.ctx, this.workdir).catch((err: unknown) => this.ctx.log(`startup recovery: ${String(err)}`));
+      this.startupStep = await this.resolveLeftInDoubt();
       await this.gc();
       await syncTrunk(this.ctx).catch((err: unknown) => {
         if (!(err instanceof LeaseLost)) this.ctx.log(`startup trunk report: ${err instanceof Error ? err.message : String(err)}`);
       });
     }
     return this.lease.held;
+  }
+
+  /**
+   * The end of startup recovery (design §2.2.7): a landing the last lease left
+   * in pushing is resolved through next, which hands it out first with
+   * resolve: true, before anything else runs: the startup trunk report would
+   * otherwise reconcile one whose push went through as merely found on trunk,
+   * and the in-doubt rule, not that backstop, is what decides it.
+   */
+  private async resolveLeftInDoubt(): Promise<StepResult | null> {
+    let running: Landing[];
+    try {
+      running = await this.ctx.hub.landings({ status: ['running'], limit: 5 });
+    } catch {
+      return null; // the attempt loop's first next hands it out anyway
+    }
+    if (!running.some((l) => l.status === 'running' && l.phase === 'pushing' && l.in_doubt)) return null;
+    return this.step();
   }
 
   /** One admission round (errors are logged; a lost lease ends it). It never overlaps a GC pass. */
