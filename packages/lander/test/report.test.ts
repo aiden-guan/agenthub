@@ -292,6 +292,28 @@ describe('fix-it conflict reports (design §2.2.6 step 4)', () => {
     expect(r.hunks[1]!.trunk).toMatch(/more lines\)\n$/);
   });
 
+  it('Phase 3: each hunk names the declarations it lies in', async () => {
+    const work = Repo.init(path.join(t.dir, 'symbols'));
+    const src = (login: string, refresh: string) =>
+      `export function login(user: string): string {\n  return ${login};\n}\n\nexport class Session {\n  ttl = 5;\n\n  refresh(): number {\n    return ${refresh};\n  }\n}\n`;
+    const b = work.commit('b', { 'src/s.ts': src('user', '1'), 'notes.txt': 'one\n' });
+    work.git('checkout', '-q', '-b', 'yours');
+    const y = work.commit('y', { 'src/s.ts': src('user.trim()', '2'), 'notes.txt': 'yours\n' });
+    work.git('checkout', '-q', 'main');
+    const tr = work.commit('t', { 'src/s.ts': src('user.toLowerCase()', '3'), 'notes.txt': 'trunk\n' });
+    const merged = await mergeTrees(open(work.dir, { isolated: true }), tr, y, { base: b, attrSource: tr });
+    const reporter = new ConflictReporter({ git: openGitPort({ mirror: work.dir, remote: 'origin' }), hub, project: PROJECT, epoch: EPOCH, base: b, trunk: tr });
+    const byPath = new Map(merged.conflicts.map((c) => [c.path, c]));
+    const ts = await reporter.report(byPath.get('src/s.ts')!, { tried: ['clean'], aiEligible: true, explanation: null });
+    expect(ts.hunks.map((h) => [h.start_line, h.symbols])).toEqual([
+      [2, ['login']],
+      [15, ['Session.refresh']],
+    ]);
+    // A language the extractor doesn't know: no declarations.
+    const txt = await reporter.report(byPath.get('notes.txt')!, { tried: ['clean'], aiEligible: true, explanation: null });
+    expect(txt.hunks.map((h) => h.symbols)).toEqual([[]]);
+  });
+
   it('finds the regions when the code itself has conflict-marker-like lines', async () => {
     const git = openGitPort({ mirror, remote: 'origin' });
     const blob = (s: string) => sh(mirror, ['hash-object', '-w', '--stdin'], {}, s).trim();

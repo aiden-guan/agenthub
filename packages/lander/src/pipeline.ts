@@ -13,6 +13,9 @@
 //   trunk's agenthub.json at T0 and `--attr-source=T0`.
 // - I8: agent text reaches the commit message only through the sanitizing
 //   builders in report.ts.
+// Phase 3 (§2.5): landed and resolve-landed carry the signature changes the
+// landed commit made against its first parent (T0 vs C), computed before the
+// push where the candidate is known (symbols.ts).
 
 import { candidateRef, FULL_SHA_RE, landRef, type LandConfig } from '@agenthub/contract';
 import type { ConflictEntry } from '@agenthub/gitops';
@@ -28,6 +31,7 @@ import type {
   RequeueReason,
   ResolvedBy,
   ResolverReport,
+  SymbolChangeInput,
 } from '@agenthub/hub/protocol';
 import { isLive } from './admission.js';
 import { AttemptStale, bestEffort, HubUnavailable, hubWrite, LeaseLost, Stopping, type LanderContext } from './context.js';
@@ -35,6 +39,7 @@ import { failureReport, sendbackContext, tellIfFailed, tellParked, tellSendback 
 import { isHubError, type ResolveResult } from './ports.js';
 import { aiLandedMessage, commitMessage, ConflictReporter, emptyReport, LISTED_COMMITS, type SendbackContext } from './report.js';
 import { approversOf, missingApprovals, mergedRequirements, protectedPaths, protectedRequirements, uniqueRequirements } from './requirements.js';
+import { DEFAULT_SYMBOLS, landedSymbolChanges, type SymbolsSettings } from './symbols.js';
 import { descends, fetchTrunk, findOnTrunk, localCandidateRef, localLandRef, policyOf, scanTrunk, trunkLocalRef } from './trunk.js';
 
 /** How an attempt (or an in-doubt resolution) ended, for the loops. */
@@ -110,6 +115,10 @@ export class Attempt {
   private readonly signal: AbortSignal;
   private cur: Landing;
   private land!: LandConfig;
+  /** Trunk's `symbols` section at T0. */
+  private symbols: SymbolsSettings = DEFAULT_SYMBOLS;
+  /** The signature changes of the commit that lands (design §2.5), once computed. */
+  private landedChanges: { sha: string; changes: SymbolChangeInput[] } | null = null;
   private T0 = '';
   private base = '';
   private files: string[] = [];
@@ -217,6 +226,7 @@ export class Attempt {
     }
     this.T0 = trunk.tip;
     this.land = trunk.config.land;
+    this.symbols = trunk.config.sections.symbols;
     const T0 = this.T0;
     const land = this.land;
 
@@ -414,6 +424,9 @@ export class Attempt {
     const missing = missingApprovals(required, latest.approvals, latest.agent);
     if (missing.length > 0) return this.park(C, required, missing, resolvedReport);
 
+    // Phase 3: what C changes in signatures (T0 vs C), read now so the push and its landed ack stay close.
+    await this.symbolChanges(C);
+
     // ---------------- P9: the write-ahead
     await this.stage(C);
     await ctx.faults.at('after-candidate-staged', id);
@@ -599,7 +612,8 @@ export class Attempt {
     if (t.kind !== 'ok') return { kind: 'in_doubt' };
     const on = (await descends(ctx, C, t.tip)) ? C : await findOnTrunk(ctx, this.cur, t.tip);
     if (on) {
-      const r = await hubWrite(ctx, `resolve ${id}`, () => ctx.hub.resolve(id, { lease: ctx.lease.auth(), outcome: 'landed', trunk_sha: on, symbol_changes: [] }));
+      const symbol_changes = await this.symbolChanges(on);
+      const r = await hubWrite(ctx, `resolve ${id}`, () => ctx.hub.resolve(id, { lease: ctx.lease.auth(), outcome: 'landed', trunk_sha: on, symbol_changes }));
       if (!r.replayed && on === C) await this.tellAiLanded(r.landing, C);
       await this.cleanup(r.landing);
       return { kind: 'landed', trunkSha: on, noop: false };
@@ -652,7 +666,9 @@ export class Attempt {
       foreign_commits: this.foreign,
       timings: this.timingsReport(),
     };
-    const r = await this.advance({ to: 'landed', trunk_sha: trunkSha, base_sha: this.base || this.T0, files: this.files, report, also_landed: this.alsoLanded, symbol_changes: [] });
+    // A no-op landed nothing new: T0 is someone else's commit.
+    const symbol_changes = o.noop ? [] : await this.symbolChanges(trunkSha);
+    const r = await this.advance({ to: 'landed', trunk_sha: trunkSha, base_sha: this.base || this.T0, files: this.files, report, also_landed: this.alsoLanded, symbol_changes });
     await ctx.faults.at('after-landed-ack', id);
     ctx.log(`${id} landed as ${trunkSha.slice(0, 12)}${o.noop ? ' (no-op)' : ''}`);
     if (!r.replayed && !o.noop) await this.tellAiLanded(r.landing, trunkSha);
@@ -685,6 +701,15 @@ export class Attempt {
       });
     }
     await bestEffort(ctx, 'deleting the local land ref', () => ctx.git.deleteLocalRef(localLandRef(H)));
+  }
+
+  /** design §2.5 "Producers": the signature changes `sha` made against its first parent (best effort, computed once). */
+  private async symbolChanges(sha: string): Promise<SymbolChangeInput[]> {
+    if (this.landedChanges?.sha !== sha) {
+      const changes = await landedSymbolChanges(this.ctx.git, { commit: sha, taskId: this.cur.task_id, config: this.symbols, log: (line) => this.ctx.log(`${this.id}: ${line}`) });
+      this.landedChanges = { sha, changes };
+    }
+    return this.landedChanges.changes;
   }
 
   private timingsReport(): LandingReport['timings'] {

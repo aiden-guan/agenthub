@@ -120,6 +120,27 @@ describe('hub-lander with the AI resolver (design §5.3, the AI rows)', () => {
   );
 
   it(
+    'AI parse gate (Phase 3): an output that passes the other gates but leaves the file unparseable is rejected: resolver_failed, nothing checked or pushed',
+    async () => {
+      // Both sides parse; the proposed text is an unclosed brace (an uncontained error, design §1.10).
+      const { sc, b, Ca, Lb } = await conflicted({ resolver: { stub: { mode: 'fixture', files: { 'src/a.ts': ['export const a = {\n'] } } } });
+      await sc.once();
+      const failed = sc.landing(Lb.id);
+      expect(failed.status).toBe('failed');
+      expect(failed.failure?.code).toBe('resolver_failed');
+      expect(failed.report?.resolver?.outcome).toBe('rejected_output');
+      expect(failed.report?.files_via).toEqual([]);
+      expect(failed.report?.conflicts).toEqual([expect.objectContaining({ file: 'src/a.ts', kind: 'content', tried: ['clean', 'ai'], ai_eligible: true })]);
+      expect(failed.report?.warnings.join('\n')).toMatch(/src\/a\.ts: the AI resolver's output was rejected \(parse\)/);
+      expect(sc.resolverCalls()).toEqual(['src/a.ts']);
+      expect(sc.checkRuns(Lb.id)).toEqual([]);
+      expect(sc.trunk()).toBe(Ca);
+      expect(landerMessages(sc, b.agent).some((m) => m.includes(Lb.id) && m.includes('resolver_failed'))).toBe(true);
+    },
+    T,
+  );
+
+  it(
     'AI broken: a resolution that passes the gates but fails the checks is resolver_failed, with the check report and the proposal kept',
     async () => {
       // Context lines give the file room for the extra line under the whole-file size gate (2 × max(ours, theirs)).

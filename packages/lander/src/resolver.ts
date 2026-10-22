@@ -32,6 +32,8 @@ import type { ApprovalRequirement, Decision, Landing, ResolverReport, Task } fro
 import { z } from 'zod';
 import { systemClock, type Clock, type GitPort, type HubPort, type PathChange, type ResolveRequest, type ResolveResult, type ResolverPort } from './ports.js';
 import { redact } from './redact.js';
+import { conflictRegions, spliceRegions, type ConflictRegion } from './regions.js';
+import { symbolsParseCheck } from './symbols.js';
 import { localCandidateRef } from './trunk.js';
 import type { ResolverInput, ResolverIntent, ResolverOutput } from './resolver-protocol.js';
 
@@ -81,75 +83,8 @@ export function languageOf(p: string): string | null {
 
 // ------------------------------------------------------------------ conflict regions and the splice
 
-/** One numbered conflict region of `git merge-file -p --diff3` output. */
-export interface ConflictRegion {
-  id: number;
-  /** Offsets in the merged text: from the start of the opening marker line to the end of the closing one. */
-  start: number;
-  end: number;
-  /** Lines of the merged text, 1-based, marker lines included. */
-  start_line: number;
-  end_line: number;
-  trunk: string;
-  base: string;
-  incoming: string;
-  /** The closing marker line's line end ('' at the end of a file without a final newline). */
-  eol: string;
-}
-
-/**
- * The conflict regions of diff3 output whose markers are `markerSize` long
- * (`<<<<<<< trunk`, `||||||| base`, `=======`, `>>>>>>> incoming`), numbered
- * 0..n-1 in file order. Each side keeps its lines' own line ends.
- */
-export function conflictRegions(merged: string, markerSize: number): ConflictRegion[] {
-  const [lt, bar, eq, gt] = ['<', '|', '=', '>'].map((c) => c.repeat(markerSize)) as [string, string, string, string];
-  const isMarker = (line: string, m: string) => line === m || line.startsWith(`${m} `);
-  const out: ConflictRegion[] = [];
-  let side: 'trunk' | 'base' | 'incoming' | null = null;
-  let open = { start: 0, start_line: 0, trunk: [] as string[], base: [] as string[], incoming: [] as string[] };
-  let offset = 0;
-  let lineNo = 0;
-  for (const m of merged.matchAll(/[^\n]*\n|[^\n]+$/g)) {
-    const full = m[0];
-    lineNo++;
-    const at = offset;
-    offset += full.length;
-    const eol = full.endsWith('\r\n') ? '\r\n' : full.endsWith('\n') ? '\n' : '';
-    const line = full.slice(0, full.length - eol.length);
-    if (side === null) {
-      if (isMarker(line, lt)) {
-        side = 'trunk';
-        open = { start: at, start_line: lineNo, trunk: [], base: [], incoming: [] };
-      }
-      continue;
-    }
-    if (side === 'trunk' && isMarker(line, bar)) side = 'base';
-    else if (side !== 'incoming' && line === eq) side = 'incoming';
-    else if (side === 'incoming' && isMarker(line, gt)) {
-      out.push({ id: out.length, start: open.start, end: offset, start_line: open.start_line, end_line: lineNo, trunk: open.trunk.join(''), base: open.base.join(''), incoming: open.incoming.join(''), eol });
-      side = null;
-    } else open[side].push(full);
-  }
-  return out;
-}
-
-/**
- * The merged text with region i replaced by texts[i], and every byte outside
- * the regions exactly as it was (design §2.6 gate 3). A non-empty text gets
- * the region's own line end if it lacks one, so the next line stays a line.
- */
-export function spliceRegions(merged: string, regions: readonly ConflictRegion[], texts: readonly string[]): string {
-  let out = '';
-  let at = 0;
-  regions.forEach((r, i) => {
-    let t = texts[i] ?? '';
-    if (t !== '' && r.eol !== '' && !t.endsWith('\n')) t += r.eol;
-    out += merged.slice(at, r.start) + t;
-    at = r.end;
-  });
-  return out + merged.slice(at);
-}
+// The regions and the splice live in regions.ts (the fix-it report reads the regions too).
+export { conflictRegions, spliceRegions, type ConflictRegion } from './regions.js';
 
 // ------------------------------------------------------------------ the gates
 
@@ -499,7 +434,7 @@ class Intents {
 
 // ------------------------------------------------------------------ the port
 
-/** design §2.6 gate 6 (Phase 3, injected by L6): why the result doesn't parse when both sides do, or null. */
+/** design §2.6 gate 6 (Phase 3): why the result doesn't parse when both sides do, or null. */
 export type ParseCheck = (file: { path: string; ours: string; theirs: string; result: string }) => Promise<string | null>;
 
 export interface AiResolverOptions {
@@ -520,7 +455,7 @@ export interface AiResolverOptions {
   /** The lander's environment: PATH, and NODE_ENV=test's AGENTHUB_RESOLVER_STUB (default process.env). */
   env?: NodeJS.ProcessEnv;
   log?: (line: string) => void;
-  /** Phase 3: the parse gate. */
+  /** Phase 3: the parse gate; by default @agenthub/symbols' (symbols.ts), null turns it off (tests). */
   parseCheck?: ParseCheck | null;
   /** Tests: the nonce source, and the argv the built-in command runs as. */
   nonce?: () => string;
@@ -546,6 +481,7 @@ export class AiResolver implements ResolverPort {
   private readonly clock: Clock;
   private readonly timeoutMs: number;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly parseCheck: ParseCheck | null;
   /** When each call of the last hour started (the hourly cap). */
   private calls: number[] = [];
 
@@ -554,6 +490,7 @@ export class AiResolver implements ResolverPort {
     this.clock = o.clock ?? systemClock;
     this.timeoutMs = o.timeoutMs ?? RESOLVER_TIMEOUT_MS;
     this.env = o.env ?? process.env;
+    this.parseCheck = o.parseCheck === undefined ? symbolsParseCheck : o.parseCheck;
   }
 
   private log(line: string): void {
@@ -811,8 +748,8 @@ export class AiResolver implements ResolverPort {
     if (run.stderr.trim()) this.log(`AI resolver (${f.path}): ${run.stderr.trim().split('\n').slice(-3).join(' | ').slice(0, 500)}`);
     if (run.kind === 'failed') return { path: f.path, verdict: null, failure: run.detail };
     let verdict = verifyOutput(f, run.value);
-    if (verdict.kind === 'resolved' && this.o.parseCheck) {
-      const why = await this.o.parseCheck({ path: f.path, ours: f.ours, theirs: f.theirs, result: verdict.text });
+    if (verdict.kind === 'resolved' && this.parseCheck) {
+      const why = await this.parseCheck({ path: f.path, ours: f.ours, theirs: f.theirs, result: verdict.text });
       if (why) verdict = { kind: 'rejected', gate: 'parse', detail: why, explanation: verdict.explanation, usage: verdict.usage };
     }
     return { path: f.path, verdict, failure: null };
