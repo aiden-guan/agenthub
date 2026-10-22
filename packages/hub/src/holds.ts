@@ -31,7 +31,7 @@ export interface SetHoldsResult {
   conflicts: ClaimConflict[];
   /** Gate warn: the entries left out of the holds because of `conflicts`. */
   dropped: ScopeEntry[];
-  /** Some entry is no longer held: the caller runs promoteQueued once it has ended whatever else it ends. */
+  /** Some entry is no longer held, or is held under another mapper: the caller runs promoteQueued once it has ended whatever else it ends. */
   trimmed: boolean;
 }
 
@@ -96,7 +96,10 @@ export function planHolds(ix: HubInternals, project: string, agent: string, entr
  * warn, the conflicting entries are left out (`dropped`). Then each hold row
  * is created, rescoped in place or ended: a new hold emits claim.granted with
  * its landing_id, added entries claim.granted, removed entries a partial
- * claim.released.
+ * claim.released. A row re-made under another mapper compares differently
+ * from then on (design §1.10), so it emits claim.granted with all its entries
+ * and the new mapper, and counts as trimmed: a waiter it blocked only at file
+ * level may be free now.
  */
 export function setHolds(
   ix: HubInternals,
@@ -146,18 +149,23 @@ export function setHolds(
     if (removed.length > 0) {
       trimmed = true;
       const gone = unique(removed.map((e) => e.file)).filter((f) => !want.some((w) => w.file === f));
-      ix.emit(project, 'claim.released', row.holder, { claim_id: row.id, holder: row.holder, files: gone, partial: true, landing_id: landing.id, scope: removed });
+      ix.emit(project, 'claim.released', row.holder, { claim_id: row.id, holder: row.holder, files: gone, partial: true, landing_id: landing.id, scope: removed, mapper: row.mapper });
     }
-    if (added.length > 0) {
+    // Under a new mapper every entry is held anew: it overlaps other claims differently.
+    const remapped = patch.mapper !== undefined;
+    trimmed ||= remapped;
+    const granted = remapped ? want : added;
+    if (granted.length > 0) {
       ix.emit(project, 'claim.granted', row.holder, {
         claim_id: row.id,
         holder: row.holder,
-        files: unique(added.map((e) => e.file)),
+        files: unique(granted.map((e) => e.file)),
         mode,
         intent: updated.intent,
         task_id: updated.task_id,
         landing_id: landing.id,
-        scope: added,
+        scope: granted,
+        mapper,
       });
     }
     holds.push(updated);
@@ -180,6 +188,7 @@ export function moveHolds(ix: HubInternals, project: string, from: Pick<Landing,
       task_id: to.task_id,
       landing_id: to.id,
       scope: c.scope,
+      mapper: c.mapper,
       moved_from: from.id,
     });
     return moved;
@@ -211,6 +220,7 @@ export function holdsToLeases(ix: HubInternals, project: string, landingId: stri
       task_id: c.task_id,
       landing_id: null,
       scope: c.scope,
+      mapper: c.mapper,
       from_landing: landingId,
     });
     return { ...c, landing_id: null, expires_at, intent };
@@ -258,6 +268,7 @@ function createHold(ix: HubInternals, project: string, landing: HoldOwner, scope
     task_id: hold.task_id,
     landing_id: landing.id,
     scope,
+    mapper,
   });
   return hold;
 }

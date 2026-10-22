@@ -88,9 +88,19 @@ describe('claims', () => {
   });
 
   it('is file-level in Phase 1: different symbols in one file still conflict', () => {
-    const { hub } = setup();
-    hub.claim(P, A, { scope: [{ file: 'src/session.ts', symbol: 'refreshToken' }] });
-    const b = hub.claim(P, B, { scope: [{ file: 'src/session.ts', symbol: 'logout' }] });
+    // Phase 3 (H5, design §1.9/§1.10) changed this test's premise, as the frozen
+    // ClaimRequest.mapper says: symbol entries without the mapper that produced
+    // them are refused (400 invalid_symbol), so the Phase 1 request is checked
+    // that way. What Phase 1 stored, symbols with no mapper, still compares as
+    // the whole file. (Symbol-level grants: symbol-scope.test.ts.)
+    const { hub, store, clock } = setup();
+    expect(errorCode(() => hub.claim(P, A, { scope: [{ file: 'src/session.ts', symbol: 'refreshToken' }] }))).toBe('invalid_symbol');
+    store.insertClaim({
+      id: 'C-1', project: P, holder: A, task_id: null, scope: [{ file: 'src/session.ts', symbol: 'refreshToken' }], mode: 'exclusive', intent: 'phase 1', base_commit: null,
+      status: 'active', created_at: clock.t, granted_at: clock.t, expires_at: clock.t + 60_000, ttl_ms: 60_000, heartbeat_interval_ms: 15_000, ended_at: null, end_reason: null,
+      landing_id: null, mapper: null,
+    });
+    const b = hub.claim(P, B, { scope: [{ file: 'src/session.ts', symbol: 'logout' }], mapper: 'sym1;test' });
     expect(b.status).toBe('denied');
   });
 
