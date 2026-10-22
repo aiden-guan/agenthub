@@ -1,7 +1,11 @@
 import WebSocket from 'ws';
-import type { Claim, FeedServerFrame, HeartbeatRequest, HeartbeatResult, HubEvent } from '@agenthub/hub/protocol';
+import { humanOf } from '@agenthub/contract';
+import { gitops } from '@agenthub/gitops';
+import type { Claim, FeedServerFrame, HeartbeatRequest, HeartbeatResult, HubEvent, Landing } from '@agenthub/hub/protocol';
 import { HubApiError, classifyFailure, type HubClient } from './client.js';
-import { claimFiles, inline } from './format.js';
+import { teamSections } from './config.js';
+import { approversOf, claimFiles, inline, notices as noticeText } from './format.js';
+import { fetchTrunk } from './sync.js';
 
 export interface FeedOptions {
   /** Fixed heartbeat period. By default the feed follows the hub (see `periodMs`). */
@@ -9,6 +13,12 @@ export interface FeedOptions {
   /** Presence info sent with every heartbeat. */
   info?: Omit<HeartbeatRequest, 'claim_ids'>;
   log?: (msg: string) => void;
+  /**
+   * This agent's checkout: where trunk is fetched in the background when it
+   * moves, and whose modified files a trunk.moved notice looks for. Without
+   * one, those notices name held files only and nothing is fetched.
+   */
+  root?: string | null;
 }
 
 /** The hello frame. `epoch` names the hub's database; hubs older than it don't send one. */
@@ -25,6 +35,8 @@ export interface WaitResult {
 
 const BUFFER_LIMIT = 1000;
 const NOTICE_LIMIT = 50;
+/** The background fetch of trunk on landing.landed and trunk.moved (design §2.3.4). */
+const FETCH_TIMEOUT_MS = 10_000;
 /**
  * However short an interval the hub announces, heartbeats don't come faster
  * than this: the shortest a hub hands out (25 ms, a third of its shortest
@@ -84,7 +96,16 @@ export class Feed {
   /** This agent's claims as far as this process knows, with their heartbeat interval when known. */
   private held = new Map<string, { files: string[]; interval: number | null }>();
   private readonly reportedLost = new Set<string>();
-  private notices: string[] = [];
+  /** For the next tool result; a landing notice names its landing and key, so showing that landing drops it (seenLanding). */
+  private notices: Array<{ text: string; landing: string | null; key: string | null }> = [];
+  /** Landings of this agent's, by id, as the landing events name them (so its own trunk.moved isn't news to it). */
+  private readonly mine = new Set<string>();
+  /** Landing notices already given (`landed:L-7`, `approval:L-9`, `trunk:<sha>`): each is said once. */
+  private readonly noticed = new Set<string>();
+  /** Landing notices the agent no longer needs: it was shown that landing in that state (seenLanding). */
+  private readonly suppressed = new Set<string>();
+  private fetching: Promise<void> | null = null;
+  private fetchAgain = false;
 
   constructor(
     private readonly client: HubClient,
@@ -138,7 +159,7 @@ export class Feed {
 
   /** What the agent must hear about its claims since the last call: leases that ran out, a hub that lost them. */
   takeNotices(): string[] {
-    return this.notices.splice(0);
+    return this.notices.splice(0).map((n) => n.text);
   }
 
   /**
@@ -335,6 +356,7 @@ export class Feed {
     this.buffer.push(e);
     if (this.buffer.length > BUFFER_LIMIT) this.buffer.splice(0, this.buffer.length - BUFFER_LIMIT);
     this.track(e);
+    this.landingNotices(e);
     this.wake();
   }
 
@@ -430,9 +452,169 @@ export class Feed {
     );
   }
 
-  private notice(text: string, logLine = text): void {
+  private notice(text: string, logLine = text, about: { landing: string; key: string } | null = null): void {
+    if (about && this.suppressed.has(about.key)) return;
     this.opts.log?.(logLine);
-    if (this.notices.length < NOTICE_LIMIT) this.notices.push(text);
+    if (this.notices.length < NOTICE_LIMIT) this.notices.push({ text, landing: about?.landing ?? null, key: about?.key ?? null });
+  }
+
+  /**
+   * The agent was just shown landing `l` as it is now (hub_wait, landing_status,
+   * land_cancel): its pending notices go, and the state it was shown in is
+   * not announced again when its event comes in afterwards.
+   */
+  seenLanding(l: Pick<Landing, 'id' | 'status' | 'in_doubt'>): void {
+    this.notices = this.notices.filter((n) => n.landing !== l.id);
+    const kinds: Partial<Record<Landing['status'], string[]>> = {
+      landed: ['landed'],
+      failed: ['failed'],
+      cancelled: ['cancelled'],
+      needs_approval: ['parked'],
+      running: l.in_doubt ? ['in_doubt'] : [],
+    };
+    for (const k of kinds[l.status] ?? []) {
+      this.noticed.add(`${k}:${l.id}`);
+      this.suppressed.add(`${k}:${l.id}`);
+    }
+  }
+
+  /**
+   * Phase 2 notices (design §2.3.4), for the next tool result: this agent's
+   * landings landing, coming back, parking for an approval, going in doubt or
+   * being cancelled by someone else; an approval this agent's human may give;
+   * trunk moving under files this agent holds or has modified. On
+   * landing.landed and trunk.moved, trunk is also fetched in the background,
+   * which only updates its remote-tracking ref, so hooks compare against a
+   * fresh trunk without network calls. Event data carries no agent-written
+   * text (§1.8): the notices quote codes and ids only.
+   */
+  private landingNotices(e: HubEvent): void {
+    const me = this.client.cfg.agent;
+    if (!me) return;
+    const d = e.data as Record<string, unknown>;
+    if (e.type === 'landing.landed' || e.type === 'trunk.moved') this.fetchTrunkSoon();
+    const id = typeof d.landing_id === 'string' ? d.landing_id : null;
+    if (!id && e.type !== 'trunk.moved') return;
+    const own = d.agent === me;
+    if (own && id) this.mine.add(id);
+    const once = (key: string, text: () => string | null) => {
+      if (this.noticed.has(key)) return;
+      const t = text();
+      if (t === null) return;
+      this.noticed.add(key);
+      this.notice(t, t, id ? { landing: id, key } : null);
+    };
+    if (own) {
+      if (e.type === 'landing.landed') once(`landed:${id}`, () => noticeText.landed(d, this.trunkName()));
+      else if (e.type === 'landing.failed') once(`failed:${id}`, () => noticeText.failed(d));
+      else if (e.type === 'landing.updated' && d.reason === 'in_doubt') once(`in_doubt:${id}`, () => noticeText.inDoubt(d));
+      else if (e.type === 'landing.updated' && d.reason === 'cancelled' && e.actor !== me) once(`cancelled:${id}`, () => noticeText.cancelled(d, e.actor ?? ''));
+      else if (e.type === 'landing.needs_approval' && d.parked === true) this.later(`parked:${id}`, id, async () => {
+        const l = await this.landingOf(id!);
+        const pending = l ? [...new Set(l.approval.flatMap((r) => r.paths))].sort() : paths(d);
+        return noticeText.parked(d, pending.length ? pending : paths(d), l ? approversOf(l.approval, l.agent) : null);
+      });
+    } else if (e.type === 'landing.needs_approval') {
+      // Whether this agent's human may give it: the rules of the requirements still pending, the author's own human left out where a rule says distinct.
+      this.later(`approval:${id}`, id, async () => {
+        const l = await this.landingOf(id!);
+        const human = humanOf(me);
+        if (!l || l.agent === me) return null;
+        const may = l.approval.some((r) => r.rules.some((rule) => (rule.approvers === null || rule.approvers.includes(human)) && !(rule.distinct && humanOf(l.agent) === human)));
+        return may ? noticeText.relay(d, [...new Set(l.approval.flatMap((r) => r.paths))].sort(), human) : null;
+      });
+    } else if (e.type === 'trunk.moved' && !(id && this.mine.has(id))) {
+      const files = Array.isArray(d.files) ? d.files.filter((f): f is string => typeof f === 'string') : [];
+      if (files.length === 0) return;
+      this.later(`trunk:${String(d.to)}`, null, async () => {
+        const held = new Set([...this.held.values()].flatMap((c) => c.files));
+        const modified = await this.modifiedFiles();
+        const h = files.filter((f) => held.has(f));
+        const m = files.filter((f) => !held.has(f) && modified.has(f));
+        return h.length || m.length ? noticeText.trunkMoved(d, h, m) : null;
+      });
+    }
+  }
+
+  /** A notice that needs a hub or git call first; said once per key, best effort. */
+  private later(key: string, landing: string | null, make: () => Promise<string | null>): void {
+    if (this.noticed.has(key)) return;
+    this.noticed.add(key);
+    void make().then(
+      (t) => {
+        if (t !== null && !this.halted) this.notice(t, t, landing ? { landing, key } : null);
+      },
+      (err: unknown) => this.opts.log?.(`notice ${key} failed: ${(err as Error).message}`),
+    );
+  }
+
+  private async landingOf(id: string): Promise<Landing | null> {
+    try {
+      return await this.client.landing(id);
+    } catch {
+      return null;
+    }
+  }
+
+  /** The trunk branch's name, from trunk's agenthub.json (lenient). */
+  private trunkName(): string {
+    return this.landConfig()?.trunk ?? 'main';
+  }
+
+  private landConfig() {
+    if (!this.opts.root) return null;
+    try {
+      return teamSections(this.opts.root, { strict: false }).sections.land;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Files this checkout changed: committed since its merge base with trunk, and uncommitted tracked changes. */
+  private async modifiedFiles(): Promise<Set<string>> {
+    const out = new Set<string>();
+    const land = this.landConfig();
+    if (!this.opts.root || !land) return out;
+    const g = gitops.open(this.opts.root, { isolated: false });
+    try {
+      const base = await gitops.mergeBase(g, 'HEAD', `refs/remotes/${land.remote}/${land.trunk}`);
+      if (base) for (const f of await gitops.diffNames(g, base, 'HEAD')) out.add(f);
+    } catch {
+      // no trunk fetched yet, or no commits: the uncommitted changes still count
+    }
+    try {
+      const st = (await g.run(['--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=no'])).stdout.split('\0');
+      for (let i = 0; i < st.length; i++) {
+        const rec = st[i];
+        if (rec.length < 4) continue;
+        out.add(rec.slice(3).normalize('NFC'));
+        if (rec[0] === 'R' || rec[0] === 'C') out.add((st[++i] ?? '').normalize('NFC'));
+      }
+    } catch {
+      // git failed: the committed changes are what we know
+    }
+    return out;
+  }
+
+  /** `git fetch` of trunk into its remote-tracking ref, in the background, one at a time (a request meanwhile runs once more after). */
+  private fetchTrunkSoon(): void {
+    if (!this.opts.root || this.halted) return;
+    if (this.fetching) {
+      this.fetchAgain = true;
+      return;
+    }
+    const root = this.opts.root;
+    this.fetching = (async () => {
+      do {
+        this.fetchAgain = false;
+        const land = this.landConfig();
+        if (!land) break;
+        const error = await fetchTrunk(gitops.open(root, { isolated: false }), land.remote, land.trunk, FETCH_TIMEOUT_MS);
+        if (error) this.opts.log?.(`background fetch of ${land.trunk} failed: ${error}`);
+      } while (this.fetchAgain && !this.halted);
+    })().finally(() => {
+      this.fetching = null;
+    });
   }
 
   private scheduleHeartbeat(delayMs: number): void {
@@ -486,4 +668,8 @@ export class Feed {
       this.scheduleHeartbeat(Math.max(0, this.lastBeatAt + this.periodMs - Date.now()));
     }
   }
+}
+
+function paths(d: Record<string, unknown>): string[] {
+  return Array.isArray(d.paths) ? d.paths.filter((p): p is string => typeof p === 'string') : [];
 }

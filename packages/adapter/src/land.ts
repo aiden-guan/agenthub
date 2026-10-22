@@ -379,7 +379,10 @@ export async function waitForLanding(deps: LandDeps, id: string, timeoutMs: numb
     const restarts = waiter.restarts;
     const seq = await client.latestSeq();
     const l = await client.landing(id);
-    if (SETTLED.has(l.status)) return { text: await renderLanding(deps, l, { since: started }), landing: l };
+    if (SETTLED.has(l.status)) {
+      deps.feed?.seenLanding(l); // the brief says it all: no notice of it on top
+      return { text: await renderLanding(deps, l, { since: started }), landing: l };
+    }
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
       return { text: `Still waiting after ${Math.round(timeoutMs / 1000)}s. ${await renderLanding(deps, l, {})}`, landing: l };

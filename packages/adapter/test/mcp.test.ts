@@ -9,7 +9,7 @@ import { Feed } from '../src/feed.js';
 import { createMcpServer } from '../src/mcp.js';
 import { A, B, PROJECT, client, failingHub, git, hubCli, makeRepo, preToolUseInput, sessionEventInput, sleep, startHub, testEnv, type SampleRepo } from './helpers.js';
 
-const TOOLS = ['claim', 'decide', 'hub_post', 'hub_status', 'hub_wait', 'inbox', 'land', 'land_cancel', 'landing_status', 'release', 'task_create', 'task_list', 'task_take'];
+const TOOLS = ['claim', 'decide', 'hub_post', 'hub_status', 'hub_sync', 'hub_wait', 'inbox', 'land', 'land_cancel', 'landing_status', 'release', 'task_create', 'task_list', 'task_take'];
 
 let srv: RunningServer;
 let repo: SampleRepo;

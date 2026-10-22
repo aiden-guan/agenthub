@@ -7,13 +7,15 @@ const HELP = `hub — agenthub adapter
 
 Agent integration
   hub mcp                    Run the MCP stdio server (tools: hub_status, task_list, task_take, task_create,
-                             claim, release, hub_wait, hub_post, inbox, decide, land, landing_status, land_cancel)
+                             claim, release, hub_wait, hub_post, inbox, decide, land, landing_status, land_cancel, hub_sync)
   hub hook pre-edit          Claude Code PreToolUse hook (Edit|Write|MultiEdit|NotebookEdit): claim the file or deny the edit
   hub hook post-edit         Claude Code PostToolUse hook: confirm the claim of an edit that ran
-  hub hook settle            Claude Code Stop/SubagentStop/UserPromptSubmit/SessionEnd hook: release claims of edits that never ran
-  hub hook digest            Claude Code SessionStart hook: team state as additionalContext
+  hub hook settle            Claude Code Stop/SubagentStop/UserPromptSubmit/SessionEnd hook: release claims of edits that never ran;
+                             on UserPromptSubmit, sync the workspace with trunk (a safe point)
+  hub hook digest            Claude Code SessionStart hook: sync the workspace with trunk, then team state as additionalContext
   hub guard                  git pre-commit hook (also prepare-commit-msg for revert/cherry-pick/rebase, pre-merge-commit for merges, pre-applypatch for am):
                              reject commits touching files others hold exclusively
+  hub guard --pre-push       git pre-push hook: refuse pushes to trunk and to the lander's candidate refs (HUB_GUARD=off bypasses it)
   hub init [--agent human/agent] [--project ID] [--url URL] [--command CMD] [--no-hooks] [--no-mcp] [--no-guard]
                              Write .hub.json, .claude/settings.json hooks, .mcp.json and the pre-commit guard
 
@@ -40,6 +42,10 @@ Landing queue (with a "land" section in trunk's agenthub.json; without one, land
   hub lander | hub lander resume [--accept-trunk SHA]
                              The lander lease, standbys and pause flag; resume needs approver credentials and a terminal
   hub doctor                 Check the config (strictly), the hub, push access to land refs and git features
+  hub sync [--merge] [--recover]
+                             Bring the workspace up to trunk: fast-forward, or replay unlanded commits (one git reset --keep,
+                             with a backup ref; never with uncommitted changes); --merge merges trunk into the branch instead;
+                             --recover clears an interrupted sync's record once a human has looked
 
 Configuration (env wins over files): HUB_URL (default http://127.0.0.1:7077), HUB_AGENT, HUB_PROJECT,
 HUB_TOKEN, HUB_FAIL_CLOSED, HUB_TIMEOUT_MS; files: <worktree>/.hub.json, ~/.config/agenthub/config.json
@@ -80,7 +86,8 @@ async function main(argv: string[]): Promise<void> {
       return finish({ stderr: 'usage: hub hook pre-edit | post-edit | settle | digest\n', exitCode: 2 });
     }
     case 'guard': {
-      const { guard } = await import('./guard.js');
+      const { guard, prePushGuard } = await import('./guard.js');
+      if (rest.includes('--pre-push')) return finish(prePushGuard({ cwd: process.cwd(), env: process.env, stdin: await readStdin() }));
       return finish(await guard({ cwd: process.cwd(), env: process.env, sequencer: rest.includes('--sequencer'), merge: rest.includes('--merge') }));
     }
     case 'init': {

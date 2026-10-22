@@ -5,12 +5,13 @@ import type { Landing, LandingStats, TaskStatus } from '@agenthub/hub/protocol';
 import { approverCredentials, decideCommand, landerCommand, processTerminal } from './approve.js';
 import { HubApiError, HubClient, classifyFailure } from './client.js';
 import { hasOwnSettings, loadConfig, teamSections, type HubConfig } from './config.js';
-import { claimFiles, formatDecision, formatMessage, formatTask, landingLine, landingsText, statsText, statusText, UNTRUSTED_NOTE } from './format.js';
+import { claimFiles, formatDecision, formatMessage, formatTask, landingLine, landingsText, statsText, statusText, syncToolText, UNTRUSTED_NOTE } from './format.js';
 import { claimKey, lendIdentity, lendingSessions } from './checkout.js';
 import { fullHead, headCommit } from './git.js';
 import { commitGuardOff } from './guard-status.js';
 import { landWork, renderLanding } from './land.js';
 import { adoptClaims } from './pending.js';
+import { syncWorkspace } from './sync.js';
 import type { HookOutcome } from './hooks.js';
 
 const ok = (stdout: string): HookOutcome => ({ stdout, stderr: '', exitCode: 0 });
@@ -226,6 +227,17 @@ async function command(cfg: HubConfig, cmd: string, argv: string[]): Promise<Hoo
     case 'lander': {
       const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { 'accept-trunk': { type: 'string' } } });
       return landerCommand(client, { sub: positionals[0], acceptTrunk: values['accept-trunk'], env: process.env, term: processTerminal() });
+    }
+
+    case 'sync': {
+      const { values } = parseArgs({ args: argv, options: { merge: { type: 'boolean' }, recover: { type: 'boolean' } } });
+      need();
+      if (!cfg.root) return fail('hub sync: not in a git checkout', 2);
+      const r = await syncWorkspace(cfg.root, cfg, client, { reason: 'explicit', mode: values.merge ? 'merge' : 'update', recover: values.recover });
+      const text = syncToolText(r);
+      // Exit 0 when the workspace is where it should be (or was left alone on purpose, dirty); 1 when the sync couldn't do its job.
+      const fine = r.kind === 'up_to_date' || r.kind === 'synced' || r.kind === 'merged' || r.kind === 'behind_dirty' || (r.kind === 'needs_human' && r.cleared);
+      return fine ? ok(text) : fail(text);
     }
 
     case 'doctor':

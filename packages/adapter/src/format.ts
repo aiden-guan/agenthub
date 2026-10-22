@@ -17,6 +17,7 @@ import type {
   StatusResult,
   Task,
 } from '@agenthub/hub/protocol';
+import type { SyncResult } from './sync.js';
 
 /**
  * Everything another agent wrote (message bodies, claim intents, decision
@@ -622,6 +623,8 @@ export interface DigestExtras {
   stats?: LandingStats | null;
   /** The trunk branch name, from agenthub.json. */
   trunk?: string;
+  /** What the SessionStart sync did, as one `Trunk: …` line (syncDigestLine); null or absent when there is nothing to say. */
+  trunkLine?: string | null;
 }
 
 /** The SessionStart digest's landing lines (design §2.3.4), each capped and each omitted when empty. */
@@ -662,6 +665,7 @@ function digestLandingLines(s: StatusResult, me: string, extras: DigestExtras): 
     const items = relay.slice(0, 3).map((l) => `${l.id} by ${l.agent} (${inline(l.approval.flatMap((r) => r.rules.flatMap((rule) => rule.paths)).filter((p, i, a) => a.indexOf(p) === i).join(', '), 80)})`);
     out.push(`Waiting for an approval you can relay: ${items.join(', ')}. Tell ${human}: \`hub approve ${relay[0].id}\` in a terminal.`);
   }
+  if (extras.trunkLine) out.push(extras.trunkLine);
   return out;
 }
 
@@ -1168,3 +1172,244 @@ function genericBrief(l: Landing, c: BriefContext): string {
   lines.push(UNTRUSTED_BRIEF);
   return lines.join('\n');
 }
+
+// ------------------------------------------------------------------ workspace sync (design §2.3.5)
+
+/** `3 landings` when every incoming trunk commit is a landing, else `3 commits`. */
+function incomingCount(commits: number, landings: readonly string[]): string {
+  const n = Math.max(commits, landings.length);
+  const what = n > 0 && landings.length >= n ? 'landing' : 'commit';
+  return `${n} ${what}${n === 1 ? '' : 's'}`;
+}
+
+/** Foreign commits among the incoming ones: `1 commit pushed outside the landing queue`. */
+function foreignCount(commits: number, landings: readonly string[]): string {
+  const n = Math.max(0, commits - landings.length);
+  return n ? `${n} commit${n === 1 ? '' : 's'} pushed outside the landing queue` : '';
+}
+
+/** What came in, by landing: `L-1 and L-2`, `L-1 and 1 commit pushed outside the landing queue`. */
+function incomingIds(commits: number, landings: readonly string[]): string {
+  const ids = landings.slice(0, 6).map(word);
+  if (landings.length > 6) ids.push(`${landings.length - 6} more landings`);
+  const foreign = foreignCount(commits, landings);
+  return andList([...ids, ...(foreign ? [foreign] : [])]) || 'new commits';
+}
+
+/** `L-1 landed`, `L-1 landed, with 1 commit pushed outside the landing queue`, or the foreign commits alone. */
+function incomingLanded(commits: number, landings: readonly string[]): string {
+  const foreign = foreignCount(commits, landings);
+  if (!landings.length) return foreign || 'new commits';
+  const ids = andList([...landings.slice(0, 6).map(word), ...(landings.length > 6 ? [`${landings.length - 6} more`] : [])]);
+  return `${ids} landed${foreign ? `, with ${foreign}` : ''}`;
+}
+
+/** Changed files as `a, b, c +2 more` (the files a sync or merge brought in). */
+function changedList(files: readonly string[], max = 6): string {
+  return files.length <= max ? showNames(files) : `${showNames(files.slice(0, max))} +${files.length - max} more`;
+}
+
+const RECOVERED_TEXT = {
+  unapplied: 'An interrupted sync had changed nothing; its record is cleared. ',
+  finished: 'An interrupted sync had finished; its record is cleared. ',
+};
+
+const MERGE_HINT = 'call hub_sync {"mode": "merge"}';
+
+/** Why a sync changed nothing, and what to do (hub_sync and `hub sync`). */
+function skippedText(r: Extract<SyncResult, { kind: 'skipped' }>): string {
+  const trunk = r.trunk ?? 'trunk';
+  const detail = inline(r.detail, 300);
+  switch (r.reason) {
+    case 'no_queue':
+      return 'This project has no landing queue (no land section in agenthub.json on trunk), so there is no trunk to sync to. Nothing was changed.';
+    case 'sync_running':
+      return 'Another workspace sync is running in this checkout; call hub_sync again in a few seconds. Nothing was changed.';
+    case 'edit_in_flight':
+      return "An edit in this checkout is still in flight (a tool call waiting for permission, or one not finished yet), so the workspace wasn't touched. It syncs at your next prompt, or call hub_sync again once that edit is done.";
+    case 'fetch_failed':
+      return `Fetching ${trunk} failed (${detail}), so nothing was changed.`;
+    case 'git_operation':
+      return `A ${detail} is in progress in this checkout; finish or abort it first. Nothing was changed.`;
+    case 'detached_head':
+      return 'HEAD is detached (not on a branch), so sync leaves it alone; check out your branch first. Nothing was changed.';
+    case 'landing_in_flight':
+      return (
+        `Your landing ${word(r.detail)} has commits of this branch and is still in the queue; replaying them now would duplicate them under new shas. ` +
+        `The workspace syncs once it lands or comes back (hub_wait {"landing_id": "${word(r.detail)}"}). Nothing was changed.`
+      );
+    case 'hub_unavailable':
+      return `The hub can't say which of your landings are in flight (${detail}); without it only a fast-forward may go ahead, and this isn't one. Nothing was changed.`;
+    case 'lander_paused':
+      return `Landing is paused (${word(r.detail)}), so sync doesn't replay your commits onto ${trunk} now. Nothing was changed.`;
+    case 'merges_in_branch':
+      return `Your branch has unlanded merge commits, which sync does not replay; ${MERGE_HINT} to merge ${trunk} into your branch instead. Nothing was changed.`;
+    case 'changed_meanwhile':
+      return `git refused to move the worktree (${detail}): something changed while the sync was being prepared, or an untracked file is in the way of one ${trunk} adds. Nothing was changed; move that file aside, or call hub_sync again.`;
+    case 'timeout':
+      return 'The sync ran out of time before changing anything; it tries again at your next prompt (or call hub_sync).';
+    case 'dirty':
+      return `Commit first: merging ${trunk} needs a clean worktree. Uncommitted: ${detail}. Nothing was changed.`;
+    case 'merge_refused':
+      return `git merge refused (${detail}); nothing was changed.`;
+  }
+}
+
+/** A ref name this checkout's git wrote (a backup ref): no control characters, capped. */
+function refText(ref: string): string {
+  return ref.replace(CONTROL, '').slice(0, 300);
+}
+
+function needsHumanText(r: Extract<SyncResult, { kind: 'needs_human' }>): string {
+  const ref = refText(r.backup_ref);
+  if (r.cleared) {
+    return `Cleared the record of an interrupted sync. HEAD is at ${short(r.head)}; before the sync it was ${short(r.orig_head)}, kept in ${ref} (to go back: git reset --keep ${ref}). Edits are allowed again.`;
+  }
+  return (
+    `A workspace sync was interrupted, and HEAD has moved since (it is at ${short(r.head)}; it was ${short(r.orig_head)} and was to become ${short(r.target)}), so nothing was touched. ` +
+    `Edits in this checkout are blocked until your human looks: the tip before the sync is kept in ${ref}. Tell your human to run \`hub sync --recover\` here.`
+  );
+}
+
+function conflictSentence(r: Extract<SyncResult, { kind: 'conflict' }>, lead: string): string {
+  return (
+    `${lead} your commit ${short(r.commit)} onto ${r.trunk} ${short(r.tip)} conflicts in ${fileAnd(r.files)}; your workspace is unchanged. ` +
+    `Land anyway (the lander's merge ladder may resolve it) or ${MERGE_HINT} to resolve it now.`
+  );
+}
+
+function behindDirtySentence(r: Extract<SyncResult, { kind: 'behind_dirty' }>): string {
+  return (
+    `${r.trunk} moved (${incomingIds(r.behind, r.landings)}). Your workspace wasn't updated because you have uncommitted changes (${listCapped(r.uncommitted, 5)}); ` +
+    `merging them ${r.conflicts.length ? `would conflict in ${fileAnd(r.conflicts)}` : 'would not conflict'}. It updates at a later prompt once you commit, or call hub_sync after committing.`
+  );
+}
+
+function syncedSentence(r: Extract<SyncResult, { kind: 'synced' }>, lead: string): string {
+  const what = `${incomingLanded(r.commits, r.landings)}${r.files.length ? `: ${changedList(r.files)} changed` : ''}`;
+  const replay = r.replayed ? `; replayed your ${r.replayed} unlanded commit${r.replayed === 1 ? '' : 's'} on top` : '';
+  return `${lead} your workspace to ${r.trunk} ${short(r.tip)} (${what})${replay}.${r.files.length ? ' Re-read those files before editing them.' : ''} Undo: git reset --keep ${refText(r.backup_ref)}.`;
+}
+
+/** What hub_sync and `hub sync` answer, for every outcome. */
+export function syncToolText(r: SyncResult): string {
+  const recovered = r.recovered ? RECOVERED_TEXT[r.recovered] : '';
+  switch (r.kind) {
+    case 'up_to_date':
+      return `${recovered}Your workspace is up to date with ${r.trunk} ${short(r.tip)}.`;
+    case 'synced':
+      return recovered + syncedSentence(r, 'Synced');
+    case 'behind_dirty':
+      return recovered + behindDirtySentence(r);
+    case 'conflict':
+      return recovered + conflictSentence(r, 'Replaying');
+    case 'merged':
+      return `${recovered}Merged ${r.trunk} ${short(r.tip)} into your branch (${incomingLanded(r.behind, r.landings)}): ${changedList(r.files)} changed. Re-read those files before editing them, then land when ready.`;
+    case 'merge_conflict':
+      return (
+        `${recovered}Merging ${r.trunk} ${short(r.tip)} into your branch stopped at conflicts in ${fileAnd(r.files)}; they hold conflict markers now. ` +
+        'Resolve them keeping both intents, `git add` them and `git commit`, then call land again. To back out instead: git merge --abort.'
+      );
+    case 'needs_human':
+      return needsHumanText(r);
+    case 'skipped':
+      return recovered + skippedText(r);
+  }
+}
+
+/**
+ * The settle hook's additionalContext at UserPromptSubmit: only when the sync
+ * changed something, found a conflict, found the worktree behind and dirty,
+ * or found an interrupted sync that needs a human (edits are blocked then).
+ */
+export function syncPromptText(r: SyncResult): string | null {
+  switch (r.kind) {
+    case 'synced':
+      return `agenthub ${syncedSentence(r, 'synced')}`;
+    case 'conflict':
+      return `agenthub: ${conflictSentence(r, 'replaying')}`;
+    case 'behind_dirty':
+      return `agenthub: ${behindDirtySentence(r)}`;
+    case 'needs_human':
+      return r.cleared ? null : `agenthub: ${needsHumanText(r)}`;
+    default:
+      return null;
+  }
+}
+
+/** The digest's `Trunk:` line for what the SessionStart sync did; null when there is nothing to say. */
+export function syncDigestLine(r: SyncResult): string | null {
+  switch (r.kind) {
+    case 'synced': {
+      const replay = r.replayed ? `; your ${r.replayed} unlanded commit${r.replayed === 1 ? ' was' : 's were'} replayed on top` : '';
+      const reread = r.files.length ? ` Re-read ${fileAnd(r.files)} before editing ${r.files.length === 1 ? 'it' : 'them'}.` : '';
+      return `Trunk: your worktree was clean and is now at ${r.trunk} ${short(r.tip)} (${incomingCount(r.commits, r.landings)}${replay}).${reread} Undo: git reset --keep ${refText(r.backup_ref)}.`;
+    }
+    case 'behind_dirty':
+      return (
+        `Trunk: your worktree is ${incomingCount(r.behind, r.landings)} behind ${r.trunk} and has uncommitted changes, so it wasn't touched; ` +
+        `merging would ${r.conflicts.length ? `conflict in ${fileAnd(r.conflicts)}` : 'not conflict'}.`
+      );
+    case 'conflict':
+      return (
+        `Trunk: your worktree is ${incomingCount(r.behind, r.landings)} behind ${r.trunk}; replaying your commit ${short(r.commit)} onto it conflicts in ${fileAnd(r.files)}, so it wasn't touched. ` +
+        `Land anyway (the lander's merge ladder may resolve it) or ${MERGE_HINT} to resolve it now.`
+      );
+    case 'needs_human':
+      return r.cleared ? null : `Trunk: ${needsHumanText(r)}`;
+    case 'skipped':
+      return r.reason === 'merges_in_branch' ? `Trunk: ${skippedText(r)}` : null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * What settle remembers having said, so an unchanged state isn't said again at
+ * every prompt: the outcome's kind and what makes it this state.
+ */
+export function syncNoticeKey(r: SyncResult): string {
+  switch (r.kind) {
+    case 'synced':
+      return `synced ${r.to}`;
+    case 'behind_dirty':
+      return `behind_dirty ${r.tip} ${r.conflicts.join(',')} ${r.uncommitted.join(',')}`;
+    case 'conflict':
+      return `conflict ${r.tip} ${r.commit}`;
+    case 'needs_human':
+      return `needs_human ${r.orig_head} ${r.head}`;
+    default:
+      return r.kind;
+  }
+}
+
+// ------------------------------------------------------------------ feed notices (design §2.3.4)
+
+/** Event data as the notices read them: fixed codes and ids only (§1.8), each run through `word`. */
+type NoticeData = Record<string, unknown>;
+
+function taskPart(d: NoticeData): string {
+  return typeof d.task_id === 'string' && d.task_id ? ` for ${word(d.task_id)}` : '';
+}
+
+export const notices = {
+  landed: (d: NoticeData, trunk: string) =>
+    `${word(d.landing_id)}${taskPart(d)} landed on ${trunk} as ${short(String(d.trunk_sha ?? ''))}; your holds are released. Your worktree updates to ${trunk} at your next prompt (or call hub_sync now).`,
+  failed: (d: NoticeData) =>
+    `${word(d.landing_id)}${taskPart(d)} came back (${word(d.code)}): call landing_status {"landing_id": "${word(d.landing_id)}"} for exactly what to fix, then fix it, commit on top and land again (you keep your place).`,
+  cancelled: (d: NoticeData, by: string) =>
+    `${word(d.landing_id)}${taskPart(d)} was cancelled by ${word(by) || 'a human'}; its task and the claims it held are yours again.`,
+  parked: (d: NoticeData, paths: readonly string[], approvers: string[] | null) =>
+    `${word(d.landing_id)}${taskPart(d)} passed its checks and waits for an approval (${showNames(paths)}): tell your human to run \`hub approve ${word(d.landing_id)}\` in a terminal ` +
+    `(${approvers === null ? 'any approver' : orList(approvers) || 'an approver'} may approve; you can't).`,
+  inDoubt: (d: NoticeData) =>
+    `${word(d.landing_id)}${taskPart(d)} is waiting for a lander: the lander went offline while pushing it; any lander resolves it when it starts. hub_wait {"landing_id": "${word(d.landing_id)}"} tells you how it ends.`,
+  relay: (d: NoticeData, paths: readonly string[], human: string) =>
+    `${word(d.landing_id)} by ${word(d.agent)}${taskPart(d)} needs an approval of ${showNames(paths)}, which your human ${word(human)} may give: ` +
+    `tell ${word(human)} to run \`hub approve ${word(d.landing_id)}\` in a terminal. You can't approve it.`,
+  trunkMoved: (d: NoticeData, held: readonly string[], modified: readonly string[]) => {
+    const who = typeof d.landing_id === 'string' && d.landing_id ? word(d.landing_id) : 'a commit pushed outside the landing queue';
+    const parts = [held.length ? `${fileAnd(held)}, which you hold` : '', modified.length ? `${fileAnd(modified)}, which you have modified` : ''].filter(Boolean);
+    return `trunk moved: ${who} changed ${parts.join(', and ')}; call hub_sync when your worktree is clean.`;
+  },
+};

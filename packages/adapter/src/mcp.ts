@@ -18,11 +18,13 @@ import {
   queueLines,
   showNames,
   statusText,
+  syncToolText,
 } from './format.js';
 import { claimKey } from './checkout.js';
 import { currentBranch, headCommit } from './git.js';
 import { landWork, renderLanding, waitForLanding } from './land.js';
 import { adoptClaims } from './pending.js';
+import { syncWorkspace } from './sync.js';
 
 export const VERSION = '0.1.0';
 
@@ -371,6 +373,32 @@ export function createMcpServer({ cfg, client, feed, cwd, env = process.env }: D
   );
 
   server.registerTool(
+    'hub_sync',
+    {
+      title: 'Sync your workspace with trunk',
+      description:
+        'Bring your worktree up to the latest trunk. update (default): with a clean tracked worktree, fast-forwards it, or replays your unlanded commits onto trunk ' +
+        '(all in one git reset --keep, with a backup ref to undo it); it never touches uncommitted changes, never runs during an edit or while one of your landings is in flight, ' +
+        'and changes nothing on a conflict. merge: merges trunk into your branch (git merge), leaving any conflicts for you to resolve and commit.',
+      inputSchema: {
+        mode: z.enum(['update', 'merge']).optional().describe('update (default) or merge'),
+      },
+    },
+    tool(async ({ mode }: { mode?: 'update' | 'merge' }) => {
+      me();
+      if (!cfg.root) throw new ToolError('This is not a git checkout, so there is no workspace to sync.');
+      let r;
+      try {
+        r = await syncWorkspace(cfg.root, cfg, client, { reason: 'explicit', mode });
+      } catch (err) {
+        // Thrown only before anything changed (a failure once the worktree moves is an outcome).
+        throw new ToolError(`hub_sync failed (${inline((err as Error).message, 400)}); nothing was changed.`);
+      }
+      return { text: syncToolText(r), error: r.kind === 'needs_human' && !r.cleared };
+    }),
+  );
+
+  server.registerTool(
     'land',
     {
       title: 'Land finished work',
@@ -406,7 +434,11 @@ export function createMcpServer({ cfg, client, feed, cwd, env = process.env }: D
     },
     tool(async (args: { landing_id?: string; log?: 'tail' | 'full' }) => {
       const agent = me();
-      if (args.landing_id) return renderLanding(deps, await client.landing(args.landing_id), { log: args.log });
+      if (args.landing_id) {
+        const l = await client.landing(args.landing_id);
+        feed?.seenLanding(l);
+        return renderLanding(deps, l, { log: args.log });
+      }
       const { trunk, check } = viewOptions();
       const mine = await client.landings({ agent, limit: 50 });
       const live = mine.filter((l) => LIVE.has(l.status));
@@ -443,6 +475,7 @@ export function createMcpServer({ cfg, client, feed, cwd, env = process.env }: D
         if (err instanceof HubApiError && err.code === 'landing_closed') return { text: `${landing_id} has already ended, so there is nothing to cancel: ${err.message}`, error: true };
         throw err;
       }
+      feed?.seenLanding(l);
       return renderLanding(deps, l, {});
     }),
   );
@@ -482,6 +515,7 @@ export async function runMcp(): Promise<void> {
     ? new Feed(client, {
         info: { client: 'mcp', branch: cfg.root ? (currentBranch(cfg.root) ?? undefined) : undefined, worktree: cfg.root ?? undefined },
         log,
+        root: cfg.root,
       })
     : null;
   if (!cfg.agent) log('no agent identity configured (HUB_AGENT or .hub.json); tools that act for you will refuse');
