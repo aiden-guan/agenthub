@@ -9,6 +9,11 @@ export type ClaimStatus = 'active' | 'queued' | 'released' | 'expired';
 
 /** One entry of a claim's scope. Phase 1 compares files only; `symbol` is stored for Phase 3. */
 export interface ScopeEntry {
+  /**
+   * Repo-relative POSIX path, stored and compared in NFC form. The hub answers
+   * 400 `invalid_path` for control, line-separator or bidi characters, an
+   * unpaired surrogate, an absolute path, or a `.`, `..` or empty segment.
+   */
   file: string;
   symbol?: string;
 }
@@ -17,6 +22,7 @@ export interface Claim {
   id: string;
   project: string;
   holder: string;
+  /** The request's task_id, else the holder's one task in progress when the claim was made (or, if it had none, renewed). */
   task_id: string | null;
   scope: ScopeEntry[];
   mode: ClaimMode;
@@ -69,10 +75,19 @@ export interface ClaimResult {
   conflicts: ClaimConflict[];
   /** Position in the queue (1 = next), only when queued. */
   position?: number;
+  /**
+   * Only when denied, and only when waiting would deadlock: a holder in the way is
+   * itself waiting, directly or not, for a claim of yours. Names the claims and
+   * agents in the cycle (no paths or intents) and which of your claims to release.
+   * When the holder only waits in line behind a queued claim of yours, it also says
+   * that asking again with `queue: true` works: the hub then reorders that line.
+   */
+  deadlock?: string;
   now: number;
   seq: number;
 }
 
+/** `claim_id`, `task_id` and `files` narrow each other (`files` drops just those files from a claim); `all` alone names every claim of yours. */
 export interface ReleaseRequest {
   claim_id?: string;
   files?: string[];
@@ -105,9 +120,24 @@ export interface HeartbeatResult {
   seq: number;
 }
 
+/** POST /claims/check. */
+export interface CheckRequest {
+  files: string[];
+  /**
+   * Without it (the guard): only other agents' active exclusive claims count.
+   * With it: for each file, the claims a `queue: false` request of the caller's
+   * for that file alone in this mode would be denied for, queued waiters
+   * included (`hub_wait` asks with `auto`, as the edit hook claims). Older hubs
+   * ignore it.
+   */
+  mode?: ClaimRequestMode;
+}
+
 export interface CheckResult {
-  /** Active exclusive claims by other agents on the given files. */
+  /** Active exclusive claims by other agents on the given files; with `mode`, what such a request would be denied for. */
   conflicts: ClaimConflict[];
+  /** Only with `mode`: waiting for these conflicts would never end (see ClaimResult.deadlock). */
+  deadlock?: string;
   now: number;
   seq: number;
 }
@@ -125,7 +155,7 @@ export interface Task {
   created_by: string | null;
   created_at: number;
   updated_at: number;
-  /** Dependencies that are not done yet. A task with any is blocked and can't be taken. */
+  /** Dependencies that are not done yet. A task with any is blocked: it can't be taken or completed (409 `task_blocked`). */
   blocked_by: string[];
 }
 
@@ -190,7 +220,11 @@ export interface LandRequest {
   branch?: string;
   commit?: string;
   summary?: string;
-  /** Release the claims tied to the task (default true). */
+  /**
+   * Release the claims tied to the task, and those tied to no task once no other
+   * task of yours is in progress; claims tied to another task stay. With no
+   * task_id, release all of yours (default true).
+   */
   release_claims?: boolean;
 }
 
@@ -199,6 +233,7 @@ export interface LandResult {
   task: Task | null;
   released: Claim[];
   unblocked: string[];
+  /** For the agent: nothing was merged, and which of its claims it still holds, if any. */
   note: string;
   now: number;
   seq: number;
@@ -255,10 +290,44 @@ export interface HubEvent {
   targets: string[] | null;
 }
 
+/** GET /events. */
+export interface EventsResult {
+  /**
+   * Events after `since` the caller may see, oldest first: at most 500, from at
+   * most 5000 read. Fewer, or none, can come back while more follow: the read
+   * stopped short of `seq`, and a long-poll then answers at once.
+   */
+  events: HubEvent[];
+  /** The latest event seq. */
+  seq: number;
+  /**
+   * The `since` to pass next time: after the last event returned, or, when
+   * fewer than 500 came back, after every event read, including those the
+   * caller can't see or didn't ask for. Below `seq`, more may follow. A `since`
+   * past the latest seq is from another database (see `epoch`) and reads on
+   * from the latest seq.
+   */
+  next_since: number;
+  /** Made once per database; a new value means seqs started over. */
+  epoch: string;
+}
+
 /** Frames sent by the hub over the WebSocket feed. */
 export type FeedServerFrame =
-  | { type: 'hello'; project: string; agent: string | null; seq: number; now: number; heartbeat_interval_ms: number }
+  /**
+   * `seq` is the latest seq when the feed opened. With `since`, every event
+   * after it up to `seq` that this agent may see follows at once (a `since`
+   * past `seq` is from another database and replays nothing). `epoch` is made
+   * once per database; a new value means seqs started over.
+   */
+  | { type: 'hello'; project: string; agent: string | null; seq: number; epoch: string; now: number; heartbeat_interval_ms: number }
   | { type: 'event'; event: HubEvent }
+  /**
+   * After the events a `since` replays: `next_since` is the `since` to reconnect
+   * with, past every event the replay read, those this agent can't see included.
+   * Hubs older than it don't send it.
+   */
+  | { type: 'replayed'; next_since: number }
   | { type: 'heartbeat.ack'; renewed: number; next_heartbeat_ms: number; now: number }
   | { type: 'pong'; now: number }
   | { type: 'error'; code: string; message: string };
@@ -274,3 +343,9 @@ export interface ApiError {
 export const AGENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const CHANNEL_RE = /^#[a-z0-9][a-z0-9._-]{0,63}$/;
 export const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,127}$/;
+/**
+ * A character no repo path may contain: C0 and C1 controls, line and paragraph
+ * separators, bidi controls, and unpaired surrogates (which aren't text, and
+ * which SQLite would store as U+FFFD, so the path would never match itself).
+ */
+export const PATH_FORBIDDEN_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069\p{Cs}]/u;

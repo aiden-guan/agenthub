@@ -1,23 +1,25 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import type { Claim, ClaimResult, HubEvent, TaskStatus } from '@agenthub/hub/protocol';
+import type { ClaimResult, HubEvent, TaskStatus } from '@agenthub/hub/protocol';
 import { HubApiError, HubClient, HubUnavailableError } from './client.js';
 import { loadConfig, type HubConfig } from './config.js';
 import { Feed } from './feed.js';
 import {
   UNTRUSTED_NOTE,
   claimFiles,
-  formatClaim,
+  formatConflict,
   formatDecision,
   formatEvent,
   formatMessage,
   formatTask,
   inline,
-  minutesLeft,
+  showNames,
   statusText,
 } from './format.js';
-import { currentBranch, headCommit, toRepoPath } from './git.js';
+import { claimKey } from './checkout.js';
+import { currentBranch, headCommit } from './git.js';
+import { adoptClaims } from './pending.js';
 
 export const VERSION = '0.1.0';
 
@@ -36,6 +38,8 @@ interface Deps {
   feed: Feed | null;
   /** Directory relative file arguments resolve against. */
   cwd: string;
+  /** For reading the config of another checkout a file argument is in; default process.env. */
+  env?: NodeJS.ProcessEnv;
 }
 
 class ToolError extends Error {}
@@ -45,31 +49,43 @@ type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: bo
 function errorText(err: unknown, cfg: HubConfig): string {
   if (err instanceof ToolError) return err.message;
   if (err instanceof HubUnavailableError) return `${err.message}. Coordination is unavailable right now; tell your human if this persists.`;
-  if (err instanceof HubApiError) return `hub refused: ${err.message} (${err.code})`;
+  if (err instanceof HubApiError) {
+    // A token the config withheld from this hub comes back as an auth error: say why.
+    const why = err.status === 401 ? cfg.warnings.map((w) => ` ${w}`).join('') : '';
+    return `hub refused: ${err.message} (${err.code})${why}`;
+  }
   return `unexpected error talking to the hub at ${cfg.url}: ${(err as Error).message}`;
 }
 
 /** Build the MCP server. Exported separately from `runMcp` so tests can drive it over an in-memory transport. */
-export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
+export function createMcpServer({ cfg, client, feed, cwd, env = process.env }: Deps): McpServer {
   const server = new McpServer({ name: 'agenthub', version: VERSION }, { instructions: INSTRUCTIONS });
 
   const me = (): string => {
     if (!cfg.agent) throw new ToolError('This checkout has no agent identity. Ask your human to run `hub init --agent <human>/<agent>` or set HUB_AGENT.');
     return cfg.agent;
   };
-  const repoFiles = (files: string[]): string[] => {
-    if (!cfg.root) throw new ToolError('not inside a git repository, so file paths cannot be mapped to the shared repo');
-    return files.map((f) => {
-      const p = toRepoPath(f, cfg.root!, cwd);
-      if (!p) throw new ToolError(`${f} is outside the repository`);
-      return p;
+  // Keyed as the edit hook keys them: relative to the checkout each file is in, so a file in a
+  // worktree nested under this one (.claude/worktrees) is claimed, waited for and released by the
+  // name the hook denies it under.
+  const repoFiles = (files: string[]): string[] =>
+    files.map((f) => {
+      try {
+        return claimKey(f, cwd, cfg, env);
+      } catch (err) {
+        throw new ToolError((err as Error).message);
+      }
     });
+  // What the feed learned about this agent's claims (a lease that ran out, a hub that lost them) rides on the next tool result.
+  const noted = (text: string): string => {
+    const notices = feed?.takeNotices() ?? [];
+    return notices.length ? `${text}\n\n${notices.map((n) => `Note: ${n}`).join('\n')}` : text;
   };
   const tool = <A>(fn: (args: A) => Promise<string>) => async (args: A): Promise<ToolResult> => {
     try {
-      return { content: [{ type: 'text', text: await fn(args) }] };
+      return { content: [{ type: 'text', text: noted(await fn(args)) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: errorText(err, cfg) }], isError: true };
+      return { content: [{ type: 'text', text: noted(errorText(err, cfg)) }], isError: true };
     }
   };
 
@@ -162,6 +178,8 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         queue: args.queue ?? true,
         base_commit: cfg.root ? (headCommit(cfg.root) ?? undefined) : undefined,
       });
+      adoptClaims(cfg.root, res.claims);
+      feed?.noteClaims(res.claim ? [res.claim, ...res.claims] : res.claims);
       return describeClaimResult(res);
     }),
   );
@@ -197,7 +215,7 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
         'Block until something you are waiting for happens: files you need are released, your queued claim is granted, or a message arrives ' +
         '(any teammate activity if you pass nothing). Returns immediately if it already happened.',
       inputSchema: {
-        files: z.array(z.string()).optional().describe('Wake when these files are free of other agents\' exclusive claims'),
+        files: z.array(z.string()).optional().describe('Wake when an edit of each of these files would be allowed: no other agent holds it exclusively or waits in line for it ahead of you'),
         claim_id: z.string().optional().describe('Wake when this queued claim of yours is granted'),
         timeout_s: z.number().int().min(1).max(600).optional().describe('Give up after this many seconds (default 120)'),
       },
@@ -206,52 +224,78 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
       const agent = me();
       const files = args.files ? repoFiles(args.files) : [];
       const timeoutS = args.timeout_s ?? 120;
-      const status = await client.status();
+      const deadline = Date.now() + timeoutS * 1000;
+      const waiter = feed ?? new Feed(client);
 
-      const blockersOf = (claims: Claim[]) =>
-        claims.filter((c) => c.status === 'active' && c.holder !== agent && c.mode === 'exclusive' && c.scope.some((s) => files.includes(s.file)));
+      // What the edit hook's request for each file would be denied for, as the hub
+      // decides it: holders, and earlier waiters a later request may not overtake.
+      const blockersOf = () => client.check(files, 'auto');
       const ready = async (): Promise<string | null> => {
         if (args.claim_id) {
           const c = await client.getClaim(args.claim_id);
+          if (c.holder !== agent) return `${c.id} is ${c.holder}'s claim, not yours; wait on the id of a claim you queued.`;
           if (c.status === 'active') return `${c.id} is granted: you now hold ${claimFiles(c).join(', ')}.`;
           if (c.status !== 'queued') return `${c.id} is ${c.status}${c.end_reason ? ` (${c.end_reason})` : ''}; claim again if you still need it.`;
         }
         if (files.length) {
-          const blockers = blockersOf((await client.status()).claims);
-          if (blockers.length === 0) return `${files.join(', ')} ${files.length === 1 ? 'is' : 'are'} free of other agents' claims now. Retry your edit.`;
+          const blockers = await blockersOf();
+          if (blockers.conflicts.length === 0) return `${showNames(files)} ${files.length === 1 ? 'is' : 'are'} free of other agents' claims now. Retry your edit.`;
+          if (blockers.deadlock) {
+            return `Waiting for ${showNames(files)} would never end: ${inline(blockers.deadlock, 600)} In the way: ${blockers.conflicts.map((c) => formatConflict(c, blockers.now)).join('; ')}.`;
+          }
         }
         return null;
       };
-
-      const immediate = await ready();
-      if (immediate) return immediate;
-      if (!files.length && !args.claim_id && status.unread > 0) return `You have ${status.unread} unread message(s); read them with inbox.`;
 
       const relevant = (e: HubEvent): boolean => {
         const d = e.data as Record<string, any>;
         if (e.type === 'message.posted') return d.from !== agent;
         if (e.type === 'task.unblocked') return true;
-        if (args.claim_id && d.claim_id === args.claim_id) return true;
+        if (args.claim_id && d.claim_id === args.claim_id && d.holder === agent) return true;
         if (files.length && (e.type === 'claim.released' || e.type === 'claim.expired')) {
           return d.holder !== agent && Array.isArray(d.files) && d.files.some((f: string) => files.includes(f));
         }
+        // An agent that comes to wait for this one no longer holds it back with its other waiters (see check).
+        if (files.length && e.type === 'claim.queued' && d.holder !== agent && Array.isArray(d.waiting_for) && d.waiting_for.includes(agent)) return true;
         if (!files.length && !args.claim_id) return e.actor !== agent && e.type !== 'agent.online';
         return false;
       };
 
-      const waiter = feed ?? new Feed(client);
-      const events = await waiter.waitFor(status.seq, relevant, timeoutS * 1000);
+      // Other agents' claims and events carry their words: intents, and file names, plain ones included.
+      let othersWords = false;
+      const finish = (out: string[]): string => (othersWords || out.some((l) => l.includes('"')) ? [...out, UNTRUSTED_NOTE] : out).join('\n');
+      // A hub back on a different database ends the wait: the claims it waited on are gone with the old one.
       const lines: string[] = [];
-      if (events.length) lines.push(`Woke up after: ${events.map(formatEvent).join('; ')}.`);
+      let events: HubEvent[];
+      for (;;) {
+        const restarts = waiter.restarts;
+        const status = await client.status();
+        const immediate = await ready();
+        if (immediate) return finish([...lines, immediate]);
+        if (!files.length && !args.claim_id && status.unread > 0) return [...lines, `You have ${status.unread} unread message(s); read them with inbox.`].join('\n');
+        const res = await waiter.waitFor(status.seq, relevant, Math.max(0, deadline - Date.now()), restarts);
+        events = res.events;
+        if (!res.restarted) break;
+        // Its claim ids mean nothing on the new database (another agent's claim may have the same one).
+        if (args.claim_id) {
+          return `The hub came back with a different database while you waited, so your queued claim ${args.claim_id} is gone. Claim again if you still need it.`;
+        }
+        lines.splice(0, 1, 'The hub came back with a different database while you waited; the claims it had are gone.');
+      }
+      const said = lines.length;
+      if (events.length) {
+        othersWords = true;
+        lines.push(`Woke up after: ${events.map(formatEvent).join('; ')}.`);
+      }
       const after = await ready();
       if (after) lines.push(after);
       else if (files.length) {
-        const fresh = await client.status();
-        lines.push(`Still claimed: ${blockersOf(fresh.claims).map((c) => formatClaim(c, fresh.now, agent)).join('; ')}`);
+        const fresh = await blockersOf();
+        othersWords = true;
+        lines.push(`Still claimed: ${fresh.conflicts.map((c) => formatConflict(c, fresh.now)).join('; ')}`);
       }
-      if (!events.length) lines.unshift(`Nothing relevant happened in ${timeoutS}s.`);
-      if (lines.some((l) => l.includes('"'))) lines.push(UNTRUSTED_NOTE);
-      return lines.join('\n');
+      if (!events.length) lines.splice(said, 0, `Nothing relevant happened in ${timeoutS}s.`);
+      return finish(lines);
     }),
   );
 
@@ -346,9 +390,7 @@ export function createMcpServer({ cfg, client, feed, cwd }: Deps): McpServer {
 }
 
 function describeClaimResult(res: ClaimResult): string {
-  const holders = res.conflicts
-    .map((c) => `${c.files.join(', ')} held by ${c.holder} (${c.claim_id}, ${c.mode}) to "${inline(c.intent)}", expires in ${minutesLeft(c.expires_at, res.now)} min`)
-    .join('; ');
+  const holders = res.conflicts.map((c) => formatConflict(c, res.now)).join('; ');
   if (res.status === 'granted' && res.renewed) {
     return `You already hold ${res.claims.map((c) => `${c.id} (${claimFiles(c).join(', ')})`).join('; ')}; lease renewed.`;
   }
@@ -362,6 +404,7 @@ function describeClaimResult(res: ClaimResult): string {
       `Call hub_wait with claim_id "${res.claim.id}" to wait for the grant, message the holder with hub_post, or work on something else.\n${UNTRUSTED_NOTE}`
     );
   }
+  if (res.deadlock) return `Not granted: ${holders}. Waiting would not help: ${inline(res.deadlock, 600)}\n${UNTRUSTED_NOTE}`;
   return `Not granted: ${holders}. Message the holder with hub_post, wait with hub_wait, or take another task.\n${UNTRUSTED_NOTE}`;
 }
 

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { RunningServer } from '@agenthub/hub';
@@ -6,7 +7,7 @@ import { HubClient } from '../src/client.js';
 import type { HubConfig } from '../src/config.js';
 import { Feed } from '../src/feed.js';
 import { createMcpServer } from '../src/mcp.js';
-import { A, B, PROJECT, makeRepo, sleep, startHub, type SampleRepo } from './helpers.js';
+import { A, B, PROJECT, client, failingHub, git, hubCli, makeRepo, preToolUseInput, sessionEventInput, sleep, startHub, testEnv, type SampleRepo } from './helpers.js';
 
 const TOOLS = ['claim', 'decide', 'hub_post', 'hub_status', 'hub_wait', 'inbox', 'land', 'release', 'task_create', 'task_list', 'task_take'];
 
@@ -27,12 +28,12 @@ afterAll(async () => {
 });
 
 /** An MCP client connected to a fresh `hub mcp` server for `agent`, with a live feed. */
-async function connect(agent: string, root: string) {
-  const cfg: HubConfig = { url: srv.url, agent, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root, configFiles: [] };
+async function connect(agent: string, root: string, env: NodeJS.ProcessEnv = testEnv({ HUB_URL: srv.url, HUB_PROJECT: PROJECT })) {
+  const cfg: HubConfig = { url: srv.url, agent, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root, configFiles: [], projectSource: 'env', warnings: [] };
   const hubClient = new HubClient(cfg);
   const feed = new Feed(hubClient, { heartbeatMs: 1000 });
   feed.start();
-  const server = createMcpServer({ cfg, client: hubClient, feed, cwd: root });
+  const server = createMcpServer({ cfg, client: hubClient, feed, cwd: root, env });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
   await server.connect(serverSide);
   const mcp = new Client({ name: 'test', version: '0' });
@@ -87,6 +88,71 @@ describe('hub mcp', () => {
     expect(res.text).toContain('src/users.ts is free of other agents\' claims now.');
   });
 
+  it('hub_wait on files agrees with the edit hook about an earlier waiter it may not overtake, and wakes once the file is free', async () => {
+    const L = 'lee/claude-1';
+    const a = await connect(A, repo.wtA);
+    const b = await connect(B, repo.wtB);
+    const lee = await connect(L, repo.wtB);
+    await a.call('claim', { files: ['src/w1.ts'], intent: 'hold w1' });
+    const queued = await b.call('claim', { files: ['src/w1.ts', 'src/w2.ts'], intent: 'both files' });
+    const waiter = /^Queued as (C-\d+)/.exec(queued.text)![1];
+    // Nobody holds src/w2.ts, yet the edit hook's request for it is denied: sam's waiter is ahead.
+    const hookAsks = () => client(srv.url, L).claim({ files: ['src/w2.ts'], mode: 'auto', queue: false });
+    expect((await hookAsks()).status).toBe('denied');
+    const quick = await lee.call('hub_wait', { files: ['src/w2.ts'], timeout_s: 1 });
+    expect(quick.text).not.toContain('free of other agents');
+    expect(quick.text).toContain(`Still claimed: sam/claude-1 (${waiter}, exclusive) waits in line for src/w2.ts ahead of you, to "both files"`);
+
+    const waiting = lee.call('hub_wait', { files: ['src/w2.ts'], timeout_s: 10 });
+    await sleep(200);
+    await a.call('release', { all: true }); // sam is granted from the queue, and now holds src/w2.ts
+    await sleep(300);
+    await b.call('release', { all: true });
+    const woke = await waiting;
+    expect(woke.text).toMatch(/Woke up after: sam\/claude-1 released C-\d+ \(src\/w1\.ts, src\/w2\.ts\)/);
+    expect(woke.text).toContain("src/w2.ts is free of other agents' claims now.");
+    expect((await hookAsks()).status).toBe('granted');
+    await client(srv.url, L).release({ all: true });
+  });
+
+  it('keys a file in a worktree nested in the session (.claude/worktrees) as the edit hook does, so hub_wait and claim agree with its denial', async () => {
+    const sub = path.join(repo.wtA, '.claude', 'worktrees', 'sub');
+    git(repo.main, 'worktree', 'add', '-q', sub, '-b', 'nested-mcp');
+    const nested = path.join(sub, 'src', 'nested.ts');
+    const sam = client(srv.url, B);
+    await sam.claim({ files: ['src/nested.ts'], intent: 'sam holds it' });
+    try {
+      // maya's edit hook, in her session, denies the nested copy under its repo path...
+      const hook = await hubCli(['hook', 'pre-edit'], {
+        cwd: repo.wtA,
+        env: testEnv({ HUB_URL: srv.url, HUB_PROJECT: PROJECT, HUB_AGENT: A, CLAUDE_PROJECT_DIR: repo.wtA }),
+        input: preToolUseInput(repo.wtA, nested),
+      });
+      expect(JSON.parse(hook.stdout).hookSpecificOutput.permissionDecisionReason).toMatch(/^src\/nested\.ts is claimed by sam\/claude-1/);
+      // ...and her MCP tools, whose directory is her session's, mean the same file by that path.
+      const a = await connect(A, repo.wtA);
+      const waited = await a.call('hub_wait', { files: [nested], timeout_s: 1 });
+      expect(waited.text).not.toMatch(/free of other agents' claims now/);
+      expect(waited.text).toMatch(/Still claimed: src\/nested\.ts held by sam\/claude-1/);
+      expect((await a.call('claim', { files: [nested], intent: 'mine next', queue: false })).text).toMatch(/^Not granted: src\/nested\.ts held by sam\/claude-1/);
+      expect((await sam.status()).claims.map((c) => c.scope[0].file)).toEqual(['src/nested.ts']);
+      // A file in another repository is not this session's to claim.
+      expect((await a.call('claim', { files: [path.join(repo.dir, 'elsewhere.ts')], intent: 'x' })).text).toMatch(/elsewhere\.ts is outside the repository/);
+    } finally {
+      await sam.release({ all: true });
+    }
+  });
+
+  it("hub_wait on another agent's claim id says so instead of reporting it as granted to you", async () => {
+    const a = await connect(A, repo.wtA);
+    const b = await connect(B, repo.wtB);
+    const id = /^Granted (C-\d+)/.exec((await a.call('claim', { files: ['src/theirs.ts'], intent: 'mine' })).text)![1];
+    const res = await b.call('hub_wait', { claim_id: id, timeout_s: 1 });
+    expect(res.text).not.toContain('is granted');
+    expect(res.text).toBe(`${id} is maya/claude-1's claim, not yours; wait on the id of a claim you queued.`);
+    await a.call('release', { all: true });
+  });
+
   it("labels other agents' messages as untrusted and keeps them from escaping the label", async () => {
     const a = await connect(A, repo.wtA);
     const b = await connect(B, repo.wtB);
@@ -132,8 +198,26 @@ describe('hub mcp', () => {
     expect(status.text).toMatch(/D-\d+ · maya\/claude-1 · just now: "Use argon2id for password hashing" \[src\/auth\.ts\]/);
   });
 
+  it('says why the hub rejected its credentials when the config withheld the token', async () => {
+    const hub = await failingHub(401, 'unauthorized', 'missing or wrong bearer token');
+    const warning = 'the hub token from HUB_TOKEN is not sent to http://127.0.0.1:1: only the committed agenthub.json names that hub.';
+    const cfg: HubConfig = { url: hub.url, agent: A, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root: repo.wtA, configFiles: [], projectSource: 'file', warnings: [warning] };
+    const server = createMcpServer({ cfg, client: new HubClient(cfg), feed: null, cwd: repo.wtA });
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const mcp = new Client({ name: 'test', version: '0' });
+    await mcp.connect(clientSide);
+    cleanups.push(async () => {
+      await mcp.close();
+      await hub.close();
+    });
+    const res = (await mcp.callTool({ name: 'hub_status', arguments: {} })) as { content: Array<{ text: string }>; isError?: boolean };
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toBe(`hub refused: missing or wrong bearer token (unauthorized) ${warning}`);
+  });
+
   it('refuses to act without an agent identity', async () => {
-    const cfg: HubConfig = { url: srv.url, agent: null, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root: repo.wtA, configFiles: [] };
+    const cfg: HubConfig = { url: srv.url, agent: null, project: PROJECT, token: null, failClosed: false, timeoutMs: 3000, root: repo.wtA, configFiles: [], projectSource: 'env', warnings: [] };
     const server = createMcpServer({ cfg, client: new HubClient(cfg), feed: null, cwd: repo.wtA });
     const [c, s] = InMemoryTransport.createLinkedPair();
     await server.connect(s);
@@ -143,6 +227,19 @@ describe('hub mcp', () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toMatch(/no agent identity/);
     await mcp.close();
+  });
+
+  it('keeps a claim the edit hook took for an edit that never ran once the agent claims the file with claim', async () => {
+    const env = testEnv({ HUB_URL: srv.url, HUB_PROJECT: PROJECT, HUB_AGENT: A });
+    const file = path.join(repo.wtA, 'docs', 'adopted.md');
+    const ids = { session: 'sess-mcp', toolUseId: 'toolu_mcp_1' };
+    expect((await hubCli(['hook', 'pre-edit'], { cwd: repo.wtA, env, input: preToolUseInput(repo.wtA, file, 'Write', ids) })).stdout).toBe('');
+    const a = await connect(A, repo.wtA);
+    expect((await a.call('claim', { files: ['docs/adopted.md'], intent: 'write the docs' })).text).toMatch(/^You already hold C-\d+ \(docs\/adopted\.md\)/);
+    await hubCli(['hook', 'settle'], { cwd: repo.wtA, env, input: sessionEventInput(repo.wtA, 'Stop', 'sess-mcp') });
+    const held = (await new HubClient({ url: srv.url, project: PROJECT, agent: A, token: null, timeoutMs: 3000 }).status()).claims;
+    expect(held.filter((c) => c.scope.some((s) => s.file === 'docs/adopted.md')).map((c) => c.holder)).toEqual([A]);
+    await a.call('release', { files: ['docs/adopted.md'] });
   });
 });
 

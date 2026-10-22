@@ -1,6 +1,7 @@
 import {
   AGENT_ID_RE,
   CHANNEL_RE,
+  PATH_FORBIDDEN_RE,
   PROJECT_RE,
   type AgentInfo,
   type CheckResult,
@@ -8,6 +9,7 @@ import {
   type ClaimConflict,
   type ClaimMode,
   type ClaimRequest,
+  type ClaimRequestMode,
   type ClaimResult,
   type Decision,
   type DecisionRequest,
@@ -36,11 +38,13 @@ export interface HubOptions {
   now?: () => number;
   /** How long a claim lives without a heartbeat. Default 2 minutes. */
   leaseTtlMs?: number;
-  /** How often adapters are asked to heartbeat. Default 30 seconds. */
+  /** How often adapters are asked to heartbeat: at most a third of the lease TTL. Default 30 seconds, or TTL/4 if less. */
   heartbeatIntervalMs?: number;
   /** An agent counts as online if seen within this window. Default = lease TTL. */
   presenceTtlMs?: number;
 }
+
+export type LeaseSettings = Required<Pick<HubOptions, 'leaseTtlMs' | 'heartbeatIntervalMs' | 'presenceTtlMs'>>;
 
 export class HubError extends Error {
   constructor(
@@ -58,11 +62,25 @@ const MAX_INTENT = 300;
 const MAX_TITLE = 200;
 const MAX_LONG_TEXT = 4000;
 const MAX_SUMMARY = 300;
-const DAY_MS = 24 * 60 * 60 * 1000;
+/** Lease TTLs a hub or a claim can have: up to a day. TTLs under a second are for tests. */
+const MIN_LEASE_TTL_MS = 100;
+const MAX_LEASE_TTL_MS = 24 * 60 * 60 * 1000;
+/** The shortest heartbeat interval a hub asks for or a claim gets (what the shortest TTL gives by default). */
+const MIN_HEARTBEAT_MS = 25;
+/** Past this many events since a wait graph was built, building a new one is cheaper than checking them. */
+const MAX_EVENTS_TO_REUSE = 100;
+/** Events read from the store at a time. */
+const EVENT_PAGE = 500;
+/**
+ * At most this many events are read from the store for one readEvents call (a
+ * GET /events, one step of a feed's replay), so a reader far behind, or behind
+ * a long run of events it can't see, can't hold up the hub: it reads on from
+ * `next_since`.
+ */
+const MAX_EVENTS_SCANNED = 5000;
 
-const LAND_NOTE =
-  'Phase 1 records the landing request only; nothing was merged. Push or merge your branch the usual way. ' +
-  'The task is marked done and its claims are released.';
+/** At most this many claims are named in a landing note. */
+const MAX_NOTE_CLAIMS = 10;
 
 /**
  * The coordination core. Every state change goes through `write()`, which
@@ -76,27 +94,50 @@ export class Hub {
   readonly leaseTtlMs: number;
   readonly heartbeatIntervalMs: number;
   readonly presenceTtlMs: number;
+  /** The store's epoch: made once per database, so clients can tell a recreated one apart. */
+  readonly epoch: string;
   private readonly clock: () => number;
   private readonly listeners = new Set<(event: HubEvent) => void>();
+  /** Every committed event up to this seq has been published to the listeners (see publish). */
+  private publishedSeq: number;
   private pending: HubEvent[] | null = null;
   private txNow = 0;
+  /** Each project's last wait graph, with the event seq it was built at (see waitGraph). */
+  private readonly waitGraphs = new Map<string, { seq: number; waits: Waits }>();
 
   constructor(opts: HubOptions) {
     this.store = opts.store;
     this.clock = opts.now ?? Date.now;
-    this.leaseTtlMs = opts.leaseTtlMs ?? 120_000;
-    this.heartbeatIntervalMs = opts.heartbeatIntervalMs ?? Math.min(30_000, Math.max(1, Math.floor(this.leaseTtlMs / 4)));
-    this.presenceTtlMs = opts.presenceTtlMs ?? this.leaseTtlMs;
+    const lease = leaseSettings(opts);
+    this.leaseTtlMs = lease.leaseTtlMs;
+    this.heartbeatIntervalMs = lease.heartbeatIntervalMs;
+    this.presenceTtlMs = lease.presenceTtlMs;
+    this.epoch = this.store.epoch();
+    this.publishedSeq = this.store.lastSeq();
   }
 
   now(): number {
     return this.clock();
   }
 
-  /** Receive every committed event (all projects). Returns an unsubscribe function. */
+  /**
+   * Receive every committed event (all projects), in seq order, including those
+   * other hub processes on the same store commit (see catchUp). Returns an
+   * unsubscribe function.
+   */
   subscribe(listener: (event: HubEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Publishes the events other hub processes on the same store committed since
+   * the last event published here. The server calls this on every sweep, so
+   * its feeds and long-polls hear of those events within a tick. This hub's
+   * own commits publish them first anyway, keeping subscribers in seq order.
+   */
+  catchUp(): void {
+    this.publish([]);
   }
 
   // ---------------------------------------------------------------- claims
@@ -108,45 +149,69 @@ export class Hub {
     if (mode !== 'exclusive' && mode !== 'shared' && mode !== 'auto') {
       throw new HubError('bad_request', 'mode must be exclusive, shared or auto');
     }
-    const ttl = clampInt(req.ttl_ms, this.leaseTtlMs, 1, DAY_MS, 'ttl_ms');
-    const heartbeat = clampInt(req.heartbeat_interval_ms, Math.min(this.heartbeatIntervalMs, Math.max(1, Math.floor(ttl / 3))), 1, ttl, 'heartbeat_interval_ms');
+    const ttl = clampInt(req.ttl_ms, this.leaseTtlMs, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS, 'ttl_ms');
+    // Heartbeats for a claim come before its lease runs out, by default three times per lease.
+    const heartbeat = clampInt(req.heartbeat_interval_ms, Math.min(this.heartbeatIntervalMs, Math.floor(ttl / 3)), MIN_HEARTBEAT_MS, ttl - 1, 'heartbeat_interval_ms');
     const intentIn = cleanText(req.intent, MAX_INTENT);
     const baseCommit = cleanText(req.base_commit, 64) || null;
+    const requestedTask = idOf(req.task_id, 'task_id');
 
-    return this.write(project, (now) => {
+    // A deadlock refusal comes back as a value so the renewal below still commits.
+    const result = this.write(project, (now): ClaimResult | HubError => {
       this.touch(project, agent, now);
       // A claim request proves the agent is alive, so it renews every lease the
       // agent holds. Agents that only run the edit hook (no heartbeating MCP
       // server) keep the files they touched earlier in the session.
-      this.renewLeases(project, agent, now);
+      const held = this.renewLeases(project, agent, now);
+      // Nobody can wait for an agent that holds nothing, so its requests need no graph.
+      const waitedFor = held.length > 0;
       const files = unique(scope.map((s) => s.file));
-      const live = this.store.claimsForFiles(project, files, ['active']);
-      const mine = live.filter((c) => c.holder === agent);
-      const others = live.filter((c) => c.holder !== agent);
-
-      // A claim of mine covers a file if it includes it with a strong enough mode.
-      const covers = (c: Claim, file: string) => hasFile(c, file) && (mode !== 'exclusive' || c.mode === 'exclusive');
-      const covering = mine.filter((c) => files.some((f) => covers(c, f)));
-      const uncovered = files.filter((f) => !mine.some((c) => covers(c, f)));
+      const { covering, uncovered, queuedOnFiles, waiters, blockers, effectiveMode, waits } = this.standing(project, agent, files, mode, waitedFor);
       if (uncovered.length === 0) {
+        // A renewal ties the claims it renews that have no task to the task it is
+        // for, as a new claim would be, so landing that task releases them (see
+        // land). A task_id that names no task ties nothing; the renewal stands.
+        const untied = covering.filter((c) => c.task_id === null);
+        const known = !requestedTask || this.store.getTask(project, requestedTask) !== null;
+        const taskId = untied.length > 0 && known ? this.resolveTaskId(project, agent, requestedTask) : null;
+        for (const c of taskId ? untied : []) {
+          c.task_id = taskId;
+          this.store.updateClaim(project, c.id, { task_id: taskId });
+        }
         return { status: 'granted', claim: covering[0], claims: covering, renewed: true, conflicts: [], now, seq: this.store.latestSeq(project) };
       }
 
-      const blocking = others.filter((c) => uncovered.some((f) => hasFile(c, f)));
-      const effectiveMode: ClaimMode =
-        mode === 'auto' ? (blocking.length > 0 && blocking.every((c) => c.mode === 'shared') ? 'shared' : 'exclusive') : mode;
-      const conflicts = blocking.filter((c) => c.mode === 'exclusive' || effectiveMode === 'exclusive').map((c) => toConflict(c, uncovered));
+      const conflicts = blockers.map((c) => toConflict(c, uncovered));
+      // A holder in the way that waits, directly or not, for a claim this agent holds
+      // would wait forever, and so would this request. That can't be queued.
+      const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(c.holder, agent));
+      const cycle = waitsForMe ? waitCycle(waits().held, agent, blockers) : null;
 
       if (conflicts.length > 0 && !req.queue) {
-        return { status: 'denied', claims: covering, renewed: covering.length > 0, conflicts, now, seq: this.store.latestSeq(project) };
+        const deadlock = denialDeadlock(waits, agent, blockers, waitsForMe, cycle);
+        return {
+          status: 'denied',
+          claims: covering,
+          renewed: covering.length > 0,
+          conflicts,
+          ...(deadlock ? { deadlock } : {}),
+          now,
+          seq: this.store.latestSeq(project),
+        };
+      }
+      if (cycle) {
+        return new HubError(
+          'deadlock',
+          `queueing would deadlock: ${cycle.steps}, so none of these claims could ever be granted. Release ${cycle.release}, or go on without this claim.`,
+          409,
+        );
       }
 
-      const taskId = this.resolveTaskId(project, agent, req.task_id);
+      const taskId = this.resolveTaskId(project, agent, requestedTask);
       const intent = intentIn || this.defaultIntent(project, taskId, uncovered);
       const claimScope = scope.filter((s) => uncovered.includes(s.file));
 
       if (conflicts.length > 0) {
-        const queuedOnFiles = this.store.claimsForFiles(project, uncovered, ['queued']);
         const existing = queuedOnFiles.find((c) => c.holder === agent && c.mode === effectiveMode && sameFiles(c, uncovered));
         let claim: Claim;
         if (existing) {
@@ -174,8 +239,14 @@ export class Hub {
             intent,
             waiting_for: unique(conflicts.map((c) => c.holder)),
           });
+          // Now that this agent waits for others, a claim queued before this one
+          // may have to let a waiter go first, which may grant that waiter. (A
+          // direct grant reorders nothing: only agents that already wait for this
+          // one come to wait for it.)
+          if (waitedFor) this.promoteQueued(project, now);
         }
-        const ahead = queuedOnFiles.filter((q) => q.id !== claim.id && q.holder !== agent && claimOrderBefore(q, claim)).length;
+        const inTheWay = new Set(blockers);
+        const ahead = waiters.filter((q) => q.id !== claim.id && (claimOrderBefore(q, claim) || inTheWay.has(q))).length;
         return {
           status: 'queued',
           claim,
@@ -201,30 +272,73 @@ export class Hub {
         seq: this.store.latestSeq(project),
       };
     });
+    if (result instanceof HubError) throw result;
+    return result;
   }
 
+  /**
+   * Where a claim request of `agent`'s for `files` in `mode` stands, as claim()
+   * decides it: the agent's claims that already cover files (`covering`), the
+   * files they don't (`uncovered`) and, for those, the other agents' claims in
+   * the way (`blockers`) and the mode a grant would have. `waitedFor`: the
+   * agent holds a claim, active or queued, so others may wait for it.
+   */
+  private standing(project: string, agent: string, files: string[], mode: ClaimRequestMode, waitedFor: boolean) {
+    const live = this.store.claimsForFiles(project, files, ['active']);
+    const mine = live.filter((c) => c.holder === agent);
+    const others = live.filter((c) => c.holder !== agent);
+    let graph: Waits | undefined;
+    const waits = () => (graph ??= this.waitGraph(project));
+
+    // A claim of mine covers a file if it includes it with a strong enough mode.
+    const covers = (c: Claim, file: string) => hasFile(c, file) && (mode !== 'exclusive' || c.mode === 'exclusive');
+    const covering = mine.filter((c) => files.some((f) => covers(c, f)));
+    const uncovered = files.filter((f) => !mine.some((c) => covers(c, f)));
+    if (uncovered.length === 0) {
+      return { covering, uncovered, queuedOnFiles: [] as Claim[], waiters: [] as Claim[], blockers: [] as Claim[], effectiveMode: (mode === 'shared' ? 'shared' : 'exclusive') as ClaimMode, waits };
+    }
+
+    // Earlier waiters stand in the way like holders do, so a later request can't
+    // overtake them. A waiter whose agent is itself waiting, directly or not, for
+    // this agent doesn't: it can't be granted before this agent lets go anyway,
+    // so this request goes ahead of it, queued or not (see waitGraph).
+    const queuedOnFiles = this.store.claimsForFiles(project, uncovered, ['queued']);
+    const theirs = queuedOnFiles.filter((q) => q.holder !== agent);
+    const waiters = theirs.filter((q) => !(waitedFor && waits().reach.has(q.holder, agent)));
+    const blocking = [...others.filter((c) => uncovered.some((f) => hasFile(c, f))), ...waiters];
+    const effectiveMode: ClaimMode =
+      mode === 'auto' ? (blocking.length > 0 && blocking.every((c) => c.mode === 'shared') ? 'shared' : 'exclusive') : mode;
+    const blockers = blocking.filter((c) => c.mode === 'exclusive' || effectiveMode === 'exclusive');
+    return { covering, uncovered, queuedOnFiles, waiters, blockers, effectiveMode, waits };
+  }
+
+  /** `claim_id`, `task_id` and `files` each narrow what is released; `all` alone names every claim of the agent's. */
   release(project: string, agent: string, req: ReleaseRequest): ReleaseResult {
     assertAgent(agent);
-    const files = req.files ? unique(req.files.map(normalizeRepoPath)) : undefined;
-    if (!req.claim_id && !files?.length && !req.task_id && !req.all) {
+    if (req.files != null && !Array.isArray(req.files)) throw new HubError('bad_request', 'files must be a list of repo paths');
+    // An empty list names no files, so it narrows nothing.
+    const files = req.files?.length ? unique(req.files.map(normalizeRepoPath)) : undefined;
+    const claimId = idOf(req.claim_id, 'claim_id');
+    const taskId = idOf(req.task_id, 'task_id');
+    if (!claimId && !files && !taskId && !req.all) {
       throw new HubError('bad_request', 'say what to release: claim_id, files, task_id or all');
     }
     return this.write(project, (now) => {
       let targets: Claim[];
-      if (req.claim_id) {
-        const c = this.store.getClaim(project, req.claim_id);
-        if (!c) throw new HubError('not_found', `no claim ${req.claim_id}`, 404);
+      if (claimId) {
+        const c = this.store.getClaim(project, claimId);
+        if (!c) throw new HubError('not_found', `no claim ${claimId}`, 404);
         if (c.holder !== agent) throw new HubError('forbidden', `${c.id} is held by ${c.holder}; only its holder can release it`, 403);
-        targets = c.status === 'active' || c.status === 'queued' ? [c] : [];
+        targets = (c.status === 'active' || c.status === 'queued') && (!taskId || c.task_id === taskId) ? [c] : [];
       } else {
-        targets = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: req.task_id });
-        if (files) targets = targets.filter((c) => c.scope.some((s) => files.includes(s.file)));
+        targets = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: taskId });
       }
+      if (files) targets = targets.filter((c) => c.scope.some((s) => files.includes(s.file)));
 
       const released: Claim[] = [];
       const trimmed: Claim[] = [];
       for (const c of targets) {
-        const remaining = files && !req.claim_id ? c.scope.filter((s) => !files.includes(s.file)) : [];
+        const remaining = files ? c.scope.filter((s) => !files.includes(s.file)) : [];
         if (remaining.length > 0) {
           const removed = unique(c.scope.filter((s) => files!.includes(s.file)).map((s) => s.file));
           this.store.updateClaim(project, c.id, { scope: remaining });
@@ -242,26 +356,53 @@ export class Hub {
   /** Renew the agent's active and queued leases (all of them, or `claim_ids`) and mark it present. */
   heartbeat(project: string, agent: string, req: HeartbeatRequest = {}): HeartbeatResult {
     assertAgent(agent);
+    const claimIds = req.claim_ids == null ? undefined : idList(req.claim_ids, 'claim_ids');
     return this.write(project, (now) => {
       this.touch(project, agent, now, {
         client: cleanText(req.client, 64) || null,
         branch: cleanText(req.branch, 200) || null,
         worktree: cleanText(req.worktree, 500) || null,
       });
-      const claims = this.renewLeases(project, agent, now, req.claim_ids);
+      const claims = this.renewLeases(project, agent, now, claimIds);
       const next = claims.length ? Math.min(...claims.map((c) => c.heartbeat_interval_ms)) : this.heartbeatIntervalMs;
       return { renewed: claims.length, claims, next_heartbeat_ms: next, now, seq: this.store.latestSeq(project) };
     });
   }
 
-  /** Active exclusive claims by anyone other than `agent` on these files (for the pre-commit guard). */
-  check(project: string, agent: string | null, files: string[]): CheckResult {
+  /**
+   * Without `mode`: active exclusive claims by anyone other than `agent` on
+   * these files (for the pre-commit guard). With it: for each file, what a
+   * claim request of `agent`'s for that file alone in `mode`, with queue
+   * false, would be denied for right now, so a wait for the files (hub_wait)
+   * ends exactly when the edit hook's request would be granted. Changes nothing.
+   */
+  check(project: string, agent: string | null, files: string[], mode?: ClaimRequestMode): CheckResult {
     if (agent !== null) assertAgent(agent);
+    if (mode !== undefined && mode !== 'exclusive' && mode !== 'shared' && mode !== 'auto') {
+      throw new HubError('bad_request', 'mode must be exclusive, shared or auto');
+    }
     const norm = unique(files.map(normalizeRepoPath));
     return this.read(project, (now) => {
-      const live = this.store.claimsForFiles(project, norm, ['active']);
-      const conflicts = live.filter((c) => c.holder !== agent && c.mode === 'exclusive').map((c) => toConflict(c, norm));
-      return { conflicts, now, seq: this.store.latestSeq(project) };
+      if (mode === undefined) {
+        const live = this.store.claimsForFiles(project, norm, ['active']);
+        const conflicts = live.filter((c) => c.holder !== agent && c.mode === 'exclusive').map((c) => toConflict(c, norm));
+        return { conflicts, now, seq: this.store.latestSeq(project) };
+      }
+      const me = agent ?? '';
+      const waitedFor = agent !== null && this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent }).length > 0;
+      const byClaim = new Map<string, ClaimConflict>();
+      let deadlock: string | null = null;
+      for (const file of norm) {
+        const { uncovered, blockers, waits } = this.standing(project, me, [file], mode, waitedFor);
+        for (const c of blockers) {
+          const seen = byClaim.get(c.id);
+          if (seen) seen.files = unique([...seen.files, ...toConflict(c, uncovered).files]);
+          else byClaim.set(c.id, toConflict(c, uncovered));
+        }
+        const waitsForMe = waitedFor && blockers.some((c) => waits().reach.has(c.holder, me));
+        deadlock ??= blockers.length ? denialDeadlock(waits, me, blockers, waitsForMe, waitsForMe ? waitCycle(waits().held, me, blockers) : null) : null;
+      }
+      return { conflicts: [...byClaim.values()], ...(deadlock ? { deadlock } : {}), now, seq: this.store.latestSeq(project) };
     });
   }
 
@@ -318,11 +459,7 @@ export class Hub {
       if (task.owner === agent && task.status === 'in_progress') return this.withBlocked(project, task);
       if (task.status === 'done' || task.status === 'cancelled') throw new HubError('task_closed', `${id} is already ${task.status}`, 409);
       if (task.status === 'in_progress' && task.owner) throw new HubError('task_taken', `${id} is already taken by ${task.owner}`, 409);
-      const blockedBy = this.blockedBy(project, task);
-      if (blockedBy.length > 0) {
-        const detail = blockedBy.map((d) => `${d} (${this.store.getTask(project, d)?.status ?? 'missing'})`).join(', ');
-        throw new HubError('task_blocked', `${id} is blocked by ${detail}; it can be taken once those are done`, 409);
-      }
+      this.assertUnblocked(project, task, 'taken');
       this.store.updateTask(project, id, { owner: agent, status: 'in_progress', updated_at: now });
       this.emit(project, 'task.taken', agent, { task_id: id, title: task.title, owner: agent });
       return this.withBlocked(project, { ...task, owner: agent, status: 'in_progress', updated_at: now });
@@ -338,6 +475,7 @@ export class Hub {
       const task = this.store.getTask(project, id);
       if (!task) throw new HubError('not_found', `no task ${id}`, 404);
       if (task.owner && task.owner !== agent) throw new HubError('forbidden', `${id} is owned by ${task.owner}`, 403);
+      if (status === 'done' && task.status !== 'done') this.assertCompletable(project, task);
       const owner = status === 'open' ? null : task.owner;
       this.store.updateTask(project, id, { status, owner, updated_at: now });
       this.emit(project, 'task.updated', agent, { task_id: id, status, previous: task.status });
@@ -400,8 +538,9 @@ export class Hub {
     const rationale = cleanText(req.rationale, MAX_LONG_TEXT, true);
     const files = unique((req.files ?? []).map(normalizeRepoPath));
     const symbols = unique((req.symbols ?? []).map((s) => cleanText(s, 200)).filter(Boolean));
+    const requestedTask = idOf(req.task_id, 'task_id');
     return this.write(project, (now) => {
-      const taskId = req.task_id ? this.resolveTaskId(project, agent, req.task_id) : null;
+      const taskId = requestedTask ? this.resolveTaskId(project, agent, requestedTask) : null;
       const decision: Decision = { id: `D-${this.store.nextCounter(project, 'decision')}`, project, agent, summary, rationale, files, symbols, task_id: taskId, created_at: now };
       this.store.insertDecision(decision);
       this.emit(project, 'decision.recorded', agent, { decision_id: decision.id, agent, summary, files, symbols });
@@ -415,18 +554,24 @@ export class Hub {
 
   // --------------------------------------------------------------- landing
 
-  /** Phase 1 stub: records the request, marks the task done and releases its claims. */
+  /**
+   * Phase 1 stub: records the request, marks the task done and releases its
+   * claims, and those tied to no task once no other task of the agent's is in
+   * progress. With no task, it releases all of the agent's claims.
+   */
   land(project: string, agent: string, req: LandRequest): LandResult {
     assertAgent(agent);
+    const requestedTask = idOf(req.task_id, 'task_id');
     return this.write(project, (now) => {
       let task: Task | null = null;
       let unblocked: string[] = [];
-      if (req.task_id) {
-        const t = this.store.getTask(project, req.task_id);
-        if (!t) throw new HubError('not_found', `no task ${req.task_id}`, 404);
+      if (requestedTask) {
+        const t = this.store.getTask(project, requestedTask);
+        if (!t) throw new HubError('not_found', `no task ${requestedTask}`, 404);
         if (t.owner && t.owner !== agent) throw new HubError('forbidden', `${t.id} is owned by ${t.owner}`, 403);
         const owner = t.owner ?? agent;
         if (t.status !== 'done') {
+          this.assertCompletable(project, t);
           this.store.updateTask(project, t.id, { status: 'done', owner, updated_at: now });
           this.emit(project, 'task.updated', agent, { task_id: t.id, status: 'done', previous: t.status });
           unblocked = this.announceUnblocked(project, t.id, agent);
@@ -447,13 +592,23 @@ export class Hub {
       this.store.insertLanding(landing);
       this.emit(project, 'land.requested', agent, { landing_id: landing.id, agent, task_id: landing.task_id, branch: landing.branch, commit: landing.commit });
 
+      // Unless the request named one, a claim is tied to a task only when it was
+      // made or renewed while that was the agent's one task in progress, so the
+      // edit hook's claims from before task_take, or from while two tasks were,
+      // are tied to none. Once no other task of the agent's is in progress, those
+      // can only be for this one, so they go too. A claim tied to another task
+      // stays for it.
+      const inProgress = this.store.listTasks(project).filter((t) => t.owner === agent && t.status === 'in_progress').map((t) => t.id);
       const released: Claim[] = [];
       if (req.release_claims !== false) {
-        const mine = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent, task_id: task?.id });
+        const mine = this.store
+          .listClaims(project, { statuses: ['active', 'queued'], holder: agent })
+          .filter((c) => !task || c.task_id === task.id || (c.task_id === null && inProgress.length === 0));
         for (const c of mine) released.push(this.endClaim(project, c, 'released', `landed ${landing.id}`, now));
         if (released.length) this.promoteQueued(project, now);
       }
-      return { landing, task, released, unblocked, note: LAND_NOTE, now, seq: this.store.latestSeq(project) };
+      const held = this.store.listClaims(project, { statuses: ['active', 'queued'], holder: agent });
+      return { landing, task, released, unblocked, note: landNote(task, released, held, inProgress), now, seq: this.store.latestSeq(project) };
     });
   }
 
@@ -489,10 +644,44 @@ export class Hub {
     });
   }
 
-  /** Committed events after `since` that `agent` may see. */
+  /** Committed events after `since` that `agent` may see, at most `limit`. */
   events(project: string, agent: string | null, since: number, limit = 500): HubEvent[] {
+    return this.readEvents(project, agent, since, { limit }).events;
+  }
+
+  /**
+   * Committed events after `since` that `agent` may see, oldest first: at most
+   * `limit`, and only those of `types` if given, from at most `maxScan` events
+   * read (default MAX_EVENTS_SCANNED). `next_since` is where to read on: after
+   * the last event returned, or, short of `limit`, after every event read, seen
+   * or not, so a run of other agents' direct messages can't hold a reader back.
+   * `end`: every event up to the latest seq was read. A `since` past the latest
+   * seq comes from another database (see epoch), so reading starts at the latest seq.
+   */
+  readEvents(
+    project: string,
+    agent: string | null,
+    since: number,
+    opts: { limit?: number; types?: readonly string[]; maxScan?: number } = {},
+  ): { events: HubEvent[]; next_since: number; end: boolean } {
     assertProject(project);
-    return this.store.eventsSince(project, since, limit).filter((e) => isVisibleTo(e, agent));
+    const limit = opts.limit ?? 500;
+    const maxScan = Math.max(1, opts.maxScan ?? MAX_EVENTS_SCANNED);
+    const events: HubEvent[] = [];
+    let cursor = Math.min(since, this.store.latestSeq(project));
+    let scanned = 0;
+    for (;;) {
+      const want = Math.min(EVENT_PAGE, maxScan - scanned);
+      const page = this.store.eventsSince(project, cursor, want);
+      scanned += page.length;
+      for (const e of page) {
+        cursor = e.seq;
+        if (!isVisibleTo(e, agent) || (opts.types && !opts.types.includes(e.type))) continue;
+        if (events.push(e) >= limit) return { events, next_since: cursor, end: cursor >= this.store.latestSeq(project) };
+      }
+      if (page.length < want) return { events, next_since: cursor, end: true };
+      if (scanned >= maxScan) return { events, next_since: cursor, end: false };
+    }
   }
 
   latestSeq(project: string): number {
@@ -521,10 +710,37 @@ export class Hub {
         this.expireDue(project, now);
         return fn(now);
       });
+    } catch (err) {
+      // A wait graph built in a transaction that rolled back describes claims that
+      // never were, at an event seq that the next commit reuses.
+      this.waitGraphs.delete(project);
+      throw err;
     } finally {
       this.pending = null;
     }
-    for (const event of pending) {
+    if (pending.length > 0) this.publish(pending);
+    return result;
+  }
+
+  /**
+   * Publishes committed events to the listeners, each once and in seq order:
+   * first those other processes on the store committed since the last one
+   * published here, then `own`, which this hub has just committed. Seq order is
+   * commit order, so every event before `own` was committed before it.
+   */
+  private publish(own: HubEvent[]): void {
+    const before = own.length > 0 ? own[0].seq : Infinity;
+    const events: HubEvent[] = [];
+    for (let cursor = this.publishedSeq; cursor < before - 1; ) {
+      const page = this.store.allEventsSince(cursor, EVENT_PAGE);
+      events.push(...page.filter((e) => e.seq < before));
+      if (page.length < EVENT_PAGE || page[page.length - 1].seq >= before) break;
+      cursor = page[page.length - 1].seq;
+    }
+    events.push(...own);
+    if (events.length === 0) return;
+    this.publishedSeq = Math.max(this.publishedSeq, events[events.length - 1].seq);
+    for (const event of events) {
       for (const listener of this.listeners) {
         try {
           listener(event);
@@ -533,7 +749,6 @@ export class Hub {
         }
       }
     }
-    return result;
   }
 
   /** Reads go through `write` only when a lease is overdue, so they never see a dead claim. */
@@ -593,34 +808,82 @@ export class Hub {
   }
 
   /**
-   * Grant queued claims in FIFO order. A queued claim is granted when no active
-   * claim conflicts with it and no earlier, still-waiting claim does either,
-   * so a later request can't overtake an earlier one for the same file.
+   * Grant every queued claim that waits for nothing in waitGraph, until none is
+   * left. Such claims conflict with no active claim and with no other of them,
+   * and the line they wait in keeps a later request from overtaking an earlier
+   * one for the same file. The grant keeps the lease the waiter's last heartbeat
+   * or request gave it: only the waiter itself can prove it is still alive.
    */
   private promoteQueued(project: string, now: number): Claim[] {
-    const queued = this.store.listClaims(project, { statuses: ['queued'] });
     const promoted: Claim[] = [];
-    const waiting: Claim[] = [];
-    for (const q of queued) {
-      const active = this.store.claimsForFiles(project, claimFiles(q), ['active']);
-      if (active.some((a) => conflictsWith(a, q)) || waiting.some((w) => conflictsWith(w, q))) {
-        waiting.push(q);
-        continue;
+    for (;;) {
+      const { queue, blocked } = this.waitGraph(project);
+      const ready = queue.filter((q) => !blocked.has(q.id));
+      if (ready.length === 0) return promoted;
+      for (const q of ready) {
+        this.store.updateClaim(project, q.id, { status: 'active', granted_at: now });
+        this.emit(project, 'claim.granted', q.holder, {
+          claim_id: q.id,
+          holder: q.holder,
+          files: claimFiles(q),
+          mode: q.mode,
+          intent: q.intent,
+          task_id: q.task_id,
+          from_queue: true,
+        });
+        // As stored: a graph from an earlier request can predate the waiter's last heartbeat.
+        promoted.push(this.store.getClaim(project, q.id)!);
       }
-      const granted: Claim = { ...q, status: 'active', granted_at: now, expires_at: now + q.ttl_ms };
-      this.store.updateClaim(project, q.id, { status: 'active', granted_at: now, expires_at: granted.expires_at });
-      this.emit(project, 'claim.granted', q.holder, {
-        claim_id: q.id,
-        holder: q.holder,
-        files: claimFiles(q),
-        mode: q.mode,
-        intent: q.intent,
-        task_id: q.task_id,
-        from_queue: true,
-      });
-      promoted.push(granted);
     }
-    return promoted;
+  }
+
+  /**
+   * Who waits for whom, with an agent that is waiting keeping what it holds. A
+   * queued claim waits for the active claims it conflicts with, and for the
+   * conflicting queued claims ahead of it in line. The line is FIFO, except that
+   * an earlier claim whose agent already waits, directly or through others, for
+   * a later claim's agent goes behind it: it can't be granted before that agent
+   * lets go anyway, and going first would leave each waiting for the other.
+   * Claims are decided in queue order, each against those before it, given all
+   * waits for active claims and the decisions made so far. That adds no cycle
+   * the waits for active claims (`held`) don't already have, and claim() never
+   * queues a claim that closes one there. So the graph stays acyclic, and some
+   * claim can always go next.
+   *
+   * Whatever changes which claims are queued or active, or the files they name,
+   * emits an event in the same transaction. So a graph still holds, even after
+   * another process wrote, while the events since it was built queue, promote or
+   * end no waiter and grant or end no claim on a file a waiter names. Requests
+   * then reuse it instead of going over the whole queue again.
+   */
+  private waitGraph(project: string): Waits {
+    const seq = this.store.latestSeq(project);
+    const cached = this.waitGraphs.get(project);
+    if (cached && (cached.seq === seq || this.leftAlone(project, cached.seq, cached.waits))) {
+      cached.seq = seq;
+      return cached.waits;
+    }
+    const queue = this.store.listClaims(project, { statuses: ['queued'] });
+    const files = new Set(queue.flatMap(claimFiles));
+    const waits = buildWaits(queue, files, this.store.claimsForFiles(project, [...files], ['active']));
+    this.waitGraphs.set(project, { seq, waits });
+    return waits;
+  }
+
+  /** Whether the events after `seq` leave `waits` as they are (see waitGraph). */
+  private leftAlone(project: string, seq: number, waits: Waits): boolean {
+    const events = this.store.eventsSince(project, seq, MAX_EVENTS_TO_REUSE + 1);
+    if (events.length > MAX_EVENTS_TO_REUSE) return false;
+    return events.every((e) => {
+      if (!e.type.startsWith('claim.')) return true;
+      const { claim_id: id, files } = e.data;
+      return (
+        e.type !== 'claim.queued' &&
+        !waits.ids.has(id as string) &&
+        Array.isArray(files) &&
+        !files.some((f) => waits.files.has(f as string))
+      );
+    });
   }
 
   private newClaim(
@@ -658,14 +921,29 @@ export class Hub {
     return mine.length === 1 ? mine[0].id : null;
   }
 
+  /** The task's title, else the files (some of them), capped like an intent the request gives. */
   private defaultIntent(project: string, taskId: string | null, files: string[]): string {
     const task = taskId ? this.store.getTask(project, taskId) : null;
-    if (task) return task.title;
-    return `edit ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` and ${files.length - 3} more` : ''}`;
+    if (task) return capText(task.title, MAX_INTENT);
+    return capText(`edit ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` and ${files.length - 3} more` : ''}`, MAX_INTENT);
   }
 
   private blockedBy(project: string, task: Pick<Task, 'deps'>): string[] {
     return task.deps.filter((d) => this.store.getTask(project, d)?.status !== 'done');
+  }
+
+  /** A task with a dependency that isn't done can be neither taken nor completed. */
+  private assertUnblocked(project: string, task: Pick<Task, 'id' | 'deps'>, what: 'taken' | 'completed'): void {
+    const blockedBy = this.blockedBy(project, task);
+    if (blockedBy.length === 0) return;
+    const detail = blockedBy.map((d) => `${d} (${this.store.getTask(project, d)?.status ?? 'missing'})`).join(', ');
+    throw new HubError('task_blocked', `${task.id} is blocked by ${detail}; it can be ${what} once those are done`, 409);
+  }
+
+  /** Marking a task done needs it unblocked, and a cancelled one reopened first. */
+  private assertCompletable(project: string, task: Pick<Task, 'id' | 'deps' | 'status'>): void {
+    if (task.status === 'cancelled') throw new HubError('task_closed', `${task.id} is cancelled; reopen it before marking it done`, 409);
+    this.assertUnblocked(project, task, 'completed');
   }
 
   private withBlocked(project: string, task: Omit<Task, 'blocked_by'>): Task {
@@ -702,20 +980,43 @@ export function assertProject(project: unknown): asserts project is string {
   }
 }
 
-/** Repo-relative POSIX path with no `.`/`..` segments. */
+const MAX_PATH = 4096;
+
+/**
+ * The claim key for a repo-relative POSIX path: the NFC form of the path as
+ * sent, nothing else changed, so every client names a file the same way.
+ * Refuses PATH_FORBIDDEN_RE characters, absolute paths (`/x`, or a Windows
+ * drive root like `C:/x`) and `.`, `..` or empty segments. `a:b.md` and
+ * `..env` are legal.
+ */
 export function normalizeRepoPath(input: unknown): string {
-  if (typeof input !== 'string') throw new HubError('bad_path', 'file paths must be strings');
-  let p = input.trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/');
-  while (p.startsWith('./')) p = p.slice(2);
-  p = p.replace(/\/$/, '');
-  if (!p || p.startsWith('/') || /^[A-Za-z]:/.test(p)) {
-    throw new HubError('bad_path', `"${input}" must be a path relative to the repository root`);
+  if (typeof input !== 'string') throw new HubError('invalid_path', 'file paths must be strings');
+  const p = input.normalize('NFC');
+  const bad = PATH_FORBIDDEN_RE.exec(p);
+  if (bad) throw invalidPath(p, `contains ${codePoint(bad[0])}; control, line-separator and bidi characters and unpaired surrogates are not allowed`);
+  if (p.length > MAX_PATH) throw invalidPath(p, `is longer than ${MAX_PATH} characters`);
+  if (p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)) throw invalidPath(p, 'is absolute; use a path relative to the repository root');
+  if (p.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) {
+    throw invalidPath(p, 'has a ".", ".." or empty segment');
   }
-  if (p.split('/').some((seg) => seg === '..' || seg === '.')) {
-    throw new HubError('bad_path', `"${input}" must not contain . or .. segments`);
-  }
-  if (p.length > 1024) throw new HubError('bad_path', 'path too long');
   return p;
+}
+
+function invalidPath(p: string, reason: string): HubError {
+  return new HubError('invalid_path', `invalid path ${escapePath(p)}: ${reason}`);
+}
+
+/** JSON-quote a path for a message with every invisible or line-breaking character escaped; long paths are cut short. */
+function escapePath(p: string): string {
+  const shown = p.length > 200 ? `${p.slice(0, 200)}…` : p;
+  return JSON.stringify(shown).replace(/[\u007F-\u009F\p{Cf}\p{Zl}\p{Zp}]/gu, (ch) => {
+    const cp = ch.codePointAt(0)!;
+    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`;
+  });
+}
+
+function codePoint(ch: string): string {
+  return `U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0')}`;
 }
 
 function normalizeScope(req: ClaimRequest): ScopeEntry[] {
@@ -744,8 +1045,56 @@ export function cleanText(value: unknown, max: number, multiline = false): strin
   if (typeof value !== 'string') throw new HubError('bad_request', 'expected a string');
   let s = value.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000B-\u001F\u007F​-‏‪-‮⁦-⁩]/g, '');
   s = multiline ? s.replace(/\n{3,}/g, '\n\n') : s.replace(/\s+/g, ' ');
-  s = s.trim();
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  return capText(s.trim(), max);
+}
+
+/** `s`, cut to at most `max` characters with a trailing ellipsis, never between the halves of a surrogate pair. */
+function capText(s: string, max: number): string {
+  if (s.length <= max) return s;
+  let end = max - 1;
+  if (/[\uD800-\uDBFF]/.test(s[end - 1] ?? '')) end--;
+  return `${s.slice(0, end)}…`;
+}
+
+/**
+ * The lease settings a hub runs with, defaults filled in. Throws a RangeError
+ * naming the first setting that can't work, under the name `names` gives it
+ * (hub-server passes the flag or variable it came from). Leases need a TTL
+ * from 100 ms to a day, and heartbeats at least three times per lease TTL
+ * and presence window, so a live agent keeps its leases across a late
+ * heartbeat. Adapters heartbeat at the announced interval at the slowest, so a
+ * longer one would let leases expire while their holders run.
+ */
+export function leaseSettings(opts: Partial<LeaseSettings>, names: Partial<Record<keyof LeaseSettings, string>> = {}): LeaseSettings {
+  const check = (key: keyof LeaseSettings, value: number, min: number, max: number, why = '') => {
+    const name = names[key] ?? key;
+    if (!Number.isInteger(value)) throw new RangeError(`${name} must be a whole number of milliseconds, got ${value}`);
+    if (value < min || value > max) throw new RangeError(`${name} must be from ${min} to ${max} ms${why}, got ${value}`);
+    return value;
+  };
+  const leaseTtlMs = check('leaseTtlMs', opts.leaseTtlMs ?? 120_000, MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS);
+  const heartbeatIntervalMs = check('heartbeatIntervalMs', opts.heartbeatIntervalMs ?? Math.min(30_000, Math.floor(leaseTtlMs / 4)), MIN_HEARTBEAT_MS, Math.floor(leaseTtlMs / 3), ` (a third of the ${leaseTtlMs} ms lease TTL)`);
+  const presenceTtlMs = check('presenceTtlMs', opts.presenceTtlMs ?? leaseTtlMs, 3 * heartbeatIntervalMs, MAX_LEASE_TTL_MS, ` (three ${heartbeatIntervalMs} ms heartbeats or more)`);
+  return { leaseTtlMs, heartbeatIntervalMs, presenceTtlMs };
+}
+
+/**
+ * A task or claim id from a request body: a string, or a number taken as its
+ * digits; missing or empty means none. Anything else is refused with 400, not
+ * handed to the store (which would fail with a 500).
+ */
+function idOf(value: unknown, name: 'task_id' | 'claim_id'): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  throw new HubError('bad_request', `${name} must be an id such as ${name === 'task_id' ? 'T-3' : 'C-3'}`);
+}
+
+/** A list of claim ids from a request body (see idOf). */
+function idList(value: unknown, name: string): string[] {
+  const ids = Array.isArray(value) ? value.map((v) => (typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v)) ? String(v) : null)) : null;
+  if (!ids || ids.includes(null)) throw new HubError('bad_request', `${name} must be a list of claim ids such as C-3`);
+  return ids as string[];
 }
 
 function clampInt(value: unknown, fallback: number, min: number, max: number, name: string): number {
@@ -772,11 +1121,278 @@ function sameFiles(c: Claim, files: string[]): boolean {
   return mine.length === files.length && files.every((f) => mine.includes(f));
 }
 
-/** Phase 1 is file-level: any shared file counts as overlap, whatever the symbols. */
-function conflictsWith(a: Claim, b: Claim): boolean {
-  if (a.holder === b.holder) return false;
-  if (a.mode === 'shared' && b.mode === 'shared') return false;
-  return a.scope.some((s) => hasFile(b, s.file));
+/**
+ * Two claims that name the same file conflict unless they have one holder or
+ * are both shared. Phase 1 is file-level: whatever the symbols.
+ */
+function clash(a: Claim, b: Claim): boolean {
+  return a.holder !== b.holder && !(a.mode === 'shared' && b.mode === 'shared');
+}
+
+function byFile(claims: Claim[]): Map<string, Claim[]> {
+  const map = new Map<string, Claim[]>();
+  for (const c of claims) for (const f of claimFiles(c)) (map.get(f) ?? map.set(f, []).get(f)!).push(c);
+  return map;
+}
+
+/** The claims in `index` that name any of `q`'s files, each once. */
+function near(index: Map<string, Claim[]>, q: Claim): Claim[] {
+  const files = claimFiles(q);
+  if (files.length === 1) return index.get(files[0]) ?? [];
+  const found = new Map<string, Claim>();
+  for (const f of files) for (const c of index.get(f) ?? []) found.set(c.id, c);
+  return [...found.values()];
+}
+
+/** The queue positions in `line` (per file, in queue order) of the claims that name any of `files`, each once, in queue order. */
+function inLine(line: Map<string, number[]>, files: string[]): number[] {
+  if (files.length === 1) return line.get(files[0]) ?? [];
+  return [...new Set(files.flatMap((f) => line.get(f) ?? []))].sort((a, b) => a - b);
+}
+
+/** `waiter` (a queued claim, or null for the request being decided) waits for `blocker`. */
+type Wait = { waiter: Claim | null; blocker: Claim };
+/** For each agent, one wait for each agent its queued claims wait for. */
+type WaitGraph = Map<string, Map<string, Wait>>;
+
+interface Waits {
+  /** Queued claims in queue order. */
+  queue: Claim[];
+  /** Their ids. */
+  ids: Set<string>;
+  /** The files they name. */
+  files: Set<string>;
+  /** Ids of the queued claims that wait for something. */
+  blocked: Set<string>;
+  /** Only the waits for active claims. */
+  held: WaitGraph;
+  /** All waits, for active claims and in line. */
+  all: WaitGraph;
+  /** Who waits for whom in `all`, directly or through others. */
+  reach: Reach;
+}
+
+/** See Hub.waitGraph: `queue` in queue order, `files` the files it names, `active` the active claims on them. */
+function buildWaits(queue: Claim[], files: Set<string>, active: Claim[]): Waits {
+  const reach = new Reach([...queue, ...active].map((c) => c.holder));
+  const waits: Waits = { queue, ids: new Set(queue.map((q) => q.id)), files, blocked: new Set(), held: new Map(), all: new Map(), reach };
+  const who = queue.map((q) => reach.at(q.holder));
+  // A wait the others already imply (its agent waits for that one through someone
+  // else) changes nothing about who waits for whom, so `all` and `reach` skip it:
+  // a line of n waiters for one file then takes about n links, not n²/2.
+  const wait = (waiter: Claim, w: number, blocker: Claim, b: number) => {
+    if (!reach.hasAt(w, b) && link(waits.all, waiter, blocker)) reach.add(w, b);
+  };
+
+  const activeByFile = byFile(active);
+  const held: HeldWait[] = [];
+  queue.forEach((q, i) => {
+    for (const a of near(activeByFile, q)) {
+      if (!clash(a, q)) continue;
+      waits.blocked.add(q.id);
+      link(waits.held, q, a);
+      held.push({ waiter: q, w: who[i], blocker: a, b: reach.at(a.holder) });
+    }
+  });
+  // Agents that wait for nobody first, then those that wait only for them, and so
+  // on: nobody waits for an agent yet when its waits are added, so each extends
+  // just its own row (Reach.extend). Agents in a cycle, which claim() never lets
+  // form, come last and go the long way.
+  const { ordered, acyclic } = sinksFirst(held, reach.size);
+  ordered.forEach((h, k) => {
+    if (k >= acyclic) wait(h.waiter, h.w, h.blocker, h.b);
+    else if (!reach.hasAt(h.w, h.b) && link(waits.all, h.waiter, h.blocker)) reach.extend(h.w, h.b);
+  });
+
+  const earlier = new Map<string, number[]>(); // per file, the queue positions of the claims so far
+  queue.forEach((q, i) => {
+    const qFiles = claimFiles(q);
+    const line = inLine(earlier, qFiles);
+    const w = who[i];
+    // Each decided against the waits before this claim's own are added. Nobody can go
+    // behind a claim whose agent nobody waits for yet. Nearest first: waiting for the
+    // claim just ahead implies waiting for those it waits for.
+    const goesBehind = reach.waitedFor(w) ? new Set(line.filter((j) => clash(queue[j], q) && reach.hasAt(who[j], w))) : null;
+    let inLineWait = false;
+    for (let k = line.length - 1; k >= 0; k--) {
+      const j = line[k];
+      if (!clash(queue[j], q)) continue;
+      if (goesBehind?.has(j)) {
+        waits.blocked.add(queue[j].id);
+        wait(queue[j], who[j], q, w);
+      } else {
+        inLineWait = true;
+        wait(q, w, queue[j], who[j]);
+      }
+    }
+    if (inLineWait) waits.blocked.add(q.id);
+    for (const f of qFiles) (earlier.get(f) ?? earlier.set(f, []).get(f)!).push(i);
+  });
+  return waits;
+}
+
+/** A queued claim (agent `w`) that waits for an active one (agent `b`). */
+type HeldWait = { waiter: Claim; w: number; blocker: Claim; b: number };
+
+/**
+ * `held` ordered so that an agent's waits come after those of every agent it
+ * waits for: the first `acyclic` of them; the waits of agents in a cycle follow.
+ */
+function sinksFirst(held: HeldWait[], agents: number): { ordered: HeldWait[]; acyclic: number } {
+  const out = new Array<number>(agents).fill(0);
+  const into = new Map<number, HeldWait[]>();
+  const from = new Map<number, HeldWait[]>();
+  for (const h of held) {
+    out[h.w]++;
+    (into.get(h.b) ?? into.set(h.b, []).get(h.b)!).push(h);
+    (from.get(h.w) ?? from.set(h.w, []).get(h.w)!).push(h);
+  }
+  const ordered: HeldWait[] = [];
+  const done = new Set<number>();
+  const ready: number[] = [];
+  for (let a = 0; a < agents; a++) if (out[a] === 0) ready.push(a);
+  while (ready.length) {
+    const a = ready.pop()!;
+    done.add(a);
+    for (const h of from.get(a) ?? []) ordered.push(h);
+    for (const h of into.get(a) ?? []) if (--out[h.w] === 0) ready.push(h.w);
+  }
+  const acyclic = ordered.length;
+  for (const h of held) if (!done.has(h.w)) ordered.push(h);
+  return { ordered, acyclic };
+}
+
+/** Record that `waiter`'s agent waits for `blocker`'s; false if `graph` already had them waiting directly. */
+function link(graph: WaitGraph, waiter: Claim, blocker: Claim): boolean {
+  const out = graph.get(waiter.holder) ?? graph.set(waiter.holder, new Map()).get(waiter.holder)!;
+  if (out.has(blocker.holder)) return false;
+  out.set(blocker.holder, { waiter, blocker });
+  return true;
+}
+
+/** For each agent, a row of bits: the agents it waits for, directly or through others. */
+class Reach {
+  private readonly index = new Map<string, number>();
+  private readonly rows: Uint32Array[] = [];
+  /** The agents anyone waits for. */
+  private readonly any: Uint32Array;
+
+  constructor(agents: string[]) {
+    for (const a of agents) if (!this.index.has(a)) this.index.set(a, this.index.size);
+    const words = (this.index.size + 31) >>> 5;
+    for (let i = 0; i < this.index.size; i++) this.rows.push(new Uint32Array(words));
+    this.any = new Uint32Array(words);
+  }
+
+  get size(): number {
+    return this.rows.length;
+  }
+
+  /** The number of one of the agents given to the constructor. */
+  at(agent: string): number {
+    return this.index.get(agent)!;
+  }
+
+  /** Whether `waiter` waits, directly or through others, for `blocker`. */
+  has(waiter: string, blocker: string): boolean {
+    const w = this.index.get(waiter);
+    const b = this.index.get(blocker);
+    return w !== undefined && b !== undefined && bit(this.rows[w], b);
+  }
+
+  hasAt(w: number, b: number): boolean {
+    return bit(this.rows[w], b);
+  }
+
+  /** Whether anyone waits, directly or through others, for agent `b`. */
+  waitedFor(b: number): boolean {
+    return bit(this.any, b);
+  }
+
+  /** `w` now waits for `b` directly: so whoever waits for `w` waits for `b`, and for everyone it waits for. */
+  add(w: number, b: number): void {
+    if (bit(this.rows[w], b)) return;
+    const beyond = this.rows[b];
+    for (let s = 0; s < this.rows.length; s++) {
+      const row = this.rows[s];
+      // Whoever already waits for the blocker already waits for everyone it waits for.
+      if ((s !== w && !bit(row, w)) || bit(row, b)) continue;
+      row[b >>> 5] |= 1 << (b & 31);
+      for (let k = 0; k < row.length; k++) row[k] |= beyond[k];
+    }
+    this.any[b >>> 5] |= 1 << (b & 31);
+    for (let k = 0; k < beyond.length; k++) this.any[k] |= beyond[k];
+  }
+
+  /** As add, when nobody waits for `w` yet: only its own row changes. */
+  extend(w: number, b: number): void {
+    const row = this.rows[w];
+    const beyond = this.rows[b];
+    row[b >>> 5] |= 1 << (b & 31);
+    this.any[b >>> 5] |= 1 << (b & 31);
+    for (let k = 0; k < row.length; k++) {
+      row[k] |= beyond[k];
+      this.any[k] |= beyond[k];
+    }
+  }
+}
+
+function bit(row: Uint32Array, i: number): boolean {
+  return (row[i >>> 5] & (1 << (i & 31))) !== 0;
+}
+
+/** Breadth-first from `start`: the shortest chain of waits that leads to `agent`, or null if none does. */
+function waitChain(graph: WaitGraph, start: Wait[], agent: string): Wait[] | null {
+  const reachedBy = new Map<string, Wait>();
+  const todo: string[] = [];
+  const visit = (w: Wait) => {
+    if (reachedBy.has(w.blocker.holder)) return;
+    reachedBy.set(w.blocker.holder, w);
+    todo.push(w.blocker.holder);
+  };
+  start.forEach(visit);
+  for (let next = todo.shift(); next !== undefined; next = todo.shift()) {
+    if (next !== agent) {
+      graph.get(next)?.forEach(visit);
+      continue;
+    }
+    const chain = [reachedBy.get(agent)!];
+    while (!start.includes(chain[0])) chain.unshift(reachedBy.get(chain[0].waiter!.holder)!);
+    return chain;
+  }
+  return null;
+}
+
+/**
+ * When waiting for `blockers` would close a wait cycle in `graph` back to
+ * `agent`: how (claim and agent ids only), and the claim of `agent`'s it ends
+ * at, which is the one to release. Otherwise null.
+ */
+function waitCycle(graph: WaitGraph, agent: string, blockers: Claim[]): { steps: string; release: string } | null {
+  const chain = waitChain(graph, blockers.map((blocker) => ({ waiter: null, blocker })), agent);
+  if (!chain) return null;
+  const steps = chain.map((w) =>
+    w.waiter === null
+      ? `your request would wait for ${w.blocker.id} (${w.blocker.holder})`
+      : `${w.waiter.id} (${w.waiter.holder}) waits for ${w.blocker.holder === agent ? `your ${w.blocker.id}` : `${w.blocker.id} (${w.blocker.holder})`}`,
+  );
+  return { steps: steps.join(', '), release: chain[chain.length - 1].blocker.id };
+}
+
+/**
+ * For a request denied for `blockers` (see Hub.claim): why waiting for them
+ * outside the queue would never end, or null if it would. A holder in the way
+ * may wait, directly or not, for a claim of the requester's (`cycle`), or
+ * wait in line behind one; queued instead, the request would let the hub
+ * reorder that line (see waitGraph).
+ */
+function denialDeadlock(waits: () => Waits, agent: string, blockers: Claim[], waitsForMe: boolean, cycle: ReturnType<typeof waitCycle>): string | null {
+  const inLine = cycle || !waitsForMe ? null : waitCycle(waits().all, agent, blockers);
+  if (cycle) return `waiting for it would deadlock: ${cycle.steps}, so none of these claims could ever be granted. Release ${cycle.release}, or go on without this claim.`;
+  if (inLine) {
+    return `waiting for it outside the queue would deadlock: ${inLine.steps}. Ask again with queue: true and the hub reorders the line so this claim is granted in turn, or release ${inLine.release}, or go on without this claim.`;
+  }
+  return null;
 }
 
 function claimOrderBefore(a: Claim, b: Claim): boolean {
@@ -785,6 +1401,50 @@ function claimOrderBefore(a: Claim, b: Claim): boolean {
 
 function idNumber(id: string): number {
   return Number(id.split('-')[1] ?? 0);
+}
+
+/**
+ * What land did, for the agent: nothing merged, and which of its claims (ids
+ * only) it still holds, and which of its tasks in progress (`inProgress`)
+ * landing would release them: a claim tied to no task needs all of them landed,
+ * one tied to one of them that one, and one tied to any other task none.
+ */
+function landNote(task: Task | null, released: Claim[], held: Claim[], inProgress: string[]): string {
+  const parts = ['Phase 1 records the landing request only; nothing was merged. Push or merge your branch the usual way.'];
+  if (task) parts.push('The task is marked done.');
+  if (held.length === 0) parts.push(released.length > 0 ? 'Your claims are released.' : 'You held no claims.');
+  const groups = new Map<string, { tasks: string[]; claims: string[] }>();
+  for (const c of held) {
+    const tasks = c.task_id === null ? inProgress : inProgress.includes(c.task_id) ? [c.task_id] : [];
+    const key = tasks.join(' ');
+    if (!groups.has(key)) groups.set(key, { tasks, claims: [] });
+    groups.get(key)!.claims.push(`${c.id} (${c.task_id ? `task ${c.task_id}` : 'no task'})`);
+  }
+  let left = MAX_NOTE_CLAIMS;
+  let unnamed = 0;
+  for (const { tasks, claims } of groups.values()) {
+    if (left === 0) {
+      unnamed += claims.length;
+      continue;
+    }
+    const shown = capped(claims, left);
+    left -= Math.min(left, claims.length);
+    const them = claims.length === 1 ? 'it' : 'them';
+    const list = andList(capped(tasks, MAX_NOTE_CLAIMS));
+    const why = tasks.length > 0 ? ` while ${list} ${tasks.length === 1 ? 'is' : 'are'} in progress` : '';
+    parts.push(`You still hold ${andList(shown)}${why}: release ${them} when you are done with ${them}${tasks.length > 0 ? `, or land ${list}` : ''}.`);
+  }
+  if (unnamed > 0) parts.push(`You also hold ${unnamed} more claim${unnamed === 1 ? '' : 's'}.`);
+  return parts.join(' ');
+}
+
+/** The first `max` items, and how many more there are. */
+function capped(items: string[], max: number): string[] {
+  return items.length > max ? [...items.slice(0, max), `${items.length - max} more`] : items;
+}
+
+function andList(items: string[]): string {
+  return items.length <= 1 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
 }
 
 function toConflict(c: Claim, files: string[]): ClaimConflict {
