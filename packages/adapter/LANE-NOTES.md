@@ -90,3 +90,9 @@ No dependency requests and no contract-amendment requests.
 - **Markers in other checkouts.** When pre-edit writes a marker in a checkout other than the session's own (a file in another worktree or repository), it first notes that marker directory in the session's checkouts (`G/agenthub/elsewhere/<session>~<hash>`). Settle clears the thread's (SessionEnd: the session's) markers there too, and on SessionEnd drops the notes; notes older than 30 min go. Only `…/agenthub/inflight` directories are ever named in a note.
 - `SyncOutcome` changes (adapter-owned, not in the contract): `behind_dirty.conflicts` is `string[] | null`; `skipped` has optional `paths`; `SyncSkipReason` gained `old_git`.
 
+
+## A5: the end-to-end suite
+
+The suite and its notes are in `packages/e2e/` (`test/landing.e2e.test.ts`, `fixtures/**`, `LANE-NOTES.md`). No dependency requests and no contract-amendment requests.
+
+- **Test rig on H4's real server (the CP1 ruling).** `test/landing-hub.ts` `startLandingHub` now starts the real `Hub` behind `startServer({landerToken: LANDER_TOKEN, approvers: {name: 'sha256:<hex>'}, sweepIntervalMs: 100})` and nothing else; the test front that served the §1.7 routes until H4 was merged is gone. Without `approvers` the server answers `approvals_disabled`, as the front did. The adapter suite passes unchanged on it (247 passed, 1 skipped). `TestLander.takeLease` reads the epoch with a typed cast (the old line didn't type-check under a test tsconfig).
