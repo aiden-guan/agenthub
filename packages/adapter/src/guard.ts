@@ -1,11 +1,12 @@
-import type { CheckResult } from '@agenthub/hub/protocol';
+import type { CheckResult, ScopeEntry } from '@agenthub/hub/protocol';
 import { DEFAULT_REF_PREFIX } from '@agenthub/contract';
 import { lendIdentity, lendingSessions } from './checkout.js';
 import { HubClient, classifyFailure } from './client.js';
 import { loadConfig, teamSections, type HubConfig } from './config.js';
-import { INTENTS_NOTE, inline, minutesLeft, showName } from './format.js';
-import { findRepoRoot, mergeHeads, stagedPaths, unclaimableReason } from './git.js';
+import { INTENTS_NOTE, guardConflictLines, showName } from './format.js';
+import { findRepoRoot, mergeHeads, unclaimableReason } from './git.js';
 import type { HookOutcome } from './hooks.js';
+import { stagedScope } from './symbol-scope.js';
 
 const BYPASS = 'Emergency bypass: git commit --no-verify, or HUB_GUARD=off.';
 const SEQUENCER_BYPASS = 'Emergency bypass: run the git command again with HUB_GUARD=off (git commit --no-verify does not skip this check in a revert, cherry-pick or rebase).';
@@ -24,6 +25,13 @@ const blocked = (msg: string): HookOutcome => ({ stdout: '', stderr: `hub guard:
  * `merge`: called from pre-merge-commit, for a merge git commits itself. A
  * merge commit is checked for what it changes itself (see stagedPaths), not
  * for the other branches' changes it brings in as they are.
+ *
+ * Phase 3 (design §2.3.6): each staged modification of a file in a mapped
+ * language is checked for the declarations it changes (HEAD blob → index
+ * blob), at most 200 files within 10 s, so a commit is blocked only when it
+ * touches code another agent holds. Added, deleted and renamed files, merges,
+ * and files past the cap or the budget are checked whole. Other agents'
+ * landing holds count as exclusive claims.
  */
 export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer?: boolean; merge?: boolean }): Promise<HookOutcome> {
   if (io.env.HUB_GUARD === 'off') return { stdout: '', stderr: '', exitCode: 0 };
@@ -52,12 +60,15 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
   });
 
   let files: string[];
+  let scope: ScopeEntry[];
+  let mapper: string | null;
   let merging: string[];
   try {
     merging = mergeHeads(root, io.env);
     // Without the merged commits, the changes a merge brings in would all count as this commit's.
     if (io.merge && merging.length === 0) return { stdout: '', stderr: 'hub guard: warning: could not tell which commits this merge brings in; claims not checked\n', exitCode: 0 };
-    files = stagedPaths(root, merging);
+    // Read leniently: a bad symbols value is the default here, never a blocked commit.
+    ({ files, scope, mapper } = await stagedScope(root, { merging, symbols: teamSections(root, { strict: false }).sections.symbols }));
   } catch (err) {
     return blocked(`could not list the staged files (${(err as Error).message}); commit blocked. ${bypass}`);
   }
@@ -68,12 +79,15 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
     if (unclaimable.length > 5) shown.push(`${unclaimable.length - 5} more`);
     notes.push(`not checked, as the hub can't hold a claim on ${unclaimable.length === 1 ? 'it' : 'them'} and no agent can claim ${unclaimable.length === 1 ? 'it' : 'them'}: ${shown.join(', ')}`);
     files = files.filter((f) => unclaimableReason(f) === null);
+    scope = scope.filter((e) => unclaimableReason(e.file) === null);
   }
   if (files.length === 0) return withNotes({ stdout: '', stderr: '', exitCode: 0 });
 
+  // Symbol entries go with their mapper; with none, the Phase 1 file check.
+  const symbolic = mapper !== null && scope.some((e) => e.symbol !== undefined);
   let res: CheckResult;
   try {
-    res = await new HubClient(cfg).check(files);
+    res = symbolic ? await new HubClient(cfg).checkScope(scope, mapper) : await new HubClient(cfg).check(files);
   } catch (err) {
     const failure = classifyFailure(err, cfg);
     // An auth error's message already says why the token was withheld.
@@ -84,14 +98,16 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
   if (res.conflicts.length === 0) return withNotes({ stdout: '', stderr: '', exitCode: 0 });
 
   const holders = cfg.agent ? 'other agents' : 'agents (this checkout has no agent identity)';
-  const lines = [`hub guard: commit blocked. ${merging.length ? 'This merge changes files' : 'These staged files are'} exclusively claimed by ${holders}:`];
-  for (const c of res.conflicts) {
-    for (const f of c.files) {
-      lines.push(`  ${showName(f)} — claimed by ${c.holder} (${c.claim_id}) to "${inline(c.intent)}" (expires in ${minutesLeft(c.expires_at, res.now)} min)`);
-    }
-  }
+  // Declarations named on both sides: say "code"; otherwise Phase 1's words.
+  const what = merging.length
+    ? 'This merge changes files'
+    : symbolic && res.conflicts.some((c) => c.scope?.some((e) => e.symbol !== undefined))
+      ? 'These staged changes touch code'
+      : 'These staged files are';
+  const lines = [`hub guard: commit blocked. ${what} exclusively claimed by ${holders}:`];
+  for (const c of res.conflicts) lines.push(...guardConflictLines(c, res.now, scope));
   lines.push(
-    INTENTS_NOTE,
+    ...(res.conflicts.some((c) => !c.landing_id) ? [INTENTS_NOTE] : []),
     io.sequencer
       ? 'Undo the operation (git reset --merge, or git rebase --abort / git am --abort if one is in progress), coordinate with the holder (hub_post), or wait for the claim to be released (hub_wait).'
       : merging.length

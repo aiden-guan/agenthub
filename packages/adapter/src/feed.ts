@@ -1,10 +1,11 @@
 import WebSocket from 'ws';
 import { humanOf } from '@agenthub/contract';
 import { gitops } from '@agenthub/gitops';
-import type { Claim, FeedServerFrame, HeartbeatRequest, HeartbeatResult, HubEvent, Landing } from '@agenthub/hub/protocol';
+import type { Claim, FeedServerFrame, HeartbeatRequest, HeartbeatResult, HubEvent, Landing, SymbolChange, SymbolChangesResult } from '@agenthub/hub/protocol';
 import { HubApiError, classifyFailure, type HubClient } from './client.js';
 import { teamSections } from './config.js';
-import { approversOf, claimFiles, inline, notices as noticeText } from './format.js';
+import { approversOf, claimFiles, impactNotice, inline, notices as noticeText } from './format.js';
+import { isAcked, readAcks, relevant, type Impact } from './impact.js';
 import { fetchTrunk } from './sync.js';
 
 export interface FeedOptions {
@@ -15,8 +16,10 @@ export interface FeedOptions {
   log?: (msg: string) => void;
   /**
    * This agent's checkout: where trunk is fetched in the background when it
-   * moves, and whose modified files a trunk.moved notice looks for. Without
-   * one, those notices name held files only and nothing is fetched.
+   * moves, whose modified files a trunk.moved notice looks for, and whose
+   * bytes decide whether another agent's signature change touches this
+   * agent's claims (Phase 3 impacts). Without one, trunk.moved notices name
+   * held files only, nothing is fetched, and there are no impact notices.
    */
   root?: string | null;
 }
@@ -35,6 +38,8 @@ export interface WaitResult {
 
 const BUFFER_LIMIT = 1000;
 const NOTICE_LIMIT = 50;
+/** Impact evaluations remembered by event seq (hub_wait asks for the same ones the feed made). */
+const IMPACT_JOBS_LIMIT = 200;
 /** The background fetch of trunk on landing.landed and trunk.moved (design §2.3.4). */
 const FETCH_TIMEOUT_MS = 10_000;
 /**
@@ -96,7 +101,7 @@ export class Feed {
   /** This agent's claims as far as this process knows, with their heartbeat interval when known. */
   private held = new Map<string, { files: string[]; interval: number | null }>();
   private readonly reportedLost = new Set<string>();
-  /** For the next tool result; a landing notice names its landing and key, so showing that landing drops it (seenLanding). */
+  /** For the next tool result; a landing notice names its landing and key, so showing that landing drops it (seenLanding); an impact notice its change. */
   private notices: Array<{ text: string; landing: string | null; key: string | null }> = [];
   /** Landings of this agent's, by id, as the landing events name them (so its own trunk.moved isn't news to it). */
   private readonly mine = new Set<string>();
@@ -106,6 +111,16 @@ export class Feed {
   private readonly suppressed = new Set<string>();
   private fetching: Promise<void> | null = null;
   private fetchAgain = false;
+  /** Notices and impact evaluations still being worked out (settled() waits for them). */
+  private readonly jobs = new Set<Promise<unknown>>();
+  /** Phase 3: the impact evaluation of each symbol.changed event, by seq. */
+  private readonly impactJobs = new Map<number, Promise<Impact | null>>();
+  /** What each change was last announced as (status, kind, after): a change is announced again only when that differs. */
+  private readonly impactTold = new Map<string, string>();
+  /** Changes acknowledged in this process (the impacts tool), id → updated_at; the checkout's file has the rest. */
+  private readonly impactAcks = new Map<string, number>();
+  /** The last listing of recent symbol changes, shared by the evaluations of a burst of events. */
+  private listing: Promise<SymbolChangesResult> | null = null;
 
   constructor(
     private readonly client: HubClient,
@@ -357,6 +372,7 @@ export class Feed {
     if (this.buffer.length > BUFFER_LIMIT) this.buffer.splice(0, this.buffer.length - BUFFER_LIMIT);
     this.track(e);
     this.landingNotices(e);
+    if (e.type === 'symbol.changed') void this.impactOf(e);
     this.wake();
   }
 
@@ -452,7 +468,7 @@ export class Feed {
     );
   }
 
-  private notice(text: string, logLine = text, about: { landing: string; key: string } | null = null): void {
+  private notice(text: string, logLine = text, about: { landing: string | null; key: string } | null = null): void {
     if (about && this.suppressed.has(about.key)) return;
     this.opts.log?.(logLine);
     if (this.notices.length < NOTICE_LIMIT) this.notices.push({ text, landing: about?.landing ?? null, key: about?.key ?? null });
@@ -540,12 +556,99 @@ export class Feed {
   private later(key: string, landing: string | null, make: () => Promise<string | null>): void {
     if (this.noticed.has(key)) return;
     this.noticed.add(key);
-    void make().then(
-      (t) => {
-        if (t !== null && !this.halted) this.notice(t, t, landing ? { landing, key } : null);
-      },
-      (err: unknown) => this.opts.log?.(`notice ${key} failed: ${(err as Error).message}`),
+    this.keep(
+      make().then(
+        (t) => {
+          if (t !== null && !this.halted) this.notice(t, t, landing ? { landing, key } : null);
+        },
+        (err: unknown) => this.opts.log?.(`notice ${key} failed: ${(err as Error).message}`),
+      ),
     );
+  }
+
+  /** Track a background job until it ends, for settled(). */
+  private keep<T>(job: Promise<T>): Promise<T> {
+    this.jobs.add(job);
+    void job.finally(() => this.jobs.delete(job)).catch(() => undefined);
+    return job;
+  }
+
+  /** Resolves once the notices and impact evaluations under way have finished (tests; a tool that wants them on its result). */
+  async settled(): Promise<void> {
+    while (this.jobs.size) await Promise.allSettled([...this.jobs]);
+  }
+
+  // ------------------------------------------------------------------ Phase 3: impact notices (design §2.5)
+
+  /**
+   * Whether a symbol.changed event touches this agent's claims: another
+   * agent's change, in progress or landed, not acknowledged, that some live
+   * claim of this agent's uses in its checkout's current bytes (relevant()).
+   * A relevant one is queued as a notice (once per change and shape; a newer
+   * shape replaces one not yet shown) before the promise resolves, so a
+   * hub_wait woken by the event carries it. Each event is evaluated once.
+   */
+  impactOf(e: HubEvent): Promise<Impact | null> {
+    if (e.type !== 'symbol.changed') return Promise.resolve(null);
+    const known = this.impactJobs.get(e.seq);
+    if (known) return known;
+    const job = this.keep(
+      this.evaluateImpact(e).catch((err: unknown) => {
+        this.opts.log?.(`impact of ${String((e.data as Record<string, unknown>).change_id)} failed: ${(err as Error).message}`);
+        return null;
+      }),
+    );
+    this.impactJobs.set(e.seq, job);
+    if (this.impactJobs.size > IMPACT_JOBS_LIMIT) this.impactJobs.delete(this.impactJobs.keys().next().value!);
+    return job;
+  }
+
+  /** The impacts tool acknowledged these: no notice for them until they change again. */
+  ackImpacts(changes: ReadonlyArray<Pick<SymbolChange, 'id' | 'updated_at'>>): void {
+    for (const c of changes) {
+      this.impactAcks.set(c.id, Math.max(this.impactAcks.get(c.id) ?? 0, c.updated_at));
+      this.notices = this.notices.filter((n) => n.key !== `impact:${c.id}`);
+    }
+  }
+
+  private async evaluateImpact(e: HubEvent): Promise<Impact | null> {
+    const me = this.client.cfg.agent;
+    const root = this.opts.root;
+    const d = e.data as Record<string, unknown>;
+    const id = typeof d.change_id === 'string' ? d.change_id : null;
+    if (!me || !root || !id || d.agent === me) return null;
+    if (d.status !== 'in_progress' && d.status !== 'landed') {
+      // Withdrawn or superseded: a notice of it not shown yet is moot.
+      this.notices = this.notices.filter((n) => n.key !== `impact:${id}`);
+      return null;
+    }
+    // Nothing held, nothing touched: no listing needed.
+    const claims = (await this.client.claims({ holder: me })).filter((c) => c.status === 'active' || c.status === 'queued');
+    if (!claims.length) return null;
+    const change = (await this.changesSince(e.seq)).find((c) => c.id === id);
+    if (!change || change.status !== d.status) return null;
+    if (isAcked(this.impactAcks, change) || isAcked(readAcks(root, this.client.cfg.project), change)) return null;
+    const hit = await relevant(change, me, { root, claims });
+    if (!hit || this.halted) return hit;
+    const shape = `${change.status}\0${change.kind}\0${change.after ?? ''}\0${change.renamed_to ?? ''}`;
+    if (this.impactTold.get(id) !== shape) {
+      this.impactTold.set(id, shape);
+      const key = `impact:${id}`;
+      this.notices = this.notices.filter((n) => n.key !== key);
+      this.notice(impactNotice(hit), `impact: ${change.agent} changed ${change.file}#${change.symbol} (${change.status})`, { landing: null, key });
+    }
+    return hit;
+  }
+
+  /** The recent symbol changes, from a listing that includes event `seq` (one listing serves a burst of events). */
+  private async changesSince(seq: number): Promise<SymbolChange[]> {
+    const current = this.listing;
+    if (current) {
+      const r = await current.catch(() => null);
+      if (r && r.seq >= seq) return r.changes;
+    }
+    if (this.listing === current) this.listing = this.client.symbolChanges();
+    return (await this.listing!).changes;
   }
 
   private async landingOf(id: string): Promise<Landing | null> {
