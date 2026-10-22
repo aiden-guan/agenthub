@@ -306,6 +306,25 @@ describe('the AI resolver with the stub command (design §2.6, §5 "The stub res
     expect(seen).toEqual([{ path: 'src/auth.ts', ours: AUTH_TRUNK, theirs: AUTH_INCOMING, result: expect.stringContaining('  return user.trim();\n  return user.toLowerCase();\n') }]);
   });
 
+  it('gate 6 (parse, Phase 3) by default: a resolution that leaves the file with an uncontained parse error is refused; null turns the gate off', async () => {
+    const w = authWorld();
+    // Hunk 0 closes login early: the next `}` is a top-level error (both sides parse).
+    const cfg = stub(w, { mode: 'fixture', files: { 'src/auth.ts': ['  return user.trim();\n}\n}\n', '  return "goodbye";\n'] } });
+    const req = await request(w);
+    const r = await resolverFor(w, cfg).resolve(req);
+    expect(r.report.outcome).toBe('rejected_output');
+    expect(r.resolved).toEqual([]);
+    expect(r.tree).toBe(req.tree);
+    expect(r.unresolved).toEqual([{ path: 'src/auth.ts', eligible: true, explanation: expect.any(String) }]);
+    expect(r.warnings.join('\n')).toMatch(/src\/auth\.ts: the AI resolver's output was rejected \(parse\): .*doesn't parse/);
+    // A body-level error stays inside login (contained): the gate lets it through to the checks.
+    const contained = stub(w, { mode: 'fixture', files: { 'src/auth.ts': ['  return user.trim(;\n', '  return "goodbye";\n'] } });
+    expect((await resolverFor(w, contained).resolve(await request(w))).report.outcome).toBe('resolved');
+    // parseCheck: null switches the gate off.
+    const off = await resolverFor(w, cfg, { parseCheck: null }).resolve(await request(w));
+    expect(off.report.outcome).toBe('resolved');
+  });
+
   it('a command that can’t be started counts as cannot_resolve', async () => {
     const w = authWorld();
     const r = await resolverFor(w, '/nonexistent', { command: '/nonexistent/resolver --flag' }).resolve(await request(w));

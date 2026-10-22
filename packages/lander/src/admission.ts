@@ -4,12 +4,17 @@
 // refs and refs/agenthub/admit-trunk. The lander's own diff is authoritative:
 // the agent's advisory files and scope are replaced by what base..commit
 // really changes, and the hub re-makes the holds from it through the gate.
+// Phase 3: the scope names the declarations the change touches (symbols.ts),
+// so two agents' changes to different declarations of one file both hold,
+// while a change to code another agent holds fails with claim_conflict, hooks
+// or no hooks (design §4.2 #5).
 
 import { FULL_SHA_RE, landRef, type LandConfig } from '@agenthub/contract';
 import type { Landing, LandingAdmitRequest, LandingFailureCode, LandingStatus } from '@agenthub/hub/protocol';
 import { AttemptStale, hubWrite, type LanderContext } from './context.js';
 import { failureReport, sendbackContext, tellIfFailed, tellSendback } from './messages.js';
 import { protectedPaths, protectedRequirements } from './requirements.js';
+import { admissionScope, type SymbolsSettings } from './symbols.js';
 import { ADMIT_TRUNK_REF, descends, fetchTrunk, localLandRef } from './trunk.js';
 import { isHubError } from './ports.js';
 import type { SendbackContext } from './report.js';
@@ -54,7 +59,7 @@ export class Admission {
     for (const landing of submitted.sort((a, b) => (a.queue_seq ?? 0) - (b.queue_seq ?? 0))) {
       if (signal?.aborted || ctx.lease.signal.aborted) break;
       try {
-        if ((await this.admitOne(landing, trunk.tip, trunk.config.land, known)) !== 'skipped') done++;
+        if ((await this.admitOne(landing, trunk.tip, trunk.config.land, known, trunk.config.sections.symbols)) !== 'skipped') done++;
       } catch (err) {
         // It moved on meanwhile (cancelled, superseded, failed).
         if (err instanceof AttemptStale || isHubError(err, 'landing_closed', 'not_found')) continue;
@@ -70,8 +75,8 @@ export class Admission {
     return [...live, ...ended];
   }
 
-  /** design §2.2.4 steps 1 to 7 for one landing; `trunk` is the fetched admit-trunk tip. */
-  async admitOne(landing: Landing, trunk: string, land: LandConfig, known: Landing[]): Promise<AdmitOutcome> {
+  /** design §2.2.4 steps 1 to 7 for one landing; `trunk` is the fetched admit-trunk tip, `land` and `symbols` its config. */
+  async admitOne(landing: Landing, trunk: string, land: LandConfig, known: Landing[], symbols: SymbolsSettings): Promise<AdmitOutcome> {
     const { ctx } = this;
     const H = landing.commit;
     if (!H || !FULL_SHA_RE.test(H)) return this.fail(landing, land, 'not_pushed', null, {});
@@ -124,13 +129,16 @@ export class Admission {
     const approvalFiles = approvalBase === base ? files : intersect(files, await ctx.git.diffNames(approvalBase, H));
     const required = await protectedRequirements(ctx.git, land.protected, approvalFiles, approvalBase, H);
 
+    // 4. Phase 3: the scope, by declaration (at most 40 keys per file; anything else is the whole file).
+    const { scope, mapper } = await admissionScope(ctx.git, { files, base, head: H, config: symbols, log: (line) => ctx.log(`admission of ${landing.id}: ${line}`) });
+
     // 7. Admit: the hub re-makes the holds through the claim gate.
     const req: LandingAdmitRequest = {
       lease: ctx.lease.auth(),
       base_sha: base,
       files,
-      scope: null,
-      mapper: null,
+      scope,
+      mapper,
       protected: protectedPaths(files, land.protected),
       required,
       waits_for: waitsFor?.id ?? null,
@@ -143,7 +151,8 @@ export class Admission {
       await tellIfFailed(ctx, r, land);
       return 'failed';
     }
-    ctx.log(`admitted ${landing.id} (${files.length} file${files.length === 1 ? '' : 's'}${req.waits_for ? `, waits for ${req.waits_for}` : ''}${required.length ? `, ${required.length} approval${required.length === 1 ? '' : 's'} pending` : ''})`);
+    const keys = scope?.filter((e) => e.symbol !== undefined).length ?? 0;
+    ctx.log(`admitted ${landing.id} (${files.length} file${files.length === 1 ? '' : 's'}${keys > 0 ? `, ${keys} symbol${keys === 1 ? '' : 's'}` : ''}${req.waits_for ? `, waits for ${req.waits_for}` : ''}${required.length ? `, ${required.length} approval${required.length === 1 ? '' : 's'} pending` : ''})`);
     return 'admitted';
   }
 

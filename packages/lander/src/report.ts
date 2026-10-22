@@ -21,6 +21,7 @@ import type {
   TrunkChange,
 } from '@agenthub/hub/protocol';
 import type { GitPort, HubPort, PathChange } from './ports.js';
+import { hunkSymbols } from './symbols.js';
 
 export const SUBJECT_MAX = 72;
 export const SUMMARY_MAX = 4000;
@@ -267,14 +268,21 @@ export class ConflictReporter {
     return { file: entry.path, kind: entry.kind, hunks, trunk_changes: trunkChanges, tried: [...o.tried], ai_eligible: o.aiEligible, explanation: o.explanation };
   }
 
-  /** Content conflicts only: the regions of merge-file's diff3 output, at most 10, each side capped. */
+  /**
+   * Content conflicts only: the regions of merge-file's diff3 output, at most
+   * 10, each side capped, each with the declarations it lies in (Phase 3).
+   */
   async hunks(entry: ConflictEntry): Promise<ConflictHunk[]> {
     if (entry.kind !== 'content') return [];
     try {
       const merged = await this.o.git.mergeFile({ trunk: entry.stages[2] ?? null, base: entry.stages[1] ?? null, yours: entry.stages[3] ?? null });
+      const symbols = await hunkSymbols(entry.path, merged.text, merged.markerSize).catch((err: unknown) => {
+        this.o.onError?.(`declarations of the hunks of ${entry.path}`, err);
+        return new Map<number, string[]>();
+      });
       return parseConflictMarkers(merged.text, merged.markerSize)
         .slice(0, MAX_HUNKS)
-        .map((h) => ({ start_line: h.start_line, end_line: h.end_line, symbols: [], base: capSide(h.base), trunk: capSide(h.trunk), yours: capSide(h.yours) }));
+        .map((h) => ({ start_line: h.start_line, end_line: h.end_line, symbols: symbols.get(h.start_line) ?? [], base: capSide(h.base), trunk: capSide(h.trunk), yours: capSide(h.yours) }));
     } catch (err) {
       this.o.onError?.(`hunks of ${entry.path}`, err);
       return [];

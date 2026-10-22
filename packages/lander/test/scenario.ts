@@ -115,6 +115,8 @@ export interface ScenarioOptions {
    * is on loopback with no token, so lander/ ids need none.
    */
   landerToken?: string;
+  /** More files in trunk's first commit (Phase 3 tests seed TypeScript sources). */
+  seed?: Record<string, string>;
 }
 
 const SEED_FILES: Record<string, string> = {
@@ -169,7 +171,7 @@ export class Scenario {
     sh(this.remote, ['config', 'receive.denyNonFastForwards', 'true']);
     mkdirSync(this.seed.dir);
     sh(this.seed.dir, ['init', '-q', '-b', 'main']);
-    this.seed.commit('seed', { ...SEED_FILES, 'check.mjs': readFileSync(path.join(FIXTURES, 'check.mjs'), 'utf8'), 'agenthub.json': this.agenthubJson() });
+    this.seed.commit('seed', { ...SEED_FILES, ...this.o.seed, 'check.mjs': readFileSync(path.join(FIXTURES, 'check.mjs'), 'utf8'), 'agenthub.json': this.agenthubJson() });
     sh(this.seed.dir, ['remote', 'add', 'origin', this.remote]);
     sh(this.seed.dir, ['push', '-q', 'origin', 'main']);
     writeFileSync(path.join(this.remote, 'hooks', 'update'), HOOK);

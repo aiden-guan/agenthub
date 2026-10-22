@@ -5,6 +5,8 @@
 // at its base and its staged candidate intact → push that same candidate;
 // otherwise it can never land as it is → requeue. Every incarnation of the
 // lander pushes the same sha onto the same base, so it lands at most once (I3).
+// Resolved as landed, it reports the signature changes of the commit on
+// trunk against its first parent, as an attempt's landed does (design §2.5).
 
 import { existsSync, readdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
@@ -13,6 +15,7 @@ import type { Landing, LanderControl } from '@agenthub/hub/protocol';
 import { bestEffort, HubUnavailable, hubWrite, LeaseLost, AttemptStale, type LanderContext } from './context.js';
 import { tellIfFailed } from './messages.js';
 import { prefixOfCandidateRef, pushCandidate, type AttemptOutcome } from './pipeline.js';
+import { DEFAULT_SYMBOLS, landedSymbolChanges } from './symbols.js';
 import { descends, fetchTrunk, findOnTrunk, localCandidateRef, localLandRef, trunkLocalRef } from './trunk.js';
 
 /**
@@ -49,12 +52,15 @@ async function resolve(ctx: LanderContext, L: Landing, control: LanderControl): 
       return { kind: 'remote_unavailable' };
     }
     const tip = t.tip;
+    const symbols = t.config.ok ? t.config.sections.symbols : DEFAULT_SYMBOLS;
+    const changesOf = (sha: string) => landedSymbolChanges(ctx.git, { commit: sha, taskId: L.task_id, config: symbols, log: (line) => ctx.log(`${L.id}: ${line}`) });
 
     // 2. Already on trunk?
     const on = C && (await descends(ctx, C, tip)) ? C : await findOnTrunk(ctx, L, tip);
     if (on) {
       ctx.log(`${L.id} is on trunk as ${on.slice(0, 12)}: resolved as landed`);
-      const r = await hubWrite(ctx, `resolve ${L.id}`, () => ctx.hub.resolve(L.id, { lease: ctx.lease.auth(), outcome: 'landed', trunk_sha: on, symbol_changes: [] }));
+      const symbol_changes = await changesOf(on);
+      const r = await hubWrite(ctx, `resolve ${L.id}`, () => ctx.hub.resolve(L.id, { lease: ctx.lease.auth(), outcome: 'landed', trunk_sha: on, symbol_changes }));
       await cleanupLanded(ctx, r.landing);
       return { kind: 'landed', trunkSha: on, noop: false };
     }
@@ -87,10 +93,12 @@ async function resolve(ctx: LanderContext, L: Landing, control: LanderControl): 
       const local = localCandidateRef(ref!);
       if (!local || (await ctx.git.fetch([`+${ref}:${local}`])).kind !== 'ok') return { kind: 'remote_unavailable' };
     }
+    // Read before the push, so the push and its landed resolution stay close.
+    const symbol_changes = await changesOf(C);
     const pushed = await pushCandidate(ctx, { candidate: C, expected: T0, landRef: prefix ? landRef(prefix, H) : null });
     if (pushed.kind === 'pushed') {
       ctx.log(`${L.id}: pushed its staged candidate ${C.slice(0, 12)}`);
-      const r = await hubWrite(ctx, `resolve ${L.id}`, () => ctx.hub.resolve(L.id, { lease: ctx.lease.auth(), outcome: 'landed', trunk_sha: C, symbol_changes: [] }));
+      const r = await hubWrite(ctx, `resolve ${L.id}`, () => ctx.hub.resolve(L.id, { lease: ctx.lease.auth(), outcome: 'landed', trunk_sha: C, symbol_changes }));
       await cleanupLanded(ctx, r.landing);
       return { kind: 'landed', trunkSha: C, noop: false };
     }
