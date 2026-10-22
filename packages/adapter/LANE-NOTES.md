@@ -169,3 +169,7 @@ Decisions other steps and the integrator build on:
 - **`who_uses` applies the import filter** of `relevant()`, although §2.5's who_uses steps don't name it: a holder listed as "told" would otherwise not be told. A caller that reaches the symbol only through a barrel module (`import { login } from './lib'`) is missed by both, as §2.5's name-plus-import precision accepts.
 - **For lane H (no change asked):** the in-progress row's task comes from the hub (the agent's only task in progress); post-edit sends no `task_id`.
 - **Checked against H6 and L6 (not committed).** In a throwaway worktree with this commit, `p23/hub` (H6) and `p23/lander` (L6) merged and built: `AGENTHUB_E2E_PHASE=3` e2e passed (11 passed; only "1-2 without symbol claims" skipped, as it should be with symbols on), so scenarios 1 and 2 meet the texts A5's suite expects; `impact.test.ts`, `hooks-symbols.test.ts` and `mcp.test.ts` passed on H6's real routes (the front stood aside).
+
+## A5 at CP3: the end-to-end suite with Phase 3
+
+Details in `packages/e2e/LANE-NOTES.md` ("A5 at CP3"). No adapter source changed, and no dependency or contract-amendment requests. The A4 note "The e2e detection" no longer holds: the suite now turns Phase 3 on only when the adapter (A4), the hub (H6) and the lander (L6) builds all have it, so plain `npm run test:e2e` on this branch runs the Phase 2 world and passes; at CP3 it runs everything (11 passed, nothing skipped, checked in a scratch merge with H6 and L6). The CP3 gate stays `AGENTHUB_E2E_PHASE=3 npm run test:e2e`.
