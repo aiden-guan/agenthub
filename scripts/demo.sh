@@ -9,9 +9,14 @@
 # network), and the design's section 3 flows: a landing, a workspace sync, a
 # send-back, a protected path approved in a terminal, a lander handover and a
 # conflict the resolver combines.
+# Part 3 (steps 21-27): Phase 3, design 3.12. Two agents edit different
+# functions of one file at once; the same function is denied by name; a
+# signature change reaches the agent whose code calls it (impact warning,
+# who_uses); the lander admits each landing by declaration and records the
+# landed change.
 #
 #   npm run demo              (HUB_PORT=7177 by default; KEEP=1 keeps the sample repos;
-#                              DEMO_PART=1 or DEMO_PART=2 runs one part)
+#                              DEMO_PART=1, 2 or 3 runs one part)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -57,7 +62,7 @@ trap cleanup EXIT
 for _ in $(seq 50); do curl -sf "$HUB_URL/healthz" >/dev/null && break; sleep 0.1; done
 sed -n '1,4p' "$WORK/hub.log"
 
-if [ "$PART" != 2 ]; then
+if [ "$PART" = all ] || [ "$PART" = 1 ]; then
 step "2. A sample repo, set up once with hub init, and one worktree per agent"
 git init -q -b main "$WORK/sample"
 cd "$WORK/sample"
@@ -109,8 +114,9 @@ step "7. sam/claude-1 edits a free file: allowed"
 say "<Edit payload for $B/src/users.ts> | hub hook pre-edit"
 edit_payload "$B" "$B/src/users.ts" | hub hook pre-edit | pretty_json
 
-step "8. An agent without hooks commits src/auth.ts anyway: the pre-commit guard rejects it"
-echo "// quick fix" >>src/auth.ts
+step "8. An agent without hooks changes login anyway and commits: the pre-commit guard rejects it"
+# The guard checks a modified file by declaration (Phase 3): this commit changes login, which maya holds.
+sed -i.bak 's/session-/sess-/' src/auth.ts && rm src/auth.ts.bak
 git add src/auth.ts
 say 'git commit -m "quick fix in auth"'
 git commit -qm "quick fix in auth" || echo "(commit rejected, exit $?)"
@@ -136,7 +142,7 @@ fi
 
 [ "$PART" = 1 ] && exit 0
 
-# ------------------------------------------------------------------ Part 2
+# ------------------------------------------------------------------ Parts 2 and 3: helpers
 
 Q="$WORK/queue"
 REMOTE="$Q/remote.git"
@@ -158,15 +164,27 @@ wait_landing() {
   exit 1
 }
 lander_holder() { curl -sf "$HUB_URL/v1/p/$QPROJ/lander" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const l=JSON.parse(s).lease;console.log(l?`${l.holder} ${l.standby.length}`:"none 0")})'; }
-start_lander() { # <name> <workdir>
-  HUB_LANDER_TOKEN="$LANDER_TOKEN" hub-lander run --dir "$2" --id-prefix "lander/$1" --poll-trunk-ms 300 --resolver-command "$RESOLVER" >"$Q/lander-$1.log" 2>&1 &
+start_lander() { # <name> <workdir>   (with the stub resolver once Part 2 has set RESOLVER)
+  HUB_LANDER_TOKEN="$LANDER_TOKEN" hub-lander run --dir "$2" --id-prefix "lander/$1" --poll-trunk-ms 300 ${RESOLVER:+--resolver-command "$RESOLVER"} >"$Q/lander-$1.log" 2>&1 &
   LANDER_PIDS+=($!)
+}
+# The host rule (a GitHub ruleset in real life): only the lander's identity moves main, and never deletes it.
+host_rule() { # <bare remote>
+  cat >"$1/hooks/update" <<'HOOK'
+#!/bin/sh
+[ "$1" = refs/heads/main ] || exit 0
+case "$3" in 0000000000000000000000000000000000000000) echo "main can't be deleted" >&2; exit 1 ;; esac
+who=$(git log -1 --format='%cn <%ce>' "$3")
+[ "$who" = "agenthub lander <lander@localhost>" ] || { echo "only the lander may update main (committer: $who)" >&2; exit 1; }
+HOOK
+  chmod +x "$1/hooks/update"
 }
 # The approval prompt needs a terminal: python3's pty gives `hub approve` one, and types the landing id.
 PTY='import os, pty, sys
 st = pty.spawn(sys.argv[1:])
 sys.exit(os.waitstatus_to_exitcode(st))'
 
+if [ "$PART" != 3 ]; then
 step "12. Part 2, the landing queue: a bare remote with a host rule, two clones, a lander"
 git init -q --bare -b main "$REMOTE"
 git -C "$REMOTE" config receive.denyNonFastForwards true
@@ -183,15 +201,7 @@ hub init --project "$QPROJ" --no-guard >/dev/null
 node -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync("agenthub.json","utf8"));c.land={check:"node check.mjs",protected:["migrations/**"],resolver:{enabled:true}};fs.writeFileSync("agenthub.json",JSON.stringify(c,null,2)+"\n")'
 cat agenthub.json
 git add -A && git commit -qm "shop: initial import" && git push -q "$REMOTE" main
-# The host rule (a GitHub ruleset in real life): only the lander's identity moves main, and never deletes it.
-cat >"$REMOTE/hooks/update" <<'HOOK'
-#!/bin/sh
-[ "$1" = refs/heads/main ] || exit 0
-case "$3" in 0000000000000000000000000000000000000000) echo "main can't be deleted" >&2; exit 1 ;; esac
-who=$(git log -1 --format='%cn <%ce>' "$3")
-[ "$who" = "agenthub lander <lander@localhost>" ] || { echo "only the lander may update main (committer: $who)" >&2; exit 1; }
-HOOK
-chmod +x "$REMOTE/hooks/update"
+host_rule "$REMOTE"
 A="$Q/maya"
 B="$Q/sam"
 git clone -q "$REMOTE" "$A" && git -C "$A" checkout -q -b agent-a
@@ -213,7 +223,7 @@ hub lander
 step "13. maya/claude-1 finishes a task and lands it (design 3.1)"
 hub task add "Lower-case user names at login" >/dev/null
 hub task take T-1 >/dev/null
-say "<Edit payload for $A/src/auth.ts> | hub hook pre-edit   (claims src/auth.ts)"
+say "<Edit payload for $A/src/auth.ts> | hub hook pre-edit   (claims src/auth.ts#login)"
 edit_payload "$A" "$A/src/auth.ts" | hub hook pre-edit | pretty_json
 edit_file src/auth.ts '`session-${user}`' '`session-${user.toLowerCase()}`'
 # The edit ran: Claude Code's PostToolUse hook confirms its claim (and ends the edit, so a sync may run again).
@@ -336,3 +346,124 @@ step "20. The lander's log"
 sed -n '1,200p' "$Q/lander-buildbox.log" | grep -v '^$' | sed -n '1,12p'
 echo "…"
 grep -v '^$' "$Q/lander-laptop.log" | tail -4
+fi
+
+[ "$PART" = 2 ] && exit 0
+
+# ------------------------------------------------------------------ Part 3
+
+Q="$WORK/web"
+REMOTE="$Q/remote.git"
+QPROJ=web
+mkdir -p "$Q"
+# An Edit as Claude Code runs it: PreToolUse; if the hook allows it, the edit itself, then PostToolUse.
+# Prints the decision and what each hook told the agent.
+claude_edit() { # <worktree> <file> <old_string> <new_string>
+  node -e '
+    const { execFileSync } = require("child_process");
+    const fs = require("fs");
+    const path = require("path");
+    const [wt, file, oldS, newS] = process.argv.slice(1);
+    const abs = path.join(wt, file);
+    const input = { file_path: abs, old_string: oldS, new_string: newS, replace_all: false };
+    const base = { session_id: "demo-" + path.basename(wt), cwd: wt, permission_mode: "default", tool_name: "Edit", tool_input: input, tool_use_id: "toolu_" + Date.now() };
+    const hook = (name, payload) => {
+      const out = execFileSync("hub", ["hook", name], { input: JSON.stringify(payload), cwd: wt, encoding: "utf8" }).trim();
+      return out ? JSON.parse(out).hookSpecificOutput ?? {} : {};
+    };
+    const pre = hook("pre-edit", { ...base, hook_event_name: "PreToolUse" });
+    if (pre.permissionDecision === "deny") console.log(`denied: ${pre.permissionDecisionReason}`);
+    else {
+      console.log("allowed" + (pre.additionalContext ? `; the hook adds: ${pre.additionalContext}` : ""));
+      fs.writeFileSync(abs, fs.readFileSync(abs, "utf8").replace(oldS, () => newS));
+      const post = hook("post-edit", { ...base, hook_event_name: "PostToolUse", tool_response: { filePath: abs, oldString: oldS, newString: newS, replaceAll: false } });
+      if (post.additionalContext) console.log(`post-edit tells the agent: ${post.additionalContext}`);
+    }
+  ' "$@"
+}
+hub_json() { curl -sf "$HUB_URL/v1/p/$QPROJ/$1"; }
+
+step "21. Part 3, function-level claims (design 3.12): a project where two agents share src/auth.ts"
+git init -q --bare -b main "$REMOTE"
+git -C "$REMOTE" config receive.denyNonFastForwards true
+git init -q -b main "$Q/seed"
+cd "$Q/seed"
+mkdir -p src
+cp "$ROOT/packages/e2e/fixtures/repo/src/auth.ts" "$ROOT/packages/e2e/fixtures/repo/src/routes.ts" src/
+cp "$ROOT/packages/e2e/fixtures/repo/check.mjs" check.mjs
+hub init --project "$QPROJ" --no-guard >/dev/null
+# Symbol claims are on by default ("symbols": {"enabled": true}); the land section turns the queue on.
+node -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync("agenthub.json","utf8"));c.land={check:"node check.mjs"};fs.writeFileSync("agenthub.json",JSON.stringify(c,null,2)+"\n")'
+git add -A && git commit -qm "web: initial import" && git push -q "$REMOTE" main
+host_rule "$REMOTE"
+say "src/auth.ts: login, logout, refresh · src/routes.ts: handleLogin calls login"
+grep -n '^export function' src/auth.ts src/routes.ts
+A="$Q/maya"
+B="$Q/sam"
+git clone -q "$REMOTE" "$A" && git -C "$A" checkout -q -b agent-a
+git clone -q "$REMOTE" "$B" && git -C "$B" checkout -q -b agent-b
+(cd "$A" && hub init --agent maya/claude-1 >/dev/null)
+(cd "$B" && hub init --agent sam/claude-1 >/dev/null)
+hub-lander init --remote "$REMOTE" --dir "$Q/lander" >/dev/null
+say "hub-lander run --dir $Q/lander   (a lander for this project)"
+start_lander web "$Q/lander"
+for _ in $(seq 100); do [ "$(lander_holder)" = "none 0" ] || break; sleep 0.1; done
+
+step "22. maya's agent edits login and sam's edits logout, in the same file at the same time: both granted (3.12 step 1)"
+cd "$A"
+hub task add "Lower-case names at login" >/dev/null && hub task take T-1 >/dev/null
+say "maya: Edit src/auth.ts inside login"
+claude_edit "$A" src/auth.ts $'  const name = user.trim();\n' $'  const name = user.trim().toLowerCase();\n'
+cd "$B"
+hub task add "Stricter logout" >/dev/null && hub task take T-2 >/dev/null
+say "sam: Edit src/auth.ts inside logout"
+claude_edit "$B" src/auth.ts $'  const known = session.startsWith(\'session-\');\n' $'  const known = session.startsWith(\'session-\') && session.length > \'session-\'.length;\n'
+say "hub status   (the claims name declarations, under one mapper version)"
+hub status | sed -n '/^Claims/,/^$/p'
+
+step "23. sam's agent tries login too: denied by name, with what in the file is free"
+say "sam: Edit src/auth.ts inside login"
+claude_edit "$B" src/auth.ts $'  return `session-${name}`;\n' $'  return `sess-${name}`;\n'
+
+step "24. sam's agent holds handleLogin, which calls login; maya's agent changes login's signature (3.12 steps 2-3)"
+say "sam: Edit src/routes.ts inside handleLogin"
+claude_edit "$B" src/routes.ts $'  const session = login(body.user);\n' $'  const session = login(body.user.normalize());\n'
+cd "$A"
+say 'hub decide "login takes an opts argument with an optional prefix" --symbol src/auth.ts#login'
+hub decide "login takes an opts argument with an optional prefix" --symbol src/auth.ts#login
+say "maya: Edit src/auth.ts, login(user) becomes login(user, opts)"
+claude_edit "$A" src/auth.ts $'export function login(user: string): string {\n  const name = user.trim().toLowerCase();\n  return `session-${name}`;\n}\n' \
+  $'export function login(user: string, opts: { prefix?: string } = {}): string {\n  const name = user.trim().toLowerCase();\n  return `${opts.prefix ?? \'session\'}-${name}`;\n}\n'
+say "hub uses src/auth.ts#login   (who_uses: where login is used, and who holds those places)"
+hub uses src/auth.ts#login
+
+step "25. sam hears of it: the impact on the code sam holds, with maya's decision (3.12 step 3)"
+cd "$B"
+say "<SessionStart payload> | hub hook digest   (the impacts block; the MCP feed and hub_wait carry the same notice)"
+echo '{"hook_event_name":"SessionStart","source":"startup"}' | hub hook digest | pretty_context | sed -n '/^Impacts on your claims/,/^$/p'
+
+step "26. maya lands: the lander admits it by declaration, sam's logout claim stands, and the landed change replaces the in-progress one (3.12 step 4)"
+cd "$A"
+git commit -qam "login: lower-case names, take an opts argument"
+say 'hub land --task T-1 --summary "login lower-cases names and takes opts" --wait'
+hub land --task T-1 --summary "login lower-cases names and takes opts" --wait | sed -n '1,2p;/ landed on main/p'
+say "the landing's admission scope, as the lander mapped it"
+hub_json landings/L-1 | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const l=JSON.parse(s).landing;console.log(`L-1 scope: ${(l.scope??[]).map((e)=>e.symbol?`${e.file}#${e.symbol}`:e.file).join(", ")} (mapper ${String(l.mapper).split(";")[0]}…)`)})'
+say "GET /symbol-changes?status=landed,superseded"
+hub_json 'symbol-changes?status=landed,superseded' | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const c of JSON.parse(s).changes)console.log(`${c.id} ${c.file}#${c.symbol} ${c.kind} ${c.status}${c.landing_id?` in ${c.landing_id}`:""} by ${c.agent}, decisions: ${c.decisions.map((d)=>d.id).join(", ")||"none"}`)})'
+cd "$B"
+say "hub status   (sam's claims on logout and handleLogin stood throughout)"
+hub status | sed -n '/^Claims/,/^$/p'
+say "<SessionStart payload> | hub hook digest   (sam is told again: landed in L-1)"
+echo '{"hook_event_name":"SessionStart","source":"startup"}' | hub hook digest | pretty_context | sed -n '/^Impacts on your claims/,/^$/p'
+
+step "27. sam lands logout and the adapted handleLogin: two agents' changes to one file, both on trunk (3.12 step 5)"
+git commit -qam "logout: stricter; handleLogin: normalize the user name"
+say 'hub land --task T-2 --wait'
+hub land --task T-2 --wait | sed -n '1p;/ landed on main/p'
+say "git log --first-parent --oneline main"
+git -C "$REMOTE" log --first-parent --format='%h %s  (%cn)' main
+say "git show main:src/auth.ts   (maya's login and sam's logout)"
+git -C "$REMOTE" show main:src/auth.ts | sed -n '/^export function login/,/^}/p;/^export function logout/,/^}/p'
+say "the lander's log"
+grep -v '^$' "$Q/lander-web.log" | sed -n '1,10p'

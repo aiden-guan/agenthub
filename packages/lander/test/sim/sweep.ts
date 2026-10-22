@@ -87,5 +87,6 @@ export function sweepShard(k: number): void {
       for (const key of MUST_REACH) expect(totals[`cov.${key}`] ?? 0, `cov.${key}`).toBeGreaterThan(0);
     }
     expect(COVERAGE.map(([name]) => name)).toEqual(expect.arrayContaining([...MUST_REACH]));
-  }, 1_800_000);
+    // A seed takes about 0.3 s with four shards running: 30 min covers the default sweep, and a second per seed the nightly 20,000 (CP3).
+  }, Math.max(1_800_000, (to - from + 1) * 1_000));
 }

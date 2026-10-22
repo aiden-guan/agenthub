@@ -9,6 +9,8 @@ import { HubCallError } from '../src/ports.js';
 import {
   ConflictReporter,
   HUNK_SIDE_BYTES,
+  approverPhrase,
+  parkedMessage,
   MAX_HUNKS,
   capSide,
   commandHash,
@@ -329,6 +331,39 @@ describe('fix-it conflict reports (design §2.2.6 step 4)', () => {
     expect(r.hunks).toEqual([]);
     expect(r.kind).toBe('modify_delete');
     expect(r.trunk_changes.map((c) => c.landing_id)).toEqual(['L-6']);
+  });
+});
+
+describe('the parked message names who may approve (CP3)', () => {
+  const req = (rules: Array<{ paths: string[]; approvers: string[] | null; distinct: boolean }>) => ({ kind: 'protected' as const, digest: 'd', paths: ['migrations/002.sql'], rules, candidate: null, candidate_ref: null, trunk_base: null });
+  const open = { paths: ['migrations/**'], approvers: null, distinct: true };
+  const named = { paths: ['.github/**'], approvers: ['maya', 'sam'], distinct: true };
+
+  it('names the configured approvers, the author\'s own human left out where a rule says distinct', () => {
+    expect(approverPhrase([req([named]), req([named])], 'sam/claude-1')).toBe('maya');
+    expect(approverPhrase([req([{ ...named, distinct: false }])], 'sam/claude-1')).toBe('maya or sam');
+  });
+
+  it('names the rule when it names no approvers, instead of a bare "an approver"', () => {
+    expect(approverPhrase([req([open])], 'sam/claude-1')).toBe("any of the hub's approvers except sam; trunk protects migrations/** without naming approvers");
+    expect(approverPhrase([req([{ ...open, distinct: false }])], 'sam/claude-1')).toBe("any of the hub's approvers; trunk protects migrations/** without naming approvers");
+    expect(parkedMessage({ landingId: 'L-4', paths: ['migrations/002.sql'], who: approverPhrase([req([open])], 'sam/claude-1') })).toBe(
+      "L-4 passed its checks and waits for an approval of migrations/002.sql (any of the hub's approvers except sam; trunk protects migrations/** without naming approvers). Tell your human: `hub approve L-4` in a terminal.",
+    );
+  });
+
+  it('lists mixed rules, and a rule that leaves nobody, rule by rule', () => {
+    expect(approverPhrase([req([open, named])], 'sam/claude-1')).toBe('migrations/**: any approver except sam; .github/**: maya');
+    expect(approverPhrase([req([{ paths: ['ci/**'], approvers: ['sam'], distinct: true }])], 'sam/claude-1')).toBe('ci/**: nobody else');
+  });
+
+  it("says an ai_resolution requirement is the resolver's requireApproval, not a protected path", () => {
+    const ai = { ...req([{ paths: ['src/auth.ts'], approvers: null, distinct: true }]), kind: 'ai_resolution' as const, paths: ['src/auth.ts'] };
+    expect(approverPhrase([ai], 'sam/claude-1')).toBe("any of the hub's approvers except sam; trunk's resolver.requireApproval asks for a human review of the AI-resolved src/auth.ts");
+    expect(approverPhrase([req([open]), ai], 'sam/claude-1')).toBe(
+      "any of the hub's approvers except sam; trunk protects migrations/** without naming approvers and trunk's resolver.requireApproval asks for a human review of the AI-resolved src/auth.ts",
+    );
+    expect(approverPhrase([req([named]), ai], 'sam/claude-1')).toBe('.github/**: maya; AI-resolved src/auth.ts: any approver except sam');
   });
 });
 

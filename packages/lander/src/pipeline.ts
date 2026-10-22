@@ -37,8 +37,8 @@ import { isLive } from './admission.js';
 import { AttemptStale, bestEffort, HubUnavailable, hubWrite, LeaseLost, Stopping, type LanderContext } from './context.js';
 import { failureReport, sendbackContext, tellIfFailed, tellParked, tellSendback } from './messages.js';
 import { isHubError, type ResolveResult } from './ports.js';
-import { aiLandedMessage, commitMessage, ConflictReporter, emptyReport, LISTED_COMMITS, type SendbackContext } from './report.js';
-import { approversOf, missingApprovals, mergedRequirements, protectedPaths, protectedRequirements, uniqueRequirements } from './requirements.js';
+import { aiLandedMessage, approverPhrase, commitMessage, ConflictReporter, emptyReport, LISTED_COMMITS, type SendbackContext } from './report.js';
+import { missingApprovals, mergedRequirements, protectedPaths, protectedRequirements, uniqueRequirements } from './requirements.js';
 import { DEFAULT_SYMBOLS, landedSymbolChanges, type SymbolsSettings } from './symbols.js';
 import { descends, fetchTrunk, findOnTrunk, localCandidateRef, localLandRef, policyOf, scanTrunk, trunkLocalRef } from './trunk.js';
 
@@ -585,11 +585,11 @@ export class Attempt {
     const { ctx, id } = this;
     await this.stage(C);
     const paths = [...new Set(missing.flatMap((r) => r.paths))].sort();
-    const approvers = approversOf(missing);
+    const who = approverPhrase(missing, this.cur.agent);
     const report: LandingReport = {
       ...emptyReport(),
       ...parts,
-      message: `${id} passed its checks and waits for an approval of ${paths.join(', ')}${approvers ? ` (${approvers.join(' or ')})` : ''}.`,
+      message: `${id} passed its checks and waits for an approval of ${paths.join(', ')} (${who}).`,
       next_steps: [`Tell your human: \`hub approve ${id}\` in a terminal. It lands once approved (the checked candidate is pushed as it is, if ${this.ctx.trunk.branch} hasn't moved).`],
       warnings: this.cur.report?.warnings ?? [],
       foreign_commits: this.foreign,
@@ -598,7 +598,7 @@ export class Attempt {
     const r = await this.advance({ to: 'needs_approval', required, report, candidate: C, candidate_ref: this.candRef(C) });
     if (r.landing.status === 'needs_approval') {
       ctx.log(`${id}: parked for approval (${paths.join(', ')})`);
-      await tellParked(ctx, r.landing, paths, approvers);
+      await tellParked(ctx, r.landing, paths, who);
       return { kind: 'parked' };
     }
     ctx.log(`${id}: its approvals came in while it ran: back to the queue`);

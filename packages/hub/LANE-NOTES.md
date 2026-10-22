@@ -259,3 +259,19 @@ For the integrator:
 - **Observation, lane S and the adapter: long signatures.** `signatureChanges` compares signatures whole but reports them cut to 500 characters. A change after the 499th character therefore arrives with `before == after`. The hub then withdraws the open row, or skips the landed row. This is rare: a signature over 500 characters is a very long parameter list. A fix belongs in lane S, for example cutting both sides around the first difference. No hub change is needed.
 - **Observation: what the supersede rule loses.** The design supersedes the author's in-progress rows of the task as a whole, so a file the lander maps file-level gets no landed row (`too_many_symbols` past 40 keys, a parse error). Its in-progress rows are still superseded. Other agents keep the notice they got at edit time, but get no "landed in L-n" notice for those symbols. The same goes for every landing today, because the lander sends `symbol_changes: []` until L6. Superseding only the keys a landed row names would keep those rows, but it is not what §2.5 says, so I did not do it.
 - **README (frozen), CP3:** the two routes; `since_ms` is a time; a change whose `after` returns to the first `before` withdraws; landed rows supersede the task's in-progress rows; the lander's bad entries are dropped.
+
+## Integrator, CP3
+
+H6 (56d139a) merged with L6, A3–A6 (S4 was already in from CP1a). No contract-amendment or dependency requests were queued, so nothing was applied; the lockfile is unchanged.
+
+- **At the gate:** `symbol-changes.test.ts` and the fixture conformance tests pass. L6's row that needs H6 ("a landing that changes login's signature records a landed SymbolChange … and supersedes the author's in-progress row") now runs and passes instead of being skipped. The e2e Phase 3 scenarios (2, 3, 4 and 10) use both routes end to end.
+- **README (CP3), from the H5 and H6 lists:**
+  - symbol entries need the mapper (`invalid_symbol` otherwise), compare as whole files across mappers, and are capped per file;
+  - `check` with `scope`;
+  - `POST /symbol-changes` and `GET /symbol-changes` (`since_ms` is a time; the statuses; one row per agent and declaration, withdrawn when the signature comes back);
+  - landed rows supersede the task's in-progress rows, and the lander's bad entries are dropped;
+  - `symbol.changed` carries no signature text.
+- **Recorded, not changed:**
+  - The long-signature observation goes to lane S (see the symbols notes); README Limits states it.
+  - The supersede rule follows §2.5 as written: a file the lander maps whole gets no landed row, though its in-progress rows are superseded. No change.
+  - `queueView` caching per `write()` is still open (performance only).

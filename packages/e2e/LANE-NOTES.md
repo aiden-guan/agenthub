@@ -81,3 +81,12 @@ What changed (`test/landing.e2e.test.ts` only; the fixtures are unchanged):
 Checked against CP3 (not committed): a scratch clone of this branch with `p23/hub` (56d139a, H6) and `p23/lander` (030ff8d, L6) merged and built: plain `npm run test:e2e` three times in a row and `AGENTHUB_E2E_PHASE=3` once, 11 passed each time with nothing skipped (about 45 s); `AGENTHUB_E2E_PHASE=2` 9 passed, 3 skipped. The new checks bite: with H6 but not L6 the run fails at 3 (L-1 comes back `claim_conflict` over sam's `#logout`); with L6's `landedSymbolChanges` made to return nothing, it fails at 3 on the landed row. On this branch alone: plain mode 10 passed (Phase 2 world), `AGENTHUB_E2E_PHASE=2` 9 passed.
 
 Still open (no change, not a safety issue): the CP2 observation that both agents' feeds race on fetching trunk into the shared `refs/remotes/origin/main` and one logs a lock error; the ref is already where it should be.
+
+## Integrator, CP3
+
+No contract-amendment or dependency requests; nothing applied.
+
+- **The CP3 gate.** `AGENTHUB_E2E_PHASE=3 npm run test:e2e` gives 11 passed, nothing skipped, and so does plain `npm run test:e2e` (CP2 carry-over 1). That covers the §6.7 item 5 assertions and the run where the lander is killed during the checks. Both were run again on the committed tree after the resumed integration's last fix (the AI-resolution approval wording): 11 of 11 each. `npm run demo` ran all three parts there too.
+- **Integrator fix (CP2 carry-over 2): scenario 2 has no fixed sleep.** `Agent.nextWait()` resolves with the cursor of the next wait on the agent's own feed. `hub_wait` reads the hub's sequence number first, then waits on the feed from it. The scenario waits for that (10 s deadline, then it fails with a message) before maya's edit. It also asserts that the change's `symbol.changed` comes after that cursor.
+- **Scenario 7** checks the new protected-path wording exactly: "it lands once any of the hub's approvers except sam approves (trunk protects migrations/** without naming approvers)", and the same in the parked brief (CP2 carry-over 4; see the adapter notes).
+- **`scripts/demo.sh` (Part 3, CP3)** copies `fixtures/repo/src/auth.ts`, `fixtures/repo/src/routes.ts` and `fixtures/repo/check.mjs`. Part 2 still uses `fixtures/stub-resolver.mjs`. Keep these files as they are (their functions and the check's contract), or update the demo with them.

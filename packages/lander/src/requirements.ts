@@ -75,13 +75,6 @@ export function missingApprovals(required: readonly ApprovalRequirement[], appro
   return required.filter((r) => !satisfied(r, approvals, agent));
 }
 
-/** The humans who may approve these requirements; null = any approver. */
-export function approversOf(required: readonly ApprovalRequirement[]): string[] | null {
-  const rules = required.flatMap((r) => r.rules);
-  if (rules.some((r) => r.approvers === null)) return null;
-  return [...new Set(rules.flatMap((r) => r.approvers ?? []))].sort();
-}
-
 /** Requirements without repeats (same kind and digest), in order. */
 export function uniqueRequirements(rs: readonly ApprovalRequirement[]): ApprovalRequirement[] {
   const seen = new Set<string>();

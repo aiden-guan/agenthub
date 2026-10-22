@@ -19,11 +19,15 @@ import {
   landQueuedText,
   landRefusal,
   minutes,
+  notices,
   postEditConflictText,
   resumeCommand,
+  rulesOf,
+  rulesText,
   statsText,
   statusText,
   terminalSafe,
+  whoMayApprove,
   type BriefContext,
 } from '../src/format.js';
 import { landWork } from '../src/land.js';
@@ -378,6 +382,51 @@ describe('land results (design §2.3.2)', () => {
     expect(neither).not.toMatch(/structural merge \(|tries/);
     expect(neither).toContain('No structural merge or AI resolver is set up for this project');
   });
+
+  it('names who may approve a protected path: the configured approvers, or the rule when it names none (CP3)', () => {
+    const open = { paths: ['migrations/**'], approvers: null, distinct: true };
+    const named = { paths: ['.github/**'], approvers: ['maya', 'sam'], distinct: true };
+    expect(whoMayApprove([open], 'sam/claude-2')).toEqual({ who: "any of the hub's approvers except sam", why: 'trunk protects migrations/** without naming approvers' });
+    expect(whoMayApprove([{ ...open, distinct: false }], 'sam/claude-2')).toEqual({ who: "any of the hub's approvers", why: 'trunk protects migrations/** without naming approvers' });
+    expect(whoMayApprove([named, named], 'sam/claude-2')).toEqual({ who: 'maya', why: null });
+    // Mixed rules (each must be met), or named ones that leave nobody but the author's human: rule by rule.
+    expect(whoMayApprove([open, named], 'sam/claude-2')).toEqual({ who: 'migrations/**: any approver except sam; .github/**: maya', why: null });
+    expect(whoMayApprove([{ paths: ['ci/**'], approvers: ['sam'], distinct: true }], 'sam/claude-2')).toEqual({ who: 'ci/**: nobody else', why: null });
+
+    const res = { landing: landing({ id: 'L-4', agent: 'sam/claude-2', status: 'submitted' }), task: null, released: [], unblocked: [], held: [], superseded: [], replayed: false, position: 1, eta_ms: MIN, lander: null, note: '', now: NOW, seq: 1 } as any;
+    const ctxOf = (rules: Array<typeof open | typeof named>) => ({ project: 'acme/web', trunk: 'main', check: 'x', commits: 1, conflicts: [], protectedPaths: ['migrations/002.sql'], approvers: null, rules, running: null, keepPlaceRetries: 2, warnings: [] });
+    expect(landQueuedText(res, ctxOf([open]))).toContain(
+      "It changes protected paths (migrations/002.sql): its checks run now, and it lands once any of the hub's approvers except sam approves (trunk protects migrations/** without naming approvers). Tell your human: `hub approve L-4` in a terminal. You can't approve it.",
+    );
+    expect(landQueuedText(res, ctxOf([named]))).toContain('and it lands once maya approves. Tell your human');
+
+    // The parked notice and the brief name them the same way.
+    const approval = [{ kind: 'protected' as const, digest: 'd', paths: ['migrations/002.sql'], rules: [open], candidate: null, candidate_ref: null, trunk_base: null }];
+    expect(notices.parked({ landing_id: 'L-4', task_id: 'T-3' }, ['migrations/002.sql'], whoMayApprove([open], 'sam/claude-2'))).toBe(
+      "L-4 for T-3 passed its checks and waits for an approval (migrations/002.sql): tell your human to run `hub approve L-4` in a terminal (any of the hub's approvers except sam may approve, as trunk protects migrations/** without naming approvers; you can't).",
+    );
+    expect(landingBrief(landing({ id: 'L-4', task_id: 'T-3', agent: 'sam/claude-2', status: 'needs_approval', approval }), ctx({ me: 'sam/claude-2' }))).toBe(
+      "L-4 for T-3 passed its checks and waits for an approval of migrations/002.sql (any of the hub's approvers except sam; trunk protects migrations/** without naming approvers). Tell your human: `hub approve L-4` in a terminal. You can't approve it.",
+    );
+  });
+
+  it("says an AI-resolution approval is the resolver's requireApproval, not a protected path (CP3)", () => {
+    const aiReq = { kind: 'ai_resolution' as const, digest: 'd', paths: ['src/auth.ts'], rules: [{ paths: ['src/auth.ts'], approvers: null, distinct: true }], candidate: null, candidate_ref: null, trunk_base: null };
+    const protectedReq = { kind: 'protected' as const, digest: 'e', paths: ['migrations/002.sql'], rules: [{ paths: ['migrations/**'], approvers: null, distinct: true }], candidate: null, candidate_ref: null, trunk_base: null };
+    expect(rulesOf([aiReq])).toEqual([{ paths: ['src/auth.ts'], approvers: null, distinct: true, ai: true }]);
+    expect(whoMayApprove(rulesOf([aiReq]), 'sam/claude-2')).toEqual({
+      who: "any of the hub's approvers except sam",
+      why: "trunk's resolver.requireApproval asks for a human review of the AI-resolved src/auth.ts",
+    });
+    expect(whoMayApprove(rulesOf([protectedReq, aiReq]), 'sam/claude-2').why).toBe(
+      "trunk protects migrations/** without naming approvers and trunk's resolver.requireApproval asks for a human review of the AI-resolved src/auth.ts",
+    );
+    expect(landingBrief(landing({ id: 'L-7', task_id: 'T-3', agent: 'sam/claude-2', status: 'needs_approval', approval: [aiReq] }), ctx({ me: 'sam/claude-2' }))).toBe(
+      "L-7 for T-3 passed its checks and waits for an approval of src/auth.ts (any of the hub's approvers except sam; trunk's resolver.requireApproval asks for a human review of the AI-resolved src/auth.ts). Tell your human: `hub approve L-7` in a terminal. You can't approve it.",
+    );
+    // The queue's one-line view labels the rule.
+    expect(rulesText([aiReq], 'sam/claude-2')).toBe('AI-resolved src/auth.ts: any approver except sam');
+  });
 });
 
 describe('durations and the pause line (CP1 dogfood nits)', () => {
@@ -486,7 +535,7 @@ describe('views: digest, status, the queue, events', () => {
       [
         'Landing queue (2):',
         '  ▶ L-6  sam/claude-1  T-5  checking  npm ci && npm test (2m10s)',
-        '  1 L-8  sam/claude-2  T-9  queued    eta 6 min · waits for approval (migrations/**: any approver)',
+        '  1 L-8  sam/claude-2  T-9  queued    eta 6 min · waits for approval (migrations/**: any approver except sam)',
         'Lander: lander/buildbox-4123-a1b2 active.',
         'Trunk: main at 9999999 (L-4 landed, 3m ago).',
         '',
@@ -508,7 +557,7 @@ describe('views: digest, status, the queue, events', () => {
       [
         'Landing queue for acme/web · lander/buildbox-4123-a1b2 active · median land→main 9 min (7 days, 42 landed, 81% first try)',
         '  ▶ L-6  sam/claude-1  T-5  checking                           npm ci && npm test (2m10s)',
-        '  1 L-8  sam/claude-2  T-9  queued                             eta 6 min · waits for approval (migrations/**: any approver)',
+        '  1 L-8  sam/claude-2  T-9  queued                             eta 6 min · waits for approval (migrations/**: any approver except sam)',
         '  ⏸ L-4  sam/claude-2  T-8  needs approval (.github/**: maya)  checks passed 10:31',
         'Recent: L-5 landed 10:22 (8 min) · L-3 came back 10:15 (checks_failed)',
       ].join('\n'),

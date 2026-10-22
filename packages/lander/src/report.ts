@@ -6,10 +6,11 @@
 // protocol marks untrusted.
 
 import { createHash } from 'node:crypto';
-import { landingKey, TRAILER } from '@agenthub/contract';
+import { humanOf, landingKey, TRAILER } from '@agenthub/contract';
 import { sanitizeMessageText, type ConflictEntry } from '@agenthub/gitops';
 import type {
   ApprovalKind,
+  ApprovalRequirement,
   ConflictHunk,
   ConflictReport,
   Decision,
@@ -450,10 +451,50 @@ export function sendbackMessage(code: LandingFailureCode, ctx: SendbackContext):
   return `${failureMessage(code, ctx)} landing_status ${ctx.landingId} has the details; ${tail}.`;
 }
 
-/** The direct message for a landing parked for approval (design §2.2.9). */
-export function parkedMessage(o: { landingId: string; paths: string[]; approvers: string[] | null }): string {
-  const who = o.approvers && o.approvers.length > 0 ? o.approvers.map(plain).join(' or ') : 'an approver';
-  return `${o.landingId} passed its checks and waits for an approval of ${listPaths(o.paths)} (${who}). Tell your human: \`hub approve ${o.landingId}\` in a terminal.`;
+/**
+ * Who may approve these requirements (CP3: the configured approvers or the
+ * rule, never a bare "an approver"): `maya or sam`, the author's own human
+ * left out where a rule says distinct; for rules that name nobody, `any of the
+ * hub's approvers except sam; trunk protects migrations/** without naming
+ * approvers`; mixed rules, rule by rule. An `ai_resolution` requirement's rule
+ * is the resolver's requireApproval (design §2.6), not a protected path, and
+ * the phrase says so.
+ */
+export function approverPhrase(required: readonly ApprovalRequirement[], agent: string): string {
+  const human = humanOf(agent);
+  const seen = new Set<string>();
+  const rules = required
+    .flatMap((r) => r.rules.map((rule) => ({ ...rule, ai: r.kind === 'ai_resolution' })))
+    .filter((r) => {
+      const key = JSON.stringify([r.paths, r.approvers, r.distinct, r.ai]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  const named = (r: ApprovalRequirement['rules'][number]) => (r.approvers ?? []).filter((a) => !(r.distinct && a === human)).map(plain);
+  const list = (paths: readonly string[]) => [...new Set(paths)].map(plain).join(', ');
+  const open = rules.filter((r) => r.approvers === null);
+  if (open.length === 0) {
+    const names = [...new Set(rules.flatMap(named))];
+    if (names.length > 0) return names.join(' or ');
+  } else if (open.length === rules.length) {
+    const except = open.some((r) => r.distinct) ? ` except ${plain(human)}` : '';
+    const globs = open.filter((r) => !r.ai).flatMap((r) => r.paths);
+    const resolved = open.filter((r) => r.ai).flatMap((r) => r.paths);
+    const why = [
+      ...(globs.length ? [`trunk protects ${list(globs)} without naming approvers`] : []),
+      ...(resolved.length ? [`trunk's resolver.requireApproval asks for a human review of the AI-resolved ${list(resolved)}`] : []),
+    ].join(' and ');
+    return `any of the hub's approvers${except}; ${why}`;
+  }
+  return rules
+    .map((r) => `${r.ai ? 'AI-resolved ' : ''}${r.paths.map(plain).join(', ')}: ${r.approvers === null ? `any approver${r.distinct ? ` except ${plain(human)}` : ''}` : named(r).join(' or ') || 'nobody else'}`)
+    .join('; ');
+}
+
+/** The direct message for a landing parked for approval (design §2.2.9); `who` from approverPhrase. */
+export function parkedMessage(o: { landingId: string; paths: string[]; who: string }): string {
+  return `${o.landingId} passed its checks and waits for an approval of ${listPaths(o.paths)} (${o.who}). Tell your human: \`hub approve ${o.landingId}\` in a terminal.`;
 }
 
 /** The direct message to both sides of an AI-resolved conflict that landed (design §2.2.9, §2.6). */

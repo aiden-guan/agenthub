@@ -251,6 +251,7 @@ async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig, f
     conflicts,
     protectedPaths,
     approvers,
+    rules: [...new Set(matches.map((m) => m.rule))],
     running,
     keepPlaceRetries: land.keepPlaceRetries,
     warnings,

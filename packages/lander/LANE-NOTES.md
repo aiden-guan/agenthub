@@ -218,3 +218,19 @@ None. `@agenthub/symbols` was already a lander dependency.
 
 - `@imports` and `@toplevel` keys appear in admission scopes like any other key (the contract's overlap rules decide: `@imports` never conflicts with `@imports`).
 - Signature changes are looked for in files with up to 1000 changed keys, not the 40 of the admission scope: the 40 bounds claims, while an impact warning is worth sending for a wide refactor too.
+
+## Integrator, CP3
+
+L6 (030ff8d) merged with H6, A3–A6. No contract-amendment or dependency requests; nothing applied; the lockfile is unchanged.
+
+- **The row that needs H6 passes at the gate** (`lander.symbols.integration.test.ts`: 5 of 5, none skipped).
+- **Integrator fix (CP2 carry-over 4): the parked message names who may approve.**
+  - `report.ts` `approverPhrase(required, agent)` gives the configured approvers, without the author's own human where a rule says `distinct`. For rules that name nobody it gives `any of the hub's approvers except sam; trunk protects migrations/** without naming approvers`. Mixed rules are listed rule by rule.
+  - `parkedMessage` takes that phrase (`who`), and so does the parked report's `message` (`pipeline.ts` `park`), which before left the approvers out when any rule named none.
+  - `requirements.ts` `approversOf` had no other user and is gone.
+  - Tests: `report.test.ts` "the parked message names who may approve (CP3)" (4 tests), and e2e scenario 7.
+  - Follow-up at the CP3 gate (resumed integration): an `ai_resolution` requirement's rule (the resolver's `requireApproval`, paths = the resolved files, `approvers: null`) is no longer described as "trunk protects src/auth.ts without naming approvers". `approverPhrase` says "trunk's resolver.requireApproval asks for a human review of the AI-resolved src/auth.ts" (joined with " and " to a protected reason), and labels it `AI-resolved src/auth.ts: …` in a rule-by-rule list. Test: "says an ai_resolution requirement is the resolver's requireApproval, not a protected path".
+  - Not changed: `nextSteps('approval_timeout')` reads `ctx.approvers`, which nothing sets. The hub fails those landings itself, so that lander text never reaches anyone.
+- **Integrator fix: the simulation's shard timeout scales with its seed count** (`test/sim/sweep.ts`: at least 30 min, else 1 s per seed). A 5,000-seed shard of the documented nightly 20,000 takes about 20 min, too close to the fixed 30 min on a busier machine.
+- **The CP3 gate: `SIM_SEEDS=20000 npx vitest run packages/lander/test/simulation` is green** (4 files, 10 tests: the four 5,000-seed shards, determinism and the five mutation guards), on the committed tree. 117,147 landings (50,199 landed); 51,667 lander kills, 27,498 freezes, 8,766 rewinds, 24,312 foreign pushes, 972 recreated databases; 2,618 in-doubt landings pushed by the next lease holder, 1,456 found on trunk, 1,489 requeued; 2,196 parked. About 39 min of wall time on this 4-core machine: Vitest runs three shard files at once here, so shard 2 starts when the others finish (each shard about 19.5 min).
+- **Recorded, not fixed (CP2 carry-over 3): `resolveInDoubt` in a later lander process still sends no AI-resolved messages.** It isn't cheap. At `pushing` the hub holds no report (the pushing advance carries none). A later process would have to parse the paths from the candidate's `Agenthub-Resolved` trailer, which lists at most 10, and attribute the trunk-side landings again through the hub with the three-key trailer rule. The trailer and the `requireApproval` gate still hold for such a landing. README Limits now states the gap.

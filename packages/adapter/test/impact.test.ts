@@ -1,7 +1,6 @@
 // A4 (design §2.5, §3.12, §2.3.6): impact warnings and who_uses. Four
-// worktrees of one repository and a real hub (H4's server, with
-// /symbol-changes from H6 or, until H6 is merged here, the test front in
-// symbol-changes-front.ts). maya's agent changes signatures through the built
+// worktrees of one repository and a real hub (H4's server, with H6's
+// /symbol-changes; the test front that stood in for H6 went at CP3). maya's agent changes signatures through the built
 // `hub` CLI's edit hooks (the Edit tool played between PreToolUse and
 // PostToolUse); the other agents run their MCP servers in-process, each with a
 // live feed on its own checkout, as `hub mcp` does.
@@ -20,8 +19,7 @@ import { Feed } from '../src/feed.js';
 import { moduleStem, pruneRefcache, refcacheKey, refcacheStats, relevant } from '../src/impact.js';
 import { createMcpServer } from '../src/mcp.js';
 import { A, B, PROJECT, client, git, hubCli, sleep, testEnv } from './helpers.js';
-import { LANDER } from './landing-hub.js';
-import { startImpactHub, type ImpactHub } from './symbol-changes-front.js';
+import { LANDER, startLandingHub, type LandingHub } from './landing-hub.js';
 
 const C = 'lee/claude-1';
 const D = 'kim/claude-1';
@@ -70,7 +68,7 @@ const LOGOUT_SIG = { old_string: 'export function logout(session: string): boole
 const REFRESH_SIG = { old_string: 'export function refresh(session: string): string {', new_string: 'export function refresh(session: string, ttl?: number): string {' };
 const HASH_SIG = { old_string: 'export function hash(s: string): string {', new_string: 'export function hash(s: string, salt = ""): string {' };
 
-let hub: ImpactHub;
+let hub: LandingHub;
 let dir: string;
 let main: string;
 const wt: Record<string, string> = {};
@@ -197,7 +195,7 @@ let lee: Agent;
 let kim: Agent;
 
 beforeAll(async () => {
-  hub = await startImpactHub();
+  hub = await startLandingHub();
   dir = mkdtempSync(path.join(tmpdir(), 'agenthub-impact-'));
   main = path.join(dir, 'sample');
   mkdirSync(path.join(main, 'src'), { recursive: true });

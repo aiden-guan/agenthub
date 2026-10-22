@@ -537,33 +537,71 @@ export function formatEvent(e: HubEvent): string {
 
 // ------------------------------------------------------------------ the landing queue (Phase 2)
 
-/** Who may approve the pending requirements, the landing author's own human left out where a rule says `distinct`; null = any approver. */
-export function approversOf(reqs: readonly ApprovalRequirement[], author: string): string[] | null {
-  const names = new Set<string>();
-  for (const r of reqs) {
-    for (const rule of r.rules) {
-      if (rule.approvers === null) return null;
-      for (const a of rule.approvers) if (!(rule.distinct && a === humanOf(author))) names.add(a);
-    }
+/**
+ * Who may approve under these rules (CP3: the configured approvers or the
+ * rule, never a bare "an approver"). `who` is `maya or sam`; for rules that
+ * name nobody it is `any of the hub's approvers` (`except sam` where a rule
+ * says distinct), and `why` names those rules' globs, since the hub's
+ * approvers file decides then. Mixed rules, or named ones that leave nobody,
+ * are listed rule by rule (`rulesText`). A rule of an `ai_resolution`
+ * requirement (marked `ai` by `rulesOf`) is the resolver's `requireApproval`,
+ * not a protected path, and `why` says so.
+ */
+export function whoMayApprove(rules: readonly ApprovalRuleOf[], author: string): { who: string; why: string | null } {
+  const seen = new Set<string>();
+  const unique = rules.filter((r) => {
+    const key = JSON.stringify([r.paths, r.approvers, r.distinct, r.ai === true]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const open = unique.filter((r) => r.approvers === null);
+  if (open.length === 0) {
+    const names = new Set<string>();
+    for (const r of unique) for (const a of r.approvers!) if (!(r.distinct && a === humanOf(author))) names.add(a);
+    if (names.size) return { who: orList([...names].map((n) => inline(n, 40))), why: null };
+  } else if (open.length === unique.length) {
+    const except = open.some((r) => r.distinct) ? ` except ${inline(humanOf(author), 40)}` : '';
+    const globs = [...new Set(open.filter((r) => !r.ai).flatMap((r) => r.paths))];
+    const resolved = [...new Set(open.filter((r) => r.ai).flatMap((r) => r.paths))];
+    const why = [
+      ...(globs.length ? [`trunk protects ${inline(globs.join(', '), 120)} without naming approvers`] : []),
+      ...(resolved.length ? [`trunk's resolver.requireApproval asks for a human review of the AI-resolved ${inline(resolved.join(', '), 120)}`] : []),
+    ].join(' and ');
+    return { who: `any of the hub's approvers${except}`, why };
   }
-  return [...names];
+  return { who: ruleListText(unique, author), why: null };
 }
 
-/** `maya or sam`, or `an approver` (any configured approver, the author's own human excluded where a rule says distinct). */
+/** An approval rule; `ai` marks one of an `ai_resolution` requirement (the resolver's requireApproval, design §2.6). */
+export type ApprovalRuleOf = ApprovalRequirement['rules'][number] & { ai?: boolean };
+
+/** The rules of these requirements, those of `ai_resolution` ones marked `ai`. */
+export function rulesOf(reqs: readonly ApprovalRequirement[]): ApprovalRuleOf[] {
+  return reqs.flatMap((r) => r.rules.map((rule) => (r.kind === 'ai_resolution' ? { ...rule, ai: true } : rule)));
+}
+
+/** `maya or sam`, or `any of the hub's approvers except sam; trunk protects migrations/** without naming approvers`. */
 function approverText(reqs: readonly ApprovalRequirement[], author: string): string {
-  const names = approversOf(reqs, author);
-  return names === null ? 'an approver' : names.length ? orList(names) : 'an approver';
+  const { who, why } = whoMayApprove(rulesOf(reqs), author);
+  return why ? `${who}; ${why}` : who;
 }
 
 /** `migrations/**: maya or sam` per rule of the pending requirements (globs from trunk's agenthub.json). */
 export function rulesText(reqs: readonly ApprovalRequirement[], author: string): string {
+  return ruleListText(rulesOf(reqs), author);
+}
+
+/** `migrations/**: any approver except sam; package.json: maya; AI-resolved src/a.ts: any approver`, once per distinct rule. */
+function ruleListText(rules: readonly ApprovalRuleOf[], author: string): string {
   const parts: string[] = [];
-  for (const r of reqs) {
-    for (const rule of r.rules) {
-      const who = rule.approvers === null ? 'any approver' : orList(rule.approvers.filter((a) => !(rule.distinct && a === humanOf(author))));
-      const part = `${inline(rule.paths.join(', '), 120)}: ${who || 'nobody else'}`;
-      if (!parts.includes(part)) parts.push(part);
-    }
+  for (const rule of rules) {
+    const who =
+      rule.approvers === null
+        ? `any approver${rule.distinct ? ` except ${inline(humanOf(author), 40)}` : ''}`
+        : orList(rule.approvers.filter((a) => !(rule.distinct && a === humanOf(author))));
+    const part = `${rule.ai ? 'AI-resolved ' : ''}${inline(rule.paths.join(', '), 120)}: ${who || 'nobody else'}`;
+    if (!parts.includes(part)) parts.push(part);
   }
   return parts.join('; ');
 }
@@ -930,6 +968,8 @@ export interface LandContext {
   /** Changed paths that match trunk's protected rules, and who may approve them (null = any approver). */
   protectedPaths: string[];
   approvers: string[] | null;
+  /** The protected rules those paths match (CP3): the text names them when they name no approvers. */
+  rules?: ReadonlyArray<ApprovalRequirement['rules'][number]>;
   /** The landing the lander works on now, if any. */
   running: { id: string; phase: LandingPhase | null } | null;
   keepPlaceRetries: number;
@@ -973,8 +1013,10 @@ export function landQueuedText(res: LandResult, c: LandContext): string {
     lines.push(`Queued ${l.id}${titled}${where ? `: ${where}` : ''}${doing}.`);
   }
   if (c.protectedPaths.length) {
-    const who = c.approvers === null ? 'an approver' : orList(c.approvers) || 'an approver';
-    lines.push(`It changes protected paths (${showNames(c.protectedPaths)}): its checks run now, and it lands once ${who} approves. Tell your human: \`hub approve ${l.id}\` in a terminal. You can't approve it.`);
+    const { who, why } = c.rules?.length ? whoMayApprove(c.rules, l.agent) : { who: c.approvers === null ? 'an approver' : orList(c.approvers) || 'an approver', why: null };
+    lines.push(
+      `It changes protected paths (${showNames(c.protectedPaths)}): its checks run now, and it lands once ${who} approves${why ? ` (${why})` : ''}. Tell your human: \`hub approve ${l.id}\` in a terminal. You can't approve it.`,
+    );
   }
   const held = res.held.flatMap((h) => h.scope);
   lines.push(
@@ -1684,9 +1726,10 @@ export const notices = {
     `${word(d.landing_id)}${taskPart(d)} came back (${word(d.code)}): call landing_status {"landing_id": "${word(d.landing_id)}"} for exactly what to fix, then fix it, commit on top and land again (you keep your place).`,
   cancelled: (d: NoticeData, by: string) =>
     `${word(d.landing_id)}${taskPart(d)} was cancelled by ${word(by) || 'a human'}; its task and the claims it held are yours again.`,
-  parked: (d: NoticeData, paths: readonly string[], approvers: string[] | null) =>
+  /** `who`: whoMayApprove over the landing's pending rules; null when the landing couldn't be read. */
+  parked: (d: NoticeData, paths: readonly string[], who: { who: string; why: string | null } | null) =>
     `${word(d.landing_id)}${taskPart(d)} passed its checks and waits for an approval (${showNames(paths)}): tell your human to run \`hub approve ${word(d.landing_id)}\` in a terminal ` +
-    `(${approvers === null ? 'any approver' : orList(approvers) || 'an approver'} may approve; you can't).`,
+    `(${who ? `${who.who} may approve${who.why ? `, as ${who.why}` : ''}` : 'an approver may approve'}; you can't).`,
   inDoubt: (d: NoticeData) =>
     `${word(d.landing_id)}${taskPart(d)} is waiting for a lander: the lander went offline while pushing it; any lander resolves it when it starts. hub_wait {"landing_id": "${word(d.landing_id)}"} tells you how it ends.`,
   relay: (d: NoticeData, paths: readonly string[], human: string) =>

@@ -422,6 +422,32 @@ class Agent {
     await this.mcp?.close().catch(() => undefined);
   }
 
+  /**
+   * The cursor of the next wait on this agent's feed: `hub_wait` reads the
+   * hub's sequence number, then waits on the feed from it, so whatever the
+   * test does after this resolves comes after that cursor. Replaces a fixed
+   * sleep (CP3); fails after `ms` if no wait begins.
+   */
+  nextWait(ms = 10_000): Promise<number> {
+    const feed = this.feed as Feed & { waitFor: Feed['waitFor'] };
+    const original = Feed.prototype.waitFor;
+    const restore = () => {
+      delete (feed as Partial<Feed>).waitFor;
+    };
+    return new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        restore();
+        reject(new Error(`no wait began on ${this.id}'s feed within ${ms} ms`));
+      }, ms);
+      feed.waitFor = function (this: Feed, since, pred, timeoutMs, restarts) {
+        restore();
+        clearTimeout(timer);
+        resolve(since);
+        return original.call(this, since, pred, timeoutMs, restarts);
+      };
+    });
+  }
+
   /** One MCP tool call; the feed notices on its result are kept in `notes`. */
   async call(name: string, args: Record<string, unknown> = {}): Promise<{ text: string; isError: boolean }> {
     const res = (await this.mcp.callTool({ name, arguments: args }, undefined, { timeout: 600_000 })) as { content: Array<{ type: string; text: string }>; isError?: boolean };
@@ -816,9 +842,11 @@ describe('landing queue end to end: two agents and a lander', () => {
     expect(decision, decided.text).not.toBe('');
 
     // sam's agent waits for anything relevant; then maya's edit changes the signature.
+    const waiting = B.nextWait();
     const woke = B.call('hub_wait', { timeout_s: 60 });
     woke.catch(() => undefined); // awaited below; if an assertion fails first, closing the MCP client rejects it unread
-    await sleep(500); // hub_wait reads the hub's sequence number first: the change must come after it
+    // hub_wait reads the hub's sequence number first, and the change must come after it: wait for its wait to begin (no fixed sleep).
+    const from = await waiting;
     const sig = await A.edit('src/auth.ts', AUTH_LOGIN_SIGNATURE.old, AUTH_LOGIN_SIGNATURE.new);
     expect(sig.allowed, sig.reason ?? '').toBe(true);
     // post-edit tells maya's agent who calls it.
@@ -829,6 +857,9 @@ describe('landing queue end to end: two agents and a lander', () => {
     const rows = (await observer.symbolChanges()).changes.filter((c) => c.symbol === 'login');
     expect(rows).toMatchObject([{ agent: MAYA, file: 'src/auth.ts', kind: 'signature', status: 'in_progress', task_id: T1, landing_id: null }]);
     inProgress = rows[0]!;
+    // Its symbol.changed event comes after the cursor sam's wait began from.
+    const changed = await B.feed.waitFor(from, (e: HubEvent) => e.type === 'symbol.changed' && (e.data as { change_id?: string }).change_id === inProgress!.id, 10_000);
+    expect(changed.events.length, `a symbol.changed for ${inProgress.id} after seq ${from}`).toBeGreaterThan(0);
     expect(inProgress.before).toContain('login(user: string): string');
     expect(inProgress.after).toContain('opts: { prefix?: string }');
     expect(inProgress.decisions.map((d) => d.id)).toContain(decision);
@@ -1012,8 +1043,10 @@ describe('landing queue end to end: two agents and a lander', () => {
     const queued = await B.land({ task_id: T3 });
     const L4 = queued.id;
     expect(queued.text).toMatch(
-      new RegExp(`It changes protected paths \\(migrations/002_add_name\\.sql\\): its checks run now, and it lands once .+ approves\\. Tell your human: \`hub approve ${L4}\` in a terminal\\. You can't approve it\\.`),
+      new RegExp(`It changes protected paths \\(migrations/002_add_name\\.sql\\): its checks run now, and it lands once .+ approves .*\\. Tell your human: \`hub approve ${L4}\` in a terminal\\. You can't approve it\\.`),
     );
+    // It names who may approve (CP3): the rule names nobody (a plain glob), so any of the hub's approvers but sam's own human.
+    expect(queued.text).toContain("it lands once any of the hub's approvers except sam approves (trunk protects migrations/** without naming approvers).");
     // No agent can approve: the MCP server has no such tool.
     for (const agent of [A, B]) expect((await agent.tools()).filter((t) => /approv|reject|resume/.test(t))).toEqual([]);
     // maya's agent is told its human may approve it.
@@ -1021,6 +1054,7 @@ describe('landing queue end to end: two agents and a lander', () => {
 
     const parked = await B.waitLanding(L4);
     expect(parked).toMatch(new RegExp(`^${L4} for ${T3} passed its checks and waits for an approval of migrations/002_add_name\\.sql`));
+    expect(parked).toContain("(any of the hub's approvers except sam; trunk protects migrations/** without naming approvers)");
     expect(await landing(L4)).toMatchObject({ status: 'needs_approval', candidate_checked: true });
     expect(checkRuns(L4)).toBe(1);
 

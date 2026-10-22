@@ -399,3 +399,11 @@ Performance (design §2.4), for lanes A and L:
 No new commits on `p23/symbols` in this stage: S1–S4 were merged at CP1a, so CP3a's "S1–S3 merged" holds. No requests queued; nothing applied.
 
 **Ruling deferred from CP1a, settled now: unkeyable top-level names stay `@toplevel`; the optional `unkeyable_name` amendment is not applied.** §1.10's "the whole file at top level" is read as the conservative intent, and `@toplevel` meets it where it matters: the region is claimed (the mapping invariant holds, property-tested in S3), and it conflicts with every whole-file and `@toplevel` claim. Treating it as the whole file would also block agents editing unrelated declarations of the file, which costs parallelism without protecting anything: claims are coordination, and the merge ladder and the checks are the gate (§4.2). If CP3's e2e or dogfood shows otherwise, the amendment is additive (`FileLevelReason` gains `'unkeyable_name'`) and S3 returns it in the same change.
+
+## Integrator, CP3
+
+No new commits on `p23/symbols` in this stage (S4 has been in since CP1a). No requests; nothing applied.
+
+- **Open for lane S (from H6's notes): long signatures.** `signatureChanges` compares signatures whole but reports them cut to 500 characters. A change past the 499th character therefore reaches the hub with `before == after`, and the hub withdraws the open row (or records no landed one). A fix belongs here: for example, cut both sides around their first difference. README Limits states it meanwhile.
+- **For a new language:** the adapter's `symbol-scope.ts` keeps the seven languages' extensions as a fast filter (A3). A language added here is claimed whole-file until it is added there too.
+- **The `unkeyable_name` ruling stands.** Neither the CP3 e2e nor the demo's Part 3 showed a case for it.

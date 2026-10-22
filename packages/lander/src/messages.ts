@@ -35,8 +35,8 @@ export async function tellSendback(ctx: LanderContext, landing: Landing, code: L
 }
 
 /** The direct message to the author of a landing parked for approval (best effort). */
-export async function tellParked(ctx: LanderContext, landing: Landing, paths: string[], approvers: string[] | null): Promise<void> {
-  await bestEffort(ctx, `message to ${landing.agent}`, () => ctx.hub.post(landing.agent, parkedMessage({ landingId: landing.id, paths, approvers })));
+export async function tellParked(ctx: LanderContext, landing: Landing, paths: string[], who: string): Promise<void> {
+  await bestEffort(ctx, `message to ${landing.agent}`, () => ctx.hub.post(landing.agent, parkedMessage({ landingId: landing.id, paths, who })));
 }
 
 /**

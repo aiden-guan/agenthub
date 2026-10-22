@@ -4,7 +4,7 @@ import { gitops } from '@agenthub/gitops';
 import type { Claim, FeedServerFrame, HeartbeatRequest, HeartbeatResult, HubEvent, Landing, SymbolChange, SymbolChangesResult } from '@agenthub/hub/protocol';
 import { HubApiError, classifyFailure, type HubClient } from './client.js';
 import { teamSections } from './config.js';
-import { approversOf, claimFiles, impactNotice, inline, notices as noticeText } from './format.js';
+import { claimFiles, impactNotice, inline, notices as noticeText, rulesOf, whoMayApprove } from './format.js';
 import { isAcked, readAcks, relevant, type Impact } from './impact.js';
 import { fetchTrunk } from './sync.js';
 
@@ -528,7 +528,7 @@ export class Feed {
       else if (e.type === 'landing.needs_approval' && d.parked === true) this.later(`parked:${id}`, id, async () => {
         const l = await this.landingOf(id!);
         const pending = l ? [...new Set(l.approval.flatMap((r) => r.paths))].sort() : paths(d);
-        return noticeText.parked(d, pending.length ? pending : paths(d), l ? approversOf(l.approval, l.agent) : null);
+        return noticeText.parked(d, pending.length ? pending : paths(d), l ? whoMayApprove(rulesOf(l.approval), l.agent) : null);
       });
     } else if (e.type === 'landing.needs_approval') {
       // Whether this agent's human may give it: the rules of the requirements still pending, the author's own human left out where a rule says distinct.
