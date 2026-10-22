@@ -3,7 +3,8 @@ import { LANDER_LEASE_KEY } from '@agenthub/contract';
 import { Hub, SqliteStore } from '@agenthub/hub';
 import { HubClient } from '../src/hub-client.js';
 import { Lease } from '../src/lease.js';
-import { systemClock, type Clock } from '../src/ports.js';
+import { systemClock, type Clock, type HubPort } from '../src/ports.js';
+import { override } from './helpers.js';
 import { startHubFront, type HubFront } from './hub-http.js';
 import { waitFor } from './scenario.js';
 
@@ -85,5 +86,42 @@ describe('Lease', () => {
     // A heartbeat acknowledgement makes it fresh again.
     expect(await l.renew()).toBe(true);
     expect(l.fresh()).toBe(true);
+  });
+
+  it('self-fencing dates an acknowledgement from when its heartbeat was sent, not from when the answer came', async () => {
+    const hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: 60_000 });
+    front = await startHubFront(hub);
+    const t = { wall: 1_000_000, mono: 5_000 };
+    const advance = (ms: number): void => {
+      t.wall += ms;
+      t.mono += ms;
+    };
+    const clock: Clock = { now: () => t.wall, monotonic: () => t.mono, sleep: systemClock.sleep };
+    const agent = 'lander/box-1-eeee';
+    const client = new HubClient({ url: front.url, project: P, agent });
+    // Every heartbeat answer takes `delay` to come back.
+    let delay = 15_000;
+    const slow = override<HubPort>(client, {
+      async heartbeat(req) {
+        const r = await client.heartbeat(req);
+        advance(delay);
+        return r;
+      },
+    });
+    const l = new Lease({ hub: slow, clock, agent, ttlMs: 60_000, intent: 'lander on box-1', log: () => {}, retryMs: 50 });
+    leases.push(l);
+    expect(await l.acquire()).toBe(true);
+    advance(10_000);
+    // Sent at +10 s, answered at +25 s: the hub renewed the lease at most at +10 s, so it is 15 s old (limit 20 s).
+    expect(await l.renew()).toBe(true);
+    expect(l.fresh()).toBe(true);
+    advance(6_000);
+    // 21 s after the request was sent (only 6 s after the answer): not fresh.
+    expect(l.fresh()).toBe(false);
+    // An answer that took longer than ttl/3 is no fresh acknowledgement at all.
+    delay = 25_000;
+    expect(await l.renew()).toBe(false);
+    expect(l.fresh()).toBe(false);
+    expect(l.held).toBe(true);
   });
 });

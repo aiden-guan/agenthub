@@ -3,7 +3,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { collectGarbage } from '../src/gc.js';
 import { systemClock } from '../src/ports.js';
-import { sh } from './helpers.js';
+import { override, sh } from './helpers.js';
 import { Scenario } from './scenario.js';
 
 // GC (design §2.2.7): land refs of terminal landings after 1 h, candidate refs
@@ -62,6 +62,64 @@ describe('collectGarbage', () => {
       const week = await gcAt(8 * DAY);
       expect(week.deleted).toEqual([cand1]);
       expect(sc.agenthubRefs()).toEqual([`refs/agenthub/land/${Hb}`]);
+    } finally {
+      await sc.lander.lease.release();
+    }
+  }, 60_000);
+
+  it("takes turns with admission: a landing made after a GC pass read the landings keeps the mirror's land ref (no false not_pushed)", async () => {
+    // GC's landings snapshot (the one read with no status or agent filter) can be held; so can the moment admission has fetched a land ref.
+    let holdSnapshot: { taken: () => void; release: Promise<void> } | null = null;
+    let afterLandFetch: (() => Promise<void>) | null = null;
+    const sc = (s = await Scenario.create({
+      wrapHub: (hub) =>
+        override(hub, {
+          async landings(filter) {
+            const out = await hub.landings(filter);
+            if (holdSnapshot && !filter?.status && !filter?.agent) {
+              const h = holdSnapshot;
+              holdSnapshot = null;
+              h.taken();
+              await h.release;
+            }
+            return out;
+          },
+        }),
+      wrapGit: (git) =>
+        override(git, {
+          async fetch(refspecs) {
+            const out = await git.fetch(refspecs);
+            if (afterLandFetch && refspecs.some((r) => r.includes(':refs/agenthub/land/'))) {
+              const f = afterLandFetch;
+              afterLandFetch = null;
+              await f();
+            }
+            return out;
+          },
+        }),
+    }));
+    await sc.lander.ensureLease();
+    try {
+      let taken!: () => void;
+      let release!: () => void;
+      const snapshot = new Promise<void>((r) => (taken = r));
+      holdSnapshot = { taken, release: new Promise<void>((r) => (release = r)) };
+      const gc = sc.lander.gc();
+      await snapshot; // GC knows no live landing
+      const a = sc.clone('maya/claude-1');
+      a.commit('a: change', { 'src/a.ts': 'export const a = 40;\n' });
+      const L = sc.land(a, { summary: 'a = 40' });
+      // Were GC to run between admission's fetch and its read of the fetched ref, it would delete that ref.
+      afterLandFetch = async () => {
+        release();
+        await Promise.race([gc, new Promise((r) => setTimeout(r, 1_000))]);
+      };
+      const timer = setTimeout(release, 300);
+      const admitted = await sc.lander.admitRound();
+      clearTimeout(timer);
+      await gc;
+      expect(sc.landing(L.id).status).toBe('queued');
+      expect(admitted).toBe(1);
     } finally {
       await sc.lander.lease.release();
     }

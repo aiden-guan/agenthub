@@ -20,7 +20,7 @@ import { openGitPort } from '../src/git-port.js';
 import { HubClient } from '../src/hub-client.js';
 import { initWorkdir } from '../src/init.js';
 import { Lander } from '../src/lander.js';
-import type { Faults } from '../src/ports.js';
+import type { Faults, GitPort, HubPort } from '../src/ports.js';
 import { startHubFront, type HubFront } from './hub-http.js';
 import { BASE_TIME, LANDER, PROJECT, sh, testEnv, tmp, type Tmp } from './helpers.js';
 
@@ -29,11 +29,16 @@ export const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), 
 export const CHECK = 'node check.mjs';
 export const approver = (name: string): HubAuth => ({ lander: false, approver: name });
 
-/** An update hook: trunk updates need the lander's committer identity; `refuse-trunk` in the remote refuses them all (push_rejected). */
+/**
+ * An update hook: trunk updates need the lander's committer identity;
+ * `refuse-trunk` in the remote refuses them all (push_rejected). Every trunk
+ * update that reaches the remote is logged first, refused or not.
+ */
 const HOOK = `#!/bin/sh
 ref="$1"; new="$3"
 case "$ref" in
   refs/heads/main)
+    echo "$new" >> "$GIT_DIR/trunk-updates.log"
     if [ -e "$GIT_DIR/refuse-trunk" ]; then echo "trunk updates are refused right now" >&2; exit 1; fi
     case "$new" in 0000000000000000000000000000000000000000) echo "trunk can't be deleted" >&2; exit 1;; esac
     who=$(git log -1 --format='%cn <%ce>' "$new")
@@ -91,6 +96,12 @@ export interface ScenarioOptions {
   fakeMergiraf?: boolean;
   faults?: Faults;
   leaseTtlMs?: number;
+  /** Hears every lander log line as it is written. */
+  onLog?: (line: string) => void;
+  /** Wraps the lander's hub port (to hold or watch a call). */
+  wrapHub?: (hub: HubPort) => HubPort;
+  /** Wraps the lander's git port. */
+  wrapGit?: (git: GitPort) => GitPort;
 }
 
 const SEED_FILES: Record<string, string> = {
@@ -174,13 +185,18 @@ export class Scenario {
     const mirror = path.join(this.workdir, 'mirror.git');
     const agent = o.agent ?? landerId('lander/test');
     const env = { ...process.env, PATH: this.PATH };
+    const hub: HubPort = new HubClient({ url: this.front.url, project: P, agent });
+    const git: GitPort = openGitPort({ mirror, remote: 'origin', env: { PATH: this.PATH } });
     return new Lander({
-      hub: new HubClient({ url: this.front.url, project: P, agent }),
-      git: openGitPort({ mirror, remote: 'origin', env: { PATH: this.PATH } }),
+      hub: this.o.wrapHub ? this.o.wrapHub(hub) : hub,
+      git: this.o.wrapGit ? this.o.wrapGit(git) : git,
       checks: new ChecksRunner({ workdir: this.workdir, mirror, env, killGraceMs: 2_000 }),
       resolver: null,
       faults: o.faults ?? this.o.faults,
-      log: (line) => this.logs.push(line),
+      log: (line) => {
+        this.logs.push(line);
+        this.o.onLog?.(line);
+      },
       agent,
       project: P,
       committer: LANDER,
@@ -252,6 +268,12 @@ export class Scenario {
 
   trunk(): string {
     return this.remoteRef('refs/heads/main')!;
+  }
+
+  /** How many trunk updates have reached the remote's update hook (refused ones included). */
+  trunkUpdateTries(): number {
+    const f = path.join(this.remote, 'trunk-updates.log');
+    return existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean).length : 0;
   }
 
   /** Remote refs under refs/agenthub/. */

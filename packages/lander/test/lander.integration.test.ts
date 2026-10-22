@@ -1,4 +1,4 @@
-import { existsSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseTeamSections } from '@agenthub/contract';
@@ -6,6 +6,7 @@ import { approvalDigest } from '@agenthub/gitops';
 import { HubError } from '@agenthub/hub';
 import type { Faults } from '../src/ports.js';
 import { commandHash } from '../src/report.js';
+import { sh } from './helpers.js';
 import { approver, CHECK, P, Scenario, waitFor } from './scenario.js';
 
 // design §5.3: a real local bare remote (receive.denyNonFastForwards and an
@@ -390,6 +391,43 @@ describe('hub-lander against a real hub and a real remote (design §5.3)', () =>
   );
 
   it(
+    'unknown push outcome, then run --once ends: the shutdown resolution pushes the same candidate onto the same base (§2.2.3, §2.2.7 step 3)',
+    async () => {
+      // The remote goes away once pushing is acknowledged, so no push try gets an answer; it is back when the attempt gives up.
+      const at = { remote: '', away: null as string | null };
+      const faults: Faults = {
+        at(point) {
+          if (point === 'after-pushing-ack' && at.away === null) {
+            at.away = `${at.remote}.away`;
+            renameSync(at.remote, at.away);
+          }
+        },
+      };
+      const onLog = (line: string): void => {
+        if (line.includes('stays in pushing') && at.away && !existsSync(at.remote)) renameSync(at.away, at.remote);
+      };
+      const sc = await scenario({ faults, onLog });
+      at.remote = sc.remote;
+      const a = sc.clone('maya/claude-1');
+      const seedTip = sc.trunk();
+      a.commit('a: change', { 'src/a.ts': 'export const a = 28;\n' });
+      const L = sc.land(a, { summary: 'a = 28' });
+      await sc.once();
+      expect(sc.logs.some((l) => l.includes(`resolving ${L.id} (in pushing) before stopping`))).toBe(true);
+      const done = sc.landing(L.id);
+      expect(done.status).toBe('landed');
+      expect(done.attempt).toBe(1);
+      expect(done.retries.trunk_moved).toBe(0);
+      expect(done.trunk_sha).toBe(done.candidate);
+      expect(sc.rev(`${done.trunk_sha}^1`)).toBe(seedTip);
+      expect(sc.firstParents(seedTip)).toEqual([done.trunk_sha]);
+      expect(sc.checkRuns(L.id)).toHaveLength(1);
+      expect(sc.agenthubRefs()).toEqual([]);
+    },
+    T,
+  );
+
+  it(
     'trunk rewritten: a force-rewound trunk pauses landing (trunk_rewritten), nothing starts, and resume --accept-trunk continues',
     async () => {
       let rewind: (() => void) | null = null;
@@ -450,9 +488,13 @@ describe('hub-lander against a real hub and a real remote (design §5.3)', () =>
       expect(sc.trunk()).toBe(seedTip);
       const C = stuck.candidate!;
       expect(sc.remoteRef(stuck.candidate_ref!)).toBe(C);
-      // While paused nothing is pushed, though next hands the landing back.
+      // The refused push reached the remote once (a refusal is not retried).
+      expect(sc.trunkUpdateTries()).toBe(1);
+      // While paused no trunk push is even tried, though next hands the landing back.
+      await sc.once();
       await sc.once();
       expect(sc.landing(L.id).phase).toBe('pushing');
+      expect(sc.trunkUpdateTries()).toBe(1);
       expect(sc.trunk()).toBe(seedTip);
       rmSync(path.join(sc.remote, 'refuse-trunk'));
       sc.hub.resumeLander(P, {}, approver('sam'));
@@ -461,6 +503,7 @@ describe('hub-lander against a real hub and a real remote (design §5.3)', () =>
       expect(done.status).toBe('landed');
       expect(done.trunk_sha).toBe(C);
       expect(sc.trunk()).toBe(C);
+      expect(sc.trunkUpdateTries()).toBe(2);
       expect(sc.checkRuns(L.id)).toHaveLength(1);
       expect(sc.agenthubRefs()).toEqual([]);
     },
@@ -488,6 +531,52 @@ describe('hub-lander against a real hub and a real remote (design §5.3)', () =>
   );
 
   it(
+    'no-op: the landed commit itself is already on trunk (pushed by hand): landed as that commit, nothing new',
+    async () => {
+      const sc = await scenario();
+      const a = sc.clone('maya/claude-1');
+      const H = a.commit('a: change', { 'src/a.ts': 'export const a = 21;\n' });
+      // A human with a bypass of the host rule pushes H itself to trunk.
+      sh(a.dir, ['push', '-q', 'origin', `${H}:refs/heads/main`]);
+      const L = sc.land(a, { summary: 'already there', files: ['src/a.ts'] });
+      await sc.once();
+      const done = sc.landing(L.id);
+      expect(done.status).toBe('landed');
+      expect(done.report?.resolved_by).toBe('none');
+      expect(done.trunk_sha).toBe(H);
+      expect(sc.trunk()).toBe(H);
+      expect(sc.agenthubRefs()).toEqual([]);
+      expect(sc.checkRuns(L.id)).toHaveLength(0);
+    },
+    T,
+  );
+
+  it(
+    'land ref overwritten after admission: the attempt checks the tip again and fails not_pushed (§4.1 #15)',
+    async () => {
+      const sc = await scenario();
+      const a = sc.clone('maya/claude-1');
+      const seedTip = sc.trunk();
+      const H = a.commit('a: change', { 'src/a.ts': 'export const a = 23;\n' });
+      const L = sc.land(a, { summary: 'a = 23' });
+      await sc.admit();
+      expect(sc.landing(L.id).status).toBe('queued');
+      // Someone points the land ref at other content on the remote itself.
+      const other = a.commit('a: other', { 'src/a.ts': 'export const a = 99;\n' });
+      sh(a.dir, ['push', '-q', 'origin', `${other}:refs/scratch/other`]);
+      expect(sc.remoteGit('update-ref', `refs/agenthub/land/${H}`, other).code).toBe(0);
+      await sc.once();
+      const failed = sc.landing(L.id);
+      expect(failed.status).toBe('failed');
+      expect(failed.failure?.code).toBe('not_pushed');
+      expect(failed.report?.warnings.join('\n')).toContain(`not at the landed commit ${H.slice(0, 12)}`);
+      expect(sc.trunk()).toBe(seedTip);
+      expect(sc.checkRuns(L.id)).toHaveLength(0);
+    },
+    T,
+  );
+
+  it(
     'stacked: waits_for holds the second landing until the first lands; then only the work after it is applied',
     async () => {
       const sc = await scenario();
@@ -501,8 +590,14 @@ describe('hub-lander against a real hub and a real remote (design §5.3)', () =>
       const L2 = sc.land(a, { task_id: t2, summary: 'feature', files: ['src/feature.ts'] });
       await sc.once(); // admits both; L-1 runs and parks for approval
       expect(sc.landing(L1.id).status).toBe('needs_approval');
-      expect(sc.landing(L2.id).waits_for).toBe(L1.id);
-      expect(sc.landing(L2.id).status).toBe('queued');
+      const admitted = sc.landing(L2.id);
+      expect(admitted.waits_for).toBe(L1.id);
+      expect(admitted.status).toBe('queued');
+      // Holds cover the whole change from its landed base (§2.2.4 step 3), L-1's file included;
+      // the approval it asks for covers only the work after L-1, whose own approval covers the migration.
+      expect(admitted.files).toEqual(['migrations/010.sql', 'src/feature.ts']);
+      expect(admitted.protected).toEqual(['migrations/010.sql']);
+      expect(admitted.approval).toEqual([]);
       await sc.once(); // nothing eligible: L-2 waits for L-1
       expect(sc.landing(L2.id).status).toBe('queued');
       expect(sc.landing(L2.id).attempt).toBe(0);
@@ -517,6 +612,38 @@ describe('hub-lander against a real hub and a real remote (design §5.3)', () =>
       const [C1, C2] = sc.firstParents(seedTip);
       expect(sc.trailers(C2!)['Agenthub-Source']).toBe(H4);
       expect(sc.remoteGit('diff-tree', '-r', '--name-only', '--no-commit-id', C1!, C2!).stdout.trim()).toBe('src/feature.ts');
+    },
+    T,
+  );
+
+  it(
+    "stacked on a branch that merged trunk by hand: admission holds and asks approval for the agent's own work only, not trunk's",
+    async () => {
+      const sc = await scenario();
+      const a = sc.clone('maya/claude-1');
+      const b = sc.clone('sam/claude-1');
+      const original = sc.show(sc.trunk(), 'migrations/001.sql')!;
+      a.commit('a: one', { 'src/a.ts': 'export const a = 31;\n' });
+      const L1 = sc.land(a, { summary: 'one' });
+      await sc.admit();
+      expect(sc.landing(L1.id).status).toBe('queued');
+      // Trunk moves outside the queue (a protected file and src/x.ts), and sam claims src/x.ts.
+      sc.foreignPush({ 'migrations/001.sql': original.replace('create table posts (id int);', 'create table posts (id int, t text);'), 'src/x.ts': 'export const x = 5;\n' });
+      expect(sc.hub.claim(P, b.agent, { files: ['src/x.ts'], intent: 'x work' }).status).toBe('granted');
+      // maya merges trunk into her branch by hand and keeps working on top of L-1.
+      a.git('fetch', '-q', 'origin', 'main');
+      a.git('merge', '-q', '--no-edit', 'origin/main');
+      a.commit('a: feature', { 'src/feature.ts': 'export const f = 1;\n' });
+      const L2 = sc.land(a, { summary: 'feature', files: ['src/feature.ts'] });
+      await sc.admit();
+      const l2 = sc.landing(L2.id);
+      expect(l2.status).toBe('queued');
+      expect(l2.waits_for).toBe(L1.id);
+      // diffNames(landedBase(T, H), H): maya's own files (L-1's and the new one), never trunk's migrations/001.sql or src/x.ts.
+      expect(l2.files).toEqual(['src/a.ts', 'src/feature.ts']);
+      expect(l2.protected).toEqual([]);
+      expect(l2.approval).toEqual([]);
+      expect(sc.hub.listClaims(P).find((c) => c.holder === b.agent && c.scope.some((e) => e.file === 'src/x.ts'))?.status).toBe('active');
     },
     T,
   );
@@ -550,16 +677,29 @@ describe('hub-lander against a real hub and a real remote (design §5.3)', () =>
     "config invalid on trunk: a strict parse error pauses landing (config_invalid) and admits nothing; the lenient parse still reads it",
     async () => {
       const sc = await scenario();
+      // The lander starts on a valid trunk (its startup report pauses nothing), then the typo lands on trunk by hand.
+      await sc.lander.ensureLease();
+      expect(sc.hub.landerStatus(P).control.paused).toBeNull();
       const bad = JSON.parse(sc.agenthubJson()) as { land: Record<string, unknown> };
       bad.land.chekc = 'typo';
       sc.foreignPush({ 'agenthub.json': `${JSON.stringify(bad, null, 2)}\n` }, 'a typo in agenthub.json');
       const a = sc.clone('maya/claude-1');
       a.commit('a: change', { 'src/a.ts': 'export const a = 13;\n' });
       const L = sc.land(a, { summary: 'a = 13' });
-      await sc.once();
+      // Admission reads trunk's config itself (§2.2.4 step 2): invalid → pause, admit nothing.
+      try {
+        expect(await sc.lander.admitRound()).toBe(0);
+      } finally {
+        await sc.lander.lease.release();
+      }
       const control = sc.hub.landerStatus(P).control;
       expect(control.paused?.reason).toBe('config_invalid');
       expect(control.paused?.detail).toContain('land.chekc');
+      expect(sc.logs.some((l) => l.startsWith('admission: ') && l.includes('land.chekc') && l.includes('config_invalid'))).toBe(true);
+      expect(sc.landing(L.id).status).toBe('submitted');
+      // A whole run --once (startup report, admission, next) changes nothing while it is paused.
+      await sc.once();
+      expect(sc.hub.landerStatus(P).control.paused?.reason).toBe('config_invalid');
       expect(sc.landing(L.id).status).toBe('submitted');
       // What hooks, the digest and the guard use: lenient, so edits keep working, and the problem is reported.
       const lenient = parseTeamSections(bad, { strict: false });

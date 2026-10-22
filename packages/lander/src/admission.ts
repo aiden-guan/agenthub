@@ -110,15 +110,19 @@ export class Admission {
       // The same agent's failed or superseded landing lands inside this one (also_landed, at the attempt).
     }
     const waitsFor = await this.nearest(waits);
+    // 3. The holds (and `protected`) cover the whole change from its landed base: the agent's own files, the
+    // stacked work below it included, never trunk's content a branch merged in by hand.
+    const files = changed;
 
-    // A stacked landing lands on top of the one it waits for (its landed base becomes that commit, §1.1), so its
-    // holds and approvals cover only the work after it. Should that one not land, the attempt finds the extra
-    // protected paths and asks for them then (§2.2.5 P3).
-    const scopeBase = waitsFor?.commit ?? base;
-    const files = scopeBase === base ? changed : await ctx.git.diffNames(scopeBase, H);
-
-    // 5. Approvals for the protected paths the change touches.
-    const required = await protectedRequirements(ctx.git, land.protected, files, scopeBase, H);
+    // 5. Approvals for the protected paths the change touches. A stacked landing lands on top of the one it waits
+    // for (its landed base becomes that commit, §1.1), whose own approval covers that part; asking again would
+    // bind a requirement the hub enforces at pushing to content already approved (or already on trunk). So it
+    // asks only for its own paths that also changed after that commit, digested from that commit, which is the
+    // base P3 digests them from once that one has landed. Should it not land, P3 finds the rest and asks for
+    // it then (§2.2.5 P3).
+    const approvalBase = waitsFor?.commit ?? base;
+    const approvalFiles = approvalBase === base ? files : intersect(files, await ctx.git.diffNames(approvalBase, H));
+    const required = await protectedRequirements(ctx.git, land.protected, approvalFiles, approvalBase, H);
 
     // 7. Admit: the hub re-makes the holds through the claim gate.
     const req: LandingAdmitRequest = {
@@ -130,7 +134,7 @@ export class Admission {
       protected: protectedPaths(files, land.protected),
       required,
       waits_for: waitsFor?.id ?? null,
-      warnings: await this.warnings(scopeBase, H, files),
+      warnings: await this.warnings(base, H, files),
     };
     const r = await hubWrite(ctx, `admit ${landing.id}`, () => ctx.hub.admit(landing.id, { ...req, lease: ctx.lease.auth() }));
     await ctx.faults.at('after-admit', landing.id);
@@ -177,6 +181,12 @@ export class Admission {
     await tellSendback(ctx, r.landing, r.landing.failure.code, s);
     return 'failed';
   }
+}
+
+/** The items of `a` (in its order) that are also in `b`. */
+function intersect(a: string[], b: string[]): string[] {
+  const inB = new Set(b);
+  return a.filter((x) => inB.has(x));
 }
 
 function list(items: string[], n = 5): string {

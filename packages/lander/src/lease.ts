@@ -83,6 +83,15 @@ export class Lease implements LeaseView {
   }
 
   /**
+   * Now, on both clocks. An acknowledgement is dated from when its request
+   * was sent: the hub renewed the lease at some point after that, never
+   * before, so a slow answer can't make the lease look fresher than it is.
+   */
+  private stamp(): { wall: number; mono: number } {
+    return { wall: this.o.clock.now(), mono: this.o.clock.monotonic() };
+  }
+
+  /**
    * Claims the lease. As a standby, keeps the queued claim alive and waits
    * until it is granted. Resolves true once held, false if `signal` aborted
    * first. A hub that can't be reached is retried; a refusal (403) throws
@@ -96,6 +105,8 @@ export class Lease implements LeaseView {
         const head = await hub.events({ waitMs: 0 });
         this.epochValue = head.epoch;
         let since = head.next_since;
+        // When the claim (and later each heartbeat of it) was sent: a queued claim keeps the expiry its last renewal gave it when it is granted.
+        let renewed = this.stamp();
         const r = await hub.claim({
           files: [LANDER_LEASE_KEY],
           mode: 'exclusive',
@@ -105,7 +116,7 @@ export class Lease implements LeaseView {
           intent: this.o.intent,
         });
         if (r.status === 'granted' && r.claim) {
-          this.become(r.claim);
+          this.become(r.claim, renewed);
           return true;
         }
         if (r.status !== 'queued' || !r.claim) {
@@ -123,12 +134,14 @@ export class Lease implements LeaseView {
           if (c.status === 'active') {
             if (c.holder !== this.o.agent) break;
             this.standby = false;
-            this.become(c);
+            this.become(c, renewed);
             return true;
           }
           if (c.status !== 'queued') break; // it lapsed or was released: claim again
           if (clock.monotonic() - lastBeat >= this.heartbeatMs) {
+            const sent = this.stamp();
             await hub.heartbeat({ claim_ids: [id] });
+            renewed = sent;
             lastBeat = clock.monotonic();
           }
           const ev = await hub.events({ since, types: ['claim.granted', 'claim.expired', 'claim.released'], waitMs: this.heartbeatMs, signal });
@@ -147,9 +160,9 @@ export class Lease implements LeaseView {
     return false;
   }
 
-  private become(claim: Claim): void {
+  private become(claim: Claim, renewed: { wall: number; mono: number }): void {
     this.claimId = claim.id;
-    this.ack = { wall: this.o.clock.now(), mono: this.o.clock.monotonic() };
+    this.ack = renewed;
     this.controller = new AbortController();
     this.o.log(`holding the lander lease ${claim.id}`);
     this.startTimer();
@@ -184,6 +197,7 @@ export class Lease implements LeaseView {
     const id = this.claimId;
     if (id === null) return false;
     try {
+      const sent = this.stamp();
       const r = await this.o.hub.heartbeat({ claim_ids: [id] });
       if (this.claimId !== id) return false;
       const mine = r.claims.find((c) => c.id === id);
@@ -191,7 +205,7 @@ export class Lease implements LeaseView {
         this.lost(`the hub no longer has lease ${id} as active`);
         return false;
       }
-      this.ack = { wall: this.o.clock.now(), mono: this.o.clock.monotonic() };
+      this.ack = sent;
       return this.fresh();
     } catch (err) {
       if (err instanceof HubCallError && !err.unavailable && err.code !== 'aborted') this.o.log(`heartbeat failed: ${err.message}`);

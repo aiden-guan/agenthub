@@ -109,6 +109,20 @@ export class Repo {
   }
 }
 
+/**
+ * `target` with some methods replaced (a port wrapper for tests). Every other
+ * method is bound to `target`, so classes with #private fields keep working.
+ */
+export function override<T extends object>(target: T, methods: Partial<T>): T {
+  return new Proxy(target, {
+    get(t, p) {
+      if (Object.prototype.hasOwnProperty.call(methods, p)) return (methods as Record<PropertyKey, unknown>)[p];
+      const v = Reflect.get(t, p, t) as unknown;
+      return typeof v === 'function' ? (v as (...args: unknown[]) => unknown).bind(t) : v;
+    },
+  });
+}
+
 /** A bare clone of `repo` with every branch, like the lander's mirror.git. */
 export function bareMirror(repo: Repo, dir: string): string {
   sh(path.dirname(dir), ['clone', '-q', '--bare', repo.dir, dir]);

@@ -60,8 +60,15 @@ export class Lander {
   private control: LanderControl | null = null;
   private landerErrors = 0;
   private since: number | undefined;
-  /** A landing of this lease left in pushing with its outcome unknown (resolved first at shutdown). */
-  private inDoubt: Landing | null = null;
+  /**
+   * The id of a landing this lease left in pushing with its outcome unknown
+   * (resolved first at shutdown). Only the id: the copy next handed out
+   * predates the attempt (no candidate, no trunk_base yet), so shutdown reads
+   * the landing as the hub has it now.
+   */
+  private inDoubt: string | null = null;
+  /** GC and admission rounds take turns on the mirror's land refs (see serially). */
+  private mirrorTurn: Promise<unknown> = Promise.resolve();
   private recovered = false;
 
   constructor(o: LanderOptions) {
@@ -140,14 +147,26 @@ export class Lander {
     return this.lease.held;
   }
 
-  /** One admission round (errors are logged; a lost lease ends it). */
+  /** One admission round (errors are logged; a lost lease ends it). It never overlaps a GC pass. */
   async admitRound(): Promise<number> {
     try {
-      return await this.admission.admitAll(this.stopController.signal);
+      return await this.serially(() => this.admission.admitAll(this.stopController.signal));
     } catch (err) {
       if (!(err instanceof LeaseLost)) this.ctx.log(`admission: ${err instanceof Error ? err.message : String(err)}`);
       return 0;
     }
+  }
+
+  /**
+   * Runs `fn` once the previous GC pass or admission round is over. GC drops
+   * the mirror's land refs of landings that weren't live when it read them;
+   * a landing submitted after that read would otherwise lose the ref between
+   * admission's fetch and its tip check, and fail with a false not_pushed.
+   */
+  private serially<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.mirrorTurn.then(fn, fn);
+    this.mirrorTurn = run.catch(() => undefined);
+    return run;
   }
 
   /** One pass of the attempt loop: next, then the attempt, or the in-doubt resolution it asks for. */
@@ -168,7 +187,7 @@ export class Lander {
     const landing = next.landing;
     if (!landing) return { kind: 'idle' };
     const out = next.resolve ? await resolveInDoubt(ctx, landing, next.control) : await runAttempt(ctx, landing, next.control);
-    this.inDoubt = out.kind === 'in_doubt' ? landing : null;
+    this.inDoubt = out.kind === 'in_doubt' ? landing.id : null;
     if (out.kind === 'failed' && out.code === 'lander_error') {
       if (++this.landerErrors >= MAX_LANDER_ERRORS) {
         this.landerErrors = 0;
@@ -245,10 +264,11 @@ export class Lander {
     }
   }
 
-  private async gc(): Promise<void> {
+  /** One GC pass (at each lease grant and hourly); it never overlaps an admission round. */
+  async gc(): Promise<void> {
     this.lastGc = this.ctx.clock.now();
     try {
-      await collectGarbage(this.ctx, { workdir: this.workdir });
+      await this.serially(() => collectGarbage(this.ctx, { workdir: this.workdir }));
     } catch (err) {
       this.ctx.log(`gc: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -257,16 +277,41 @@ export class Lander {
   /** The end of run(): a landing left in pushing is resolved first (bounded), then the lease is released. */
   private async shutdown(): Promise<void> {
     const { ctx } = this;
-    const doubt = this.inDoubt;
-    if (doubt && this.lease.held && this.control) {
-      ctx.log(`resolving ${doubt.id} (in pushing) before stopping`);
+    const id = this.inDoubt;
+    this.inDoubt = null;
+    if (id && this.lease.held) {
+      ctx.log(`resolving ${id} (in pushing) before stopping`);
       const timer = new Promise<'timeout'>((r) => {
         const t = setTimeout(() => r('timeout'), ctx.timings.stopResolveMs);
         t.unref?.();
       });
-      const r = await Promise.race([resolveInDoubt(ctx, doubt, this.control), timer]);
-      if (r === 'timeout') ctx.log(`${doubt.id} is still in pushing; the next lander resolves it`);
+      const r = await Promise.race([this.resolveBeforeStopping(id), timer]);
+      if (r === 'timeout') ctx.log(`${id} is still in pushing; the next lander resolves it`);
     }
     await this.lease.release();
+  }
+
+  /**
+   * design §2.2.3 / §2.2.7 for the landing this process left in pushing: the
+   * landing and the control as the hub has them now (the candidate and
+   * trunk_base the hub recorded at pushing, a pause since), then the in-doubt
+   * rule: on trunk → landed, trunk still at trunk_base with the candidate
+   * staged → the same push, requeue only once that candidate can't land.
+   */
+  private async resolveBeforeStopping(id: string): Promise<AttemptOutcome | null> {
+    const { ctx } = this;
+    let landing: Landing;
+    let control: LanderControl;
+    try {
+      [landing, { control }] = await Promise.all([ctx.hub.landing(id), ctx.hub.lander()]);
+    } catch (err) {
+      ctx.log(`${id}: can't read it from the hub (${err instanceof Error ? err.message : String(err)}); the next lander resolves it`);
+      return null;
+    }
+    if (landing.status !== 'running' || landing.phase !== 'pushing') {
+      ctx.log(`${id} is ${landing.status}${landing.phase ? ` (${landing.phase})` : ''} now: nothing to resolve`);
+      return null;
+    }
+    return resolveInDoubt(ctx, landing, control);
   }
 }
