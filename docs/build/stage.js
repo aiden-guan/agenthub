@@ -18,6 +18,8 @@ const CP = args.checkpoint
 // and notes for steps that were cut off mid-way ({key: text}).
 const DONE = args.done || {}
 const RESUME = args.resume || {}
+// Steps implemented (and committed) but not yet verified: {key: the implementer's last STEP_RESULT}. They start at verification.
+const IMPLEMENTED = args.implemented || {}
 
 async function ask(prompt, opts) {
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -94,7 +96,7 @@ async function runStep(lane, key) {
   const L = LANES[lane]
   const ph = 'Lanes'
   const head = `Step ${key} in lane ${lane}.`
-  let res = await ask(`${CONTEXT}
+  let res = IMPLEMENTED[key] || await ask(`${CONTEXT}
 
 ${laneRules(lane)}
 
