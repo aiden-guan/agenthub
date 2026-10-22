@@ -15,6 +15,8 @@
 
 <br/>
 
+![agenthub Hero Banner](assets/readme/hero.png)
+
 </div>
 
 ---
