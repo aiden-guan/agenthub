@@ -14,6 +14,10 @@ const PLAN = args.planPath
 const WORK = `${args.scratch}/work-p23`
 const LANES = args.lanes
 const CP = args.checkpoint
+// A continuation after an interrupted run: steps already implemented and verified ({key: {summary, lane_notes, problems, rounds}}),
+// and notes for steps that were cut off mid-way ({key: text}).
+const DONE = args.done || {}
+const RESUME = args.resume || {}
 
 async function ask(prompt, opts) {
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -94,7 +98,7 @@ async function runStep(lane, key) {
 
 ${laneRules(lane)}
 
-${head} Implement it completely, including every acceptance test its brief lists. Earlier steps of your lane are already committed on your branch; build on them.`, { label: `impl:${key}`, phase: ph, schema: STEP_RESULT })
+${head} Implement it completely, including every acceptance test its brief lists. Earlier steps of your lane are already committed on your branch; build on them.${RESUME[key] ? `\n\n${RESUME[key]}` : ''}`, { label: `impl:${key}`, phase: ph, schema: STEP_RESULT })
   if (!res) { log(`${key}: implementer failed`); return { key, lane, res: null, ver: null, rounds: 0 } }
   let ver = null
   let rounds = 0
@@ -131,7 +135,15 @@ Fix every blocking and major problem, and the minor ones where cheap. If the ver
 
 async function runLane(lane) {
   const out = []
-  for (const key of LANES[lane].steps) out.push(await runStep(lane, key))
+  for (const key of LANES[lane].steps) {
+    const d = DONE[key]
+    if (d) {
+      log(`${key}: already verified in an earlier run, skipped`)
+      out.push({ key, lane, res: { summary: d.summary, lane_notes: d.lane_notes || '' }, ver: { ok: true, tests_passed: true, problems: d.problems || [] }, rounds: d.rounds || 0, ok: true })
+      continue
+    }
+    out.push(await runStep(lane, key))
+  }
   return out
 }
 

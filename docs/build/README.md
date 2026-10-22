@@ -33,7 +33,7 @@ Stage 5 runs `stage5.js` directly with args `{repo, scratch, base: "origin/fix/p
 ## Things learned the hard way
 
 - An agent that dies on an API error returns null; `stage.js` retries each agent up to 3 times.
-- Don't resume a stopped parallel workflow with `resumeFromRunId`: its cache matches by call order, so with parallel lanes it re-runs finished agents on top of later commits. Write a continuation that skips finished steps instead.
+- Don't resume a stopped parallel workflow with `resumeFromRunId`: its cache matches by call order, so with parallel lanes it re-runs finished agents on top of later commits. Run `stage.js` again with `done` (finished steps: `{key: {summary, lane_notes, problems}}`, from the old run's journal) and `resume` (`{key: note}` for a step cut off with uncommitted work in its worktree) added to the args.
 - A brief "usage limit" API error can show up even with plenty of quota left; check the usage card before assuming the limit is real.
 - On Linux, `npm install` rewrites `package-lock.json` (it drops the `libc` fields). Lanes install with `npm ci`; only the integrator commits lockfile changes, and only for a dependency request.
 - The cloud session's git proxy accepts branch pushes but refuses tag pushes (HTTP 403). Checkpoint tags stay local; their commits are on `phase23` with the checkpoint name at the start of the message.
