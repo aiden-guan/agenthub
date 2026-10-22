@@ -1,12 +1,14 @@
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { ClaimResult } from '@agenthub/hub/protocol';
 import { claimRoot, lendIdentity, recordLending } from './checkout.js';
 import { HubClient, classifyFailure, type HubFailure } from './client.js';
-import { hasOwnSettings, loadConfig, sameHub, type HubConfig } from './config.js';
-import { denyReason, digestText, inline, showNames } from './format.js';
+import { hasOwnSettings, loadConfig, sameHub, teamSections, type HubConfig } from './config.js';
+import { denyReason, digestText, inline, showName, showNames, syncDigestLine, syncNoticeKey, syncPromptText } from './format.js';
 import { currentBranch, headCommit, isIgnored, toRepoPath, unclaimableReason } from './git.js';
 import { commitGuardOff } from './guard-status.js';
 import { PendingClaims, type StoredClaim } from './pending.js';
+import { HOOK_SYNC_BUDGET_MS, clearMarkers, clearMarkersElsewhere, enterEdit, noteMarkerElsewhere, removeMarker, staleFiles, syncPaths, syncWorkspace, type SyncPaths, type SyncResult } from './sync.js';
 
 export interface HookIO {
   stdin: string;
@@ -27,6 +29,18 @@ const ALLOW: HookOutcome = { stdout: '', stderr: '', exitCode: 0 };
  * that times out is a failure, which `onFailure: "block"` turns into a denial.)
  */
 const HOOK_REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * The hooks that sync (settle, digest) are bounded at 15 s (design §2.3.5):
+ * everything they do after they start, hub requests and the sync together,
+ * fits in this, which leaves the rest for starting node and answering.
+ */
+export const HOOK_DEADLINE_MS = 12_500;
+/** settle on UserPromptSubmit: releasing pending claims gets this much of it, so the sync after it keeps time to run. */
+const SETTLE_RELEASE_MS = 4_000;
+/** The digest: the hub requests after its sync (heartbeat, status, stats) keep this much of it. */
+const DIGEST_RESERVE_MS = 4_000;
+/** A hub request with less time than this left isn't started (its claim waits for the next try). */
+const MIN_REQUEST_MS = 200;
 
 /**
  * Let the edit through, and make sure someone sees that it isn't coordinated.
@@ -54,8 +68,10 @@ function failureText(failure: HubFailure, cfg: HubConfig): string {
   return inline(failure.message, 700 + (failure.kind === 'auth' ? (cfg.tokenWithheld?.length ?? 0) : 0));
 }
 
-function hookClient(cfg: HubConfig): HubClient {
-  return new HubClient({ ...cfg, timeoutMs: Math.min(cfg.timeoutMs, HOOK_REQUEST_TIMEOUT_MS) });
+/** A client for one hook request: within HOOK_REQUEST_TIMEOUT_MS, and done by `until` when the hook has a deadline. */
+function hookClient(cfg: HubConfig, until?: number): HubClient {
+  const cap = Math.min(cfg.timeoutMs, HOOK_REQUEST_TIMEOUT_MS, until === undefined ? Infinity : until - Date.now());
+  return new HubClient({ ...cfg, timeoutMs: Math.max(1, Math.floor(cap)) });
 }
 
 /** Claude Code PreToolUse output that blocks the tool call and tells the model why. */
@@ -143,12 +159,48 @@ function callIds(input: Record<string, any>): { session: string; thread: string;
  * and not when HUB_FAIL_CLOSED is set. A refusal (4xx), an auth error
  * (401/403) or a broken config denies it. A claim this call creates is
  * pending until `hub hook post-edit` confirms the edit ran.
+ *
+ * Phase 2: first the edit/sync exclusion (an in-flight marker, then the sync
+ * lock: an edit while a sync runs waits up to 3 s, then is denied with "retry
+ * this edit"; an interrupted sync blocks edits until hub_sync recovers), and
+ * on a newly granted claim the stale-base heads-up as additionalContext.
  */
 export async function preEditHook(io: HookIO): Promise<HookOutcome> {
   const input = parseInput(io.stdin);
   if (!input) return allowWithWarning('could not parse the hook input; edit not coordinated');
   const edited = editTarget(input, io);
   if (!edited) return ALLOW;
+  // Edit/sync exclusion (design §2.3.5): this call's in-flight marker first, then the sync lock. The
+  // marker stays until post-edit confirms the edit or settle ends the turn; a denied edit takes it away.
+  const ids = callIds(input);
+  const session = ids?.session ?? 'unknown';
+  // An edit in another checkout (another worktree, a nested repository): settle, which looks in the session's own
+  // checkouts, is told where its marker is, so it can clear it when the edit never ran (rejected at the prompt).
+  const marks = syncPaths(edited.root);
+  if (marks) for (const p of sessionSyncPaths(input, io)) if (p.dir !== marks.dir) noteMarkerElsewhere(p, session, marks.inflight);
+  const gate = await enterEdit(edited.root, { session, thread: ids?.thread ?? 'main', tool: ids?.tool ?? null });
+  if (!gate.ok) {
+    return deny(
+      gate.reason === 'syncing'
+        ? 'The workspace is updating to the latest trunk; retry this edit.'
+        : 'A workspace sync in this checkout was interrupted; call hub_sync to finish recovering, then retry this edit.',
+    );
+  }
+  const out = await claimForEdit(input, io, edited);
+  if (isDenial(out)) removeMarker(gate.marker);
+  return out;
+}
+
+function isDenial(out: HookOutcome): boolean {
+  try {
+    return JSON.parse(out.stdout)?.hookSpecificOutput?.permissionDecision === 'deny';
+  } catch {
+    return false;
+  }
+}
+
+/** The pre-edit hook's claim, once the edit/sync gate let the call through. */
+async function claimForEdit(input: Record<string, any>, io: HookIO, edited: { root: string; files: string[] }): Promise<HookOutcome> {
   // A name the hub refuses can't be claimed by anyone, so it can't conflict: leave it out, and say so.
   const refused = edited.files.flatMap((f) => {
     const why = unclaimableReason(f);
@@ -181,7 +233,16 @@ export async function preEditHook(io: HookIO): Promise<HookOutcome> {
     const res = await hookClient(cfg).claim({ files: target.files, mode: 'auto', queue: false, base_commit: headCommit(target.root) ?? undefined });
     if (res.status === 'granted') {
       trackClaim(input, target.root, cfg, res);
-      return unclaimed ? allowWithWarning(unclaimed, 600) : ALLOW;
+      // On a new claim: has trunk changed the file since this worktree's base? (Said once per file and trunk tip.)
+      const stale = res.renewed ? null : staleBaseNote(target.root, target.files, input, cfg);
+      if (unclaimed) {
+        const out = allowWithWarning(unclaimed, 600);
+        if (!stale) return out;
+        const json = JSON.parse(out.stdout);
+        json.hookSpecificOutput.additionalContext += `\nagenthub: ${stale}`;
+        return { ...out, stdout: JSON.stringify(json) };
+      }
+      return stale ? { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: `agenthub: ${stale}` } }), stderr: '', exitCode: 0 } : ALLOW;
     }
     const first = res.conflicts[0];
     if (!first) return deny(`Edit blocked: the hub denied the claim on ${showNames(target.files)} without naming a conflict. Tell your human.`);
@@ -223,8 +284,50 @@ function trackClaim(input: Record<string, any>, root: string, cfg: HubConfig, re
   }
 }
 
-/** Release pending claims (their edits never ran) and forget them. Ones the hub can't be reached for are kept for the next try. */
-async function releasePending(store: PendingClaims, entries: StoredClaim[], input: Record<string, any>, io: HookIO): Promise<void> {
+/**
+ * The stale-base heads-up (design §2.3.6): files of a newly granted claim that
+ * trunk changed since the worktree's merge base with it, as last fetched (no
+ * network). Only with a landing queue, and unless sync.staleEdit is off.
+ */
+function staleBaseNote(root: string, files: string[], input: Record<string, any>, cfg: HubConfig): string | null {
+  try {
+    const team = teamSections(root, { strict: false });
+    const land = team.sections.land;
+    if (!land || team.sections.sync.staleEdit === 'off') return null;
+    const stale = staleFiles(root, files, land, callIds(input)?.session ?? 'unknown', cfg.project);
+    if (!stale.length) return null;
+    return stale
+      .map(
+        (s) =>
+          `${showName(s.file)} changed on ${land.trunk} since your checkout${s.landing ? ` (${s.landing}${s.agent ? ` by ${s.agent}` : ''})` : ''}; ` +
+          `you're editing the older version, and your edit will be merged with it at landing. If your worktree is clean, hub_sync first.`,
+      )
+      .join(' ');
+  } catch {
+    return null; // a heads-up only
+  }
+}
+
+/**
+ * The sync files of the session's own checkouts, as settle finds them: those of
+ * Claude Code's project dir and of the hook's cwd.
+ */
+function sessionSyncPaths(input: Record<string, any>, io: HookIO): SyncPaths[] {
+  const out = new Map<string, SyncPaths>();
+  for (const dir of [io.env.CLAUDE_PROJECT_DIR, cwdFor(input, io)]) {
+    const root = dir ? claimRoot(dir, sessionDir(input, io)) : null;
+    const p = root ? syncPaths(root) : null;
+    if (p && !out.has(p.dir)) out.set(p.dir, p);
+  }
+  return [...out.values()];
+}
+
+/**
+ * Release pending claims (their edits never ran) and forget them. Ones the hub
+ * can't be reached for are kept for the next try, and so are those left when
+ * `until` (the hook's deadline) comes.
+ */
+async function releasePending(store: PendingClaims, entries: StoredClaim[], input: Record<string, any>, io: HookIO, until?: number): Promise<void> {
   // null: a broken config or an unreachable hub, so the entries for that checkout wait.
   const configs = new Map<string, HubConfig | null>();
   for (const e of entries) {
@@ -239,6 +342,7 @@ async function releasePending(store: PendingClaims, entries: StoredClaim[], inpu
     }
     const cfg = configs.get(e.root);
     if (!cfg) continue;
+    if (until !== undefined && until - Date.now() < MIN_REQUEST_MS) return;
     if (!cfg.agent) {
       store.remove(e);
       continue;
@@ -250,15 +354,14 @@ async function releasePending(store: PendingClaims, entries: StoredClaim[], inpu
       continue;
     }
     try {
-      const client = hookClient(cfg);
       if (e.created_at !== undefined) {
-        const c = await client.getClaim(e.claim_id);
+        const c = await hookClient(cfg, until).getClaim(e.claim_id);
         if (c.created_at !== e.created_at || c.holder !== cfg.agent) {
           store.remove(e);
           continue;
         }
       }
-      await client.release({ claim_id: e.claim_id });
+      await hookClient(cfg, until).release({ claim_id: e.claim_id });
       store.remove(e);
     } catch (err) {
       // The hub answered (no such claim, held by someone else): nothing is left to release.
@@ -283,6 +386,9 @@ export async function postEditHook(io: HookIO): Promise<HookOutcome> {
   const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
   const file = [toolInput.file_path, toolInput.notebook_path].find((p): p is string => typeof p === 'string' && p.length > 0);
   const root = file ? claimRoot(path.dirname(path.resolve(cwdFor(input, io), file)), sessionDir(input, io)) : null;
+  // The edit ran: its in-flight marker goes, so a sync may run again.
+  const marks = root ? syncPaths(root) : null;
+  if (marks) clearMarkers(marks, { session: ids.session, tool: ids.tool });
   const store = root ? PendingClaims.open(root) : null;
   if (!store) return ALLOW;
   const thread = store.list(ids.session).filter((e) => e.thread === ids.thread);
@@ -294,29 +400,104 @@ export async function postEditHook(io: HookIO): Promise<HookOutcome> {
 /**
  * `hub hook settle` — Stop, SubagentStop, UserPromptSubmit and SessionEnd hook.
  * When a turn (or a subagent's) is over, no tool call of it is still waiting
- * for permission, so the thread's claims that no PostToolUse confirmed are for
- * edits that never ran: release them. SessionEnd releases the whole session's.
- * Prints nothing (UserPromptSubmit output would be added to the prompt).
+ * for permission, so the thread's edit markers go, and its claims that no
+ * PostToolUse confirmed are for edits that never ran: release them.
+ * SessionEnd does it for the whole session. On UserPromptSubmit (a safe
+ * point) it then syncs the workspace with trunk, and prints additionalContext
+ * (which is added to the prompt) only when that changed the worktree, found a
+ * conflict, found it behind with uncommitted changes, or found an interrupted
+ * sync; otherwise it prints nothing.
  */
 export async function settleHook(io: HookIO): Promise<HookOutcome> {
+  const started = Date.now();
+  const until = started + HOOK_DEADLINE_MS;
   const input = parseInput(io.stdin);
   const ids = input && callIds(input);
   if (!input || !ids) return ALLOW;
   const wholeSession = input.hook_event_name === 'SessionEnd';
+  const prompt = input.hook_event_name === 'UserPromptSubmit';
+  // First the in-flight markers of the thread's (or session's) edit calls: none of them is mid-edit now. Those in
+  // other checkouts too (an edit of a file in another worktree), which the session's checkouts keep a note of.
+  const match = wholeSession ? { session: ids.session } : { session: ids.session, thread: ids.thread };
+  const own = sessionSyncPaths(input, io);
+  const cleared = new Set(own.map((p) => p.inflight));
+  for (const p of own) clearMarkers(p, match);
+  for (const p of own) clearMarkersElsewhere(p, match, cleared);
+  const roots = [io.env.CLAUDE_PROJECT_DIR, cwdFor(input, io)].map((dir) => (dir ? claimRoot(dir, sessionDir(input, io)) : null));
   const seen = new Set<string>();
-  for (const dir of [io.env.CLAUDE_PROJECT_DIR, cwdFor(input, io)]) {
-    const root = dir ? claimRoot(dir, sessionDir(input, io)) : null;
+  // On a prompt the sync comes after this, within the same 15 s: releasing gets a share of it.
+  const releaseUntil = prompt ? Math.min(until, started + SETTLE_RELEASE_MS) : until;
+  for (const root of roots) {
     const store = root ? PendingClaims.open(root) : null;
     if (!store || seen.has(store.dir)) continue;
     seen.add(store.dir);
     const entries = store.list(ids.session).filter((e) => wholeSession || e.thread === ids.thread);
-    await releasePending(store, entries, input, io);
+    await releasePending(store, entries, input, io, releaseUntil);
   }
-  return ALLOW;
+  // The safe point: a new prompt, so no tool call of the session can be mid-edit. Never on Stop or
+  // SubagentStop. The one time settle prints: the agent must know when its files changed under it.
+  if (!prompt) return ALLOW;
+  const synced = await safePointSync(input, io, 'prompt', Math.min(HOOK_SYNC_BUDGET_MS, until - Date.now()));
+  const text = synced && syncPromptText(synced.result);
+  if (!synced || !text || !freshNotice(synced.root, synced.result)) return ALLOW;
+  return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: text } }), stderr: '', exitCode: 0 };
 }
 
 /**
- * `hub hook digest` — SessionStart hook. Marks the agent present and returns
+ * The automatic sync at a safe point (SessionStart, UserPromptSubmit) of the
+ * session's own checkout: only with a landing queue and sync.auto on, within
+ * `budgetMs` (at most HOOK_SYNC_BUDGET_MS; it stops before changing anything
+ * once that is spent). Null when it didn't run; a sync that fails stays quiet
+ * (nothing changed).
+ */
+async function safePointSync(
+  input: Record<string, any>,
+  io: HookIO,
+  reason: 'prompt' | 'session_start',
+  budgetMs: number,
+  loaded?: HubConfig,
+): Promise<{ root: string; result: SyncResult } | null> {
+  const dir = sessionDir(input, io);
+  const root = loaded?.root ?? claimRoot(dir, dir);
+  if (!root) return null;
+  let cfg: HubConfig;
+  try {
+    cfg = loaded ?? configFor(root, input, io);
+  } catch {
+    return null;
+  }
+  if (!cfg.agent) return null;
+  const team = teamSections(root, { strict: false });
+  if (!team.sections.land || !team.sections.sync.auto) return null;
+  try {
+    return { root, result: await syncWorkspace(root, cfg, hookClient(cfg), { reason, budgetMs: Math.max(0, Math.min(HOOK_SYNC_BUDGET_MS, budgetMs)) }) };
+  } catch {
+    return null;
+  }
+}
+
+/** Whether this sync outcome says something settle hasn't said for this worktree yet (an unchanged state isn't repeated at every prompt). */
+function freshNotice(root: string, r: SyncResult): boolean {
+  const p = syncPaths(root);
+  if (!p) return true;
+  const key = syncNoticeKey(r);
+  try {
+    if (readFileSync(p.said, 'utf8') === key) return false;
+  } catch {
+    // nothing said yet
+  }
+  try {
+    mkdirSync(p.dir, { recursive: true });
+    writeFileSync(p.said, key);
+  } catch {
+    // then it may be said again
+  }
+  return true;
+}
+
+/**
+ * `hub hook digest` — SessionStart hook. Syncs the workspace with trunk (a
+ * safe point), marks the agent present and returns
  * a short team summary as `additionalContext`: active claims by others,
  * recent decisions, open tasks and the unread count (never message bodies).
  * Configuration warnings (HUB_AGENT overriding this checkout's identity, a
@@ -324,6 +505,7 @@ export async function settleHook(io: HookIO): Promise<HookOutcome> {
  * also when the hub fails or there is no identity.
  */
 export async function digestHook(io: HookIO): Promise<HookOutcome> {
+  const until = Date.now() + HOOK_DEADLINE_MS;
   const input = parseInput(io.stdin) ?? {};
   const context = (text: string): HookOutcome => ({
     stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: text } }),
@@ -347,6 +529,10 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
   // A commit guard a hook manager took out (husky rewrites .husky/_ on install) goes unnoticed otherwise.
   const guardOff = cfg.root && hasOwnSettings(cfg.root) ? commitGuardOff(cfg.root) : null;
   if (guardOff) cfg.warnings.push(guardOff);
+  // The land, sync and symbols sections, read leniently: a bad value is a warning here (its default
+  // applies), never a blocked edit. The lander and `land` read them strictly and refuse instead.
+  const team = cfg.root ? teamSections(cfg.root, { strict: false }) : null;
+  if (team?.problems.length) cfg.warnings.push(...team.problems.map((p) => `${p} (the default applies here; the lander and land refuse it until it is fixed)`));
   const warning = warningOf(cfg.warnings);
   const also = warning ? `\n${warning}` : '';
   if (!cfg.agent) {
@@ -354,11 +540,19 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
       `agenthub: this checkout has no agent identity, so your edits are not coordinated with the team. Ask your human to run \`hub init --agent <human>/<agent>\` here.${also}`,
     );
   }
-  const client = hookClient(cfg);
+  // The safe-point sync comes first, so the digest describes the worktree as it is now. The hub requests after it
+  // keep DIGEST_RESERVE_MS of the hook's 15 s, and each is done by the deadline.
+  const synced = await safePointSync(input, io, 'session_start', until - Date.now() - DIGEST_RESERVE_MS, cfg);
+  const trunkLine = synced ? syncDigestLine(synced.result) : null;
+  if (synced && trunkLine) freshNotice(synced.root, synced.result); // the first prompt needn't say it again
+  // Said also when the hub can't give the digest: the worktree changed (or needs the agent) all the same.
+  const trunkAlso = trunkLine ? `\n${trunkLine}` : '';
   try {
-    await client.heartbeat({ client: 'claude-code', branch: cfg.root ? (currentBranch(cfg.root) ?? undefined) : undefined, worktree: cfg.root ?? undefined });
-    const status = await client.status();
-    const text = digestText(status, cfg.agent, cfg.url);
+    await hookClient(cfg, until).heartbeat({ client: 'claude-code', branch: cfg.root ? (currentBranch(cfg.root) ?? undefined) : undefined, worktree: cfg.root ?? undefined });
+    const status = await hookClient(cfg, until).status();
+    // The queue's median land→trunk time, when there is a queue to speak of.
+    const stats = status.lander && (status.queue?.length ?? 0) > 0 && until - Date.now() >= MIN_REQUEST_MS ? await hookClient(cfg, until).landingStats().catch(() => null) : null;
+    const text = digestText(status, cfg.agent, cfg.url, { stats, trunk: team?.sections.land?.trunk, trunkLine });
     if (!warning) return context(text);
     return {
       stdout: JSON.stringify({ systemMessage: warning, hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `${warning}\n\n${text}` } }),
@@ -370,9 +564,9 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
     if (failure.kind !== 'unreachable') {
       // An auth error's message already says why the token was withheld.
       const rest = warningOf(cfg.warnings.filter((w) => failure.kind !== 'auth' || w !== cfg.tokenWithheld));
-      return problem(`agenthub: ${failureText(failure, cfg)}. Edits in this checkout are blocked until this is fixed; tell your human.${rest ? `\n${rest}` : ''}`);
+      return problem(`agenthub: ${failureText(failure, cfg)}. Edits in this checkout are blocked until this is fixed; tell your human.${rest ? `\n${rest}` : ''}${trunkAlso}`);
     }
     const mode = cfg.failClosed ? 'Edits will be blocked until it is back.' : 'Edits are not being coordinated until it is back.';
-    return problem(`agenthub: the team hub is unavailable (${inline(failure.message, 200)}). ${mode}${also}`);
+    return problem(`agenthub: the team hub is unavailable (${inline(failure.message, 200)}). ${mode}${also}${trunkAlso}`);
   }
 }

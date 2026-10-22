@@ -1,4 +1,6 @@
 import type {
+  ApproveRequest,
+  CancelRequest,
   CheckResult,
   Claim,
   ClaimConflict,
@@ -13,10 +15,20 @@ import type {
   InboxResult,
   LandRequest,
   LandResult,
+  LanderControl,
+  LanderInfo,
+  LanderResumeRequest,
+  Landing,
+  LandingStats,
+  LandingStatus,
   Message,
+  RejectRequest,
   ReleaseRequest,
   ReleaseResult,
   StatusResult,
+  SymbolChangeStatus,
+  SymbolChangesRequest,
+  SymbolChangesResult,
   Task,
   TaskCreateRequest,
   TaskStatus,
@@ -31,16 +43,23 @@ export class HubUnavailableError extends Error {
   }
 }
 
-/** The hub answered with an error. */
+/** The hub answered with an error. `details` carries structured data for some codes (claim_conflict: `{conflicts}`). */
 export class HubApiError extends Error {
   constructor(
     readonly status: number,
     readonly code: string,
     message: string,
+    readonly details: Record<string, unknown> | null = null,
   ) {
     super(message);
     this.name = 'HubApiError';
   }
+}
+
+/** A human approver's credentials, sent only by `hub approve`, `hub reject` and `hub lander resume` from a terminal. */
+export interface ApproverCredentials {
+  name: string;
+  token: string;
 }
 
 /**
@@ -98,7 +117,14 @@ export class HubClient {
     return h;
   }
 
-  async request<T>(method: 'GET' | 'POST', path: string, body?: unknown, timeoutMs = this.cfg.timeoutMs, abort?: AbortSignal): Promise<T> {
+  async request<T>(
+    method: 'GET' | 'POST',
+    path: string,
+    body?: unknown,
+    timeoutMs = this.cfg.timeoutMs,
+    abort?: AbortSignal,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<T> {
     // Built outside the try: a local mistake (a bad timeout) must not read as "hub unreachable".
     const signal = abort ? AbortSignal.any([AbortSignal.timeout(timeoutMs), abort]) : AbortSignal.timeout(timeoutMs);
     const unreachable = (err: unknown) => {
@@ -109,7 +135,7 @@ export class HubClient {
     try {
       res = await fetch(`${this.base}${path}`, {
         method,
-        headers: { ...this.headers(), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
+        headers: { ...this.headers(), ...extraHeaders, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal,
       });
@@ -138,7 +164,15 @@ export class HubClient {
     } catch {
       throw new HubApiError(res.status, 'bad_response', `hub sent a non-JSON response (HTTP ${res.status})`);
     }
-    if (!res.ok) throw new HubApiError(res.status, data?.error?.code ?? 'http_error', data?.error?.message ?? `HTTP ${res.status}`);
+    if (!res.ok) {
+      const details = data?.error?.details;
+      throw new HubApiError(
+        res.status,
+        data?.error?.code ?? 'http_error',
+        data?.error?.message ?? `HTTP ${res.status}`,
+        details && typeof details === 'object' && !Array.isArray(details) ? details : null,
+      );
+    }
     return data as T;
   }
 
@@ -223,8 +257,51 @@ export class HubClient {
   async decide(req: DecisionRequest): Promise<Decision> {
     return (await this.request<{ decision: Decision }>('POST', '/decisions', req)).decision;
   }
+  /** Phase 1 record mode, or with `queue: true` (Phase 2) the queue: the commit must already be pushed to its land ref. */
   land(req: LandRequest): Promise<LandResult> {
     return this.request('POST', '/land', req);
+  }
+  /** Live landings first, in queue order, then the most recent. */
+  async landings(filter: { statuses?: LandingStatus[]; agent?: string; task_id?: string; limit?: number } = {}): Promise<Landing[]> {
+    const q = new URLSearchParams();
+    if (filter.statuses?.length) q.set('status', filter.statuses.join(','));
+    if (filter.agent) q.set('agent', filter.agent);
+    if (filter.task_id) q.set('task', filter.task_id);
+    if (filter.limit) q.set('limit', String(filter.limit));
+    return (await this.request<{ landings: Landing[] }>('GET', `/landings${q.size ? `?${q}` : ''}`)).landings;
+  }
+  async landing(id: string): Promise<Landing> {
+    return (await this.request<{ landing: Landing }>('GET', `/landings/${encodeURIComponent(id)}`)).landing;
+  }
+  landingStats(days?: number): Promise<LandingStats> {
+    return this.request('GET', `/landings/stats${days !== undefined ? `?days=${days}` : ''}`);
+  }
+  /** T14: by the landing's author (this agent), or with `approver` by a human approver. */
+  async cancel(id: string, req: CancelRequest = {}, approver?: ApproverCredentials): Promise<Landing> {
+    return (await this.request<{ landing: Landing }>('POST', `/landings/${encodeURIComponent(id)}/cancel`, req, undefined, undefined, approver ? approverHeaders(approver) : {})).landing;
+  }
+  async approve(id: string, req: ApproveRequest, approver: ApproverCredentials): Promise<Landing> {
+    return (await this.request<{ landing: Landing }>('POST', `/landings/${encodeURIComponent(id)}/approve`, req, undefined, undefined, approverHeaders(approver))).landing;
+  }
+  async reject(id: string, req: RejectRequest, approver: ApproverCredentials): Promise<Landing> {
+    return (await this.request<{ landing: Landing }>('POST', `/landings/${encodeURIComponent(id)}/reject`, req, undefined, undefined, approverHeaders(approver))).landing;
+  }
+  /** The lander lease (null when no lander runs), standbys, the pause flag and the trunk tip the hub knows. */
+  lander(): Promise<{ lease: LanderInfo | null; control: LanderControl }> {
+    return this.request('GET', '/lander');
+  }
+  landerResume(req: LanderResumeRequest, approver: ApproverCredentials): Promise<{ control: LanderControl }> {
+    return this.request('POST', '/lander/resume', req, undefined, undefined, approverHeaders(approver));
+  }
+  /** Phase 3: in-progress signature changes (an upsert; `after == before` withdraws). */
+  postSymbolChanges(req: SymbolChangesRequest): Promise<SymbolChangesResult> {
+    return this.request('POST', '/symbol-changes', req);
+  }
+  symbolChanges(opts: { since_ms?: number; statuses?: SymbolChangeStatus[] } = {}): Promise<SymbolChangesResult> {
+    const q = new URLSearchParams();
+    if (opts.since_ms !== undefined) q.set('since_ms', String(opts.since_ms));
+    if (opts.statuses?.length) q.set('status', opts.statuses.join(','));
+    return this.request('GET', `/symbol-changes${q.size ? `?${q}` : ''}`);
   }
   /**
    * Long-poll: events after `since` (after the hub's latest without it),
@@ -237,10 +314,19 @@ export class HubClient {
     return this.request('GET', `/events?${from}wait_ms=${waitMs}`, undefined, waitMs + this.cfg.timeoutMs + 5000, abort);
   }
 
+  /** The latest event seq, without reading any event: where a wait starts. */
+  async latestSeq(): Promise<number> {
+    return (await this.events(undefined, 0)).seq;
+  }
+
   feedUrl(since?: number): string {
     const q = new URLSearchParams();
     if (this.cfg.agent) q.set('agent', this.cfg.agent);
     if (since !== undefined) q.set('since', String(since));
     return `${this.base.replace(/^http/, 'ws')}/feed?${q}`;
   }
+}
+
+function approverHeaders(a: ApproverCredentials): Record<string, string> {
+  return { 'x-hub-approver': a.name, 'x-hub-approver-token': a.token };
 }

@@ -1,9 +1,10 @@
 import type { CheckResult } from '@agenthub/hub/protocol';
+import { DEFAULT_REF_PREFIX } from '@agenthub/contract';
 import { lendIdentity, lendingSessions } from './checkout.js';
 import { HubClient, classifyFailure } from './client.js';
-import { loadConfig, type HubConfig } from './config.js';
+import { loadConfig, teamSections, type HubConfig } from './config.js';
 import { INTENTS_NOTE, inline, minutesLeft, showName } from './format.js';
-import { mergeHeads, stagedPaths, unclaimableReason } from './git.js';
+import { findRepoRoot, mergeHeads, stagedPaths, unclaimableReason } from './git.js';
 import type { HookOutcome } from './hooks.js';
 
 const BYPASS = 'Emergency bypass: git commit --no-verify, or HUB_GUARD=off.';
@@ -100,4 +101,49 @@ export async function guard(io: { cwd: string; env: NodeJS.ProcessEnv; sequencer
     bypass,
   );
   return withNotes({ stdout: '', stderr: `${lines.join('\n')}\n`, exitCode: 1 });
+}
+
+/**
+ * `hub guard --pre-push` — git pre-push hook (design §2.3.6). git passes the
+ * remote's name and URL as arguments and one line per ref on stdin:
+ * `<local ref> <local sha> <remote ref> <remote sha>` (the local ref as typed,
+ * so it may hold spaces; the remote ref is read from the end). With a landing queue
+ * (a land section in trunk's agenthub.json), it refuses any update of
+ * `refs/heads/<trunk>`, deletion included, and of the lander's candidate refs
+ * (`<P>cand/…`); land refs and every other ref go through. A speed bump: the
+ * real enforcement is the host rule that only the lander may update trunk.
+ * HUB_GUARD=off bypasses it.
+ */
+export function prePushGuard(io: { cwd: string; env: NodeJS.ProcessEnv; stdin: string }): HookOutcome {
+  const pass: HookOutcome = { stdout: '', stderr: '', exitCode: 0 };
+  if (io.env.HUB_GUARD === 'off') return pass;
+  const root = findRepoRoot(io.cwd);
+  if (!root) return pass;
+  const land = teamSections(root, { strict: false }).sections.land;
+  if (!land) return pass;
+  const trunkRef = `refs/heads/${land.trunk}`;
+  const candPrefixes = [...new Set([`${land.refPrefix}cand/`, `${DEFAULT_REF_PREFIX}cand/`])];
+  const trunk: string[] = [];
+  const cand: string[] = [];
+  for (const line of io.stdin.split('\n')) {
+    // The remote ref is the second field from the end: git writes the local ref as typed, so a source expression
+    // with spaces in it (`HEAD^{/fix the bug}`, `main@{1 minute ago}`) shifts the fields before it. Ref names and
+    // object names never hold whitespace.
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 4) continue;
+    const remoteRef = fields[fields.length - 2]!;
+    if (remoteRef === trunkRef) trunk.push(remoteRef);
+    else if (candPrefixes.some((p) => remoteRef.startsWith(p))) cand.push(remoteRef);
+  }
+  if (!trunk.length && !cand.length) return pass;
+  const lines: string[] = [];
+  if (trunk.length) {
+    lines.push(`hub guard: push blocked: ${land.trunk} is updated only by the landing queue. Call land (MCP) or \`hub land\`. Emergency bypass: HUB_GUARD=off.`);
+    lines.push(...[...new Set(trunk)].map((r) => `  ${showName(r)}`));
+  }
+  if (cand.length) {
+    lines.push(`hub guard: push blocked: candidate refs (${land.refPrefix}cand/…) are written only by the lander. Emergency bypass: HUB_GUARD=off.`);
+    lines.push(...[...new Set(cand)].map((r) => `  ${showName(r)}`));
+  }
+  return { stdout: '', stderr: `${lines.join('\n')}\n`, exitCode: 1 };
 }

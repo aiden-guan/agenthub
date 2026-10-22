@@ -1,12 +1,17 @@
 import { parseArgs } from 'node:util';
-import type { TaskStatus } from '@agenthub/hub/protocol';
-import { HubApiError, HubClient } from './client.js';
-import { hasOwnSettings, loadConfig, type HubConfig } from './config.js';
-import { claimFiles, formatDecision, formatMessage, formatTask, statusText, UNTRUSTED_NOTE } from './format.js';
+import { landRef } from '@agenthub/contract';
+import { gitops } from '@agenthub/gitops';
+import type { Landing, LandingStats, TaskStatus } from '@agenthub/hub/protocol';
+import { approverCredentials, decideCommand, landerCommand, processTerminal } from './approve.js';
+import { HubApiError, HubClient, classifyFailure } from './client.js';
+import { hasOwnSettings, loadConfig, teamSections, type HubConfig } from './config.js';
+import { claimFiles, formatDecision, formatMessage, formatTask, landingLine, landingsText, statsText, statusText, syncToolText, UNTRUSTED_NOTE } from './format.js';
 import { claimKey, lendIdentity, lendingSessions } from './checkout.js';
-import { currentBranch, headCommit } from './git.js';
+import { fullHead, headCommit } from './git.js';
 import { commitGuardOff } from './guard-status.js';
+import { landWork, renderLanding } from './land.js';
 import { adoptClaims } from './pending.js';
+import { syncWorkspace } from './sync.js';
 import type { HookOutcome } from './hooks.js';
 
 const ok = (stdout: string): HookOutcome => ({ stdout, stderr: '', exitCode: 0 });
@@ -44,7 +49,7 @@ async function command(cfg: HubConfig, cmd: string, argv: string[]): Promise<Hoo
     }
 
     case 'status':
-      return ok(statusText(await client.status(), cfg.agent));
+      return ok(statusText(await client.status(), cfg.agent, viewOptions(cfg)));
 
     case 'task': {
       const [sub, ...rest] = argv;
@@ -130,21 +135,175 @@ async function command(cfg: HubConfig, cmd: string, argv: string[]): Promise<Hoo
     }
 
     case 'land': {
-      const { values } = parseArgs({ args: argv, options: { task: { type: 'string' }, summary: { type: 'string' } } });
-      need();
-      const res = await client.land({
-        task_id: values.task,
-        summary: values.summary,
-        branch: cfg.root ? (currentBranch(cfg.root) ?? undefined) : undefined,
-        commit: cfg.root ? (headCommit(cfg.root) ?? undefined) : undefined,
+      const { values } = parseArgs({
+        args: argv,
+        options: { task: { type: 'string' }, summary: { type: 'string' }, 'allow-untracked': { type: 'boolean' }, wait: { type: 'boolean' } },
       });
-      const lines = [`recorded ${res.landing.id}${res.task ? ` for ${res.task.id} (done)` : ''}; released ${res.released.map((c) => c.id).join(', ') || 'no claims'}`];
-      if (res.unblocked.length) lines.push(`unblocked: ${res.unblocked.join(', ')}`);
-      lines.push(res.note);
-      return ok(lines.join('\n'));
+      need();
+      const out = await landWork(
+        { cfg, client, feed: null },
+        {
+          task_id: values.task,
+          summary: values.summary,
+          allow_untracked: values['allow-untracked'],
+          wait_s: values.wait ? 600 : undefined,
+          untrackedRetry: 'run hub land --allow-untracked',
+        },
+      );
+      return out.error ? fail(out.text) : ok(out.text);
     }
+
+    case 'landings': {
+      const { values } = parseArgs({
+        args: argv,
+        options: { all: { type: 'boolean' }, watch: { type: 'boolean' }, stats: { type: 'boolean' }, days: { type: 'string' } },
+      });
+      const days = values.days === undefined ? undefined : Number(values.days);
+      if (days !== undefined && (!Number.isInteger(days) || days < 1 || days > 365)) return fail('--days must be a whole number from 1 to 365', 2);
+      const { trunk, check } = viewOptions(cfg);
+      if (values.stats) return ok(statsText(await client.landingStats(days), trunk));
+      const render = async (): Promise<string> => {
+        const status = await client.status();
+        const recent = await client.landings({ statuses: ['landed', 'failed', 'cancelled', 'superseded'], limit: values.all ? 50 : 5 });
+        let stats: LandingStats | null = null;
+        try {
+          stats = await client.landingStats(days);
+        } catch {
+          // the header goes without it
+        }
+        return landingsText({ project: status.project, trunk, check, queue: status.queue ?? [], recent, lander: status.lander, control: status.control, stats, now: status.now });
+      };
+      if (!values.watch) return ok(await render());
+      // Until interrupted: the view again whenever a landing, the lander or trunk changes.
+      for (;;) {
+        process.stdout.write(`${await render()}\n\n`);
+        let since = await client.latestSeq();
+        for (;;) {
+          const page = await client.events(since, 60_000);
+          since = page.next_since ?? page.seq;
+          if (page.events.some((e) => e.type.startsWith('landing.') || e.type.startsWith('lander.') || e.type === 'trunk.moved')) break;
+        }
+      }
+    }
+
+    case 'landing': {
+      const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { log: { type: 'boolean' } } });
+      if (positionals.length !== 1) return fail('usage: hub landing L-7 [--log]', 2);
+      const l = await client.landing(positionals[0]);
+      return ok(await renderLanding({ cfg, client, feed: null }, l, { log: values.log ? 'full' : 'tail' }));
+    }
+
+    case 'cancel': {
+      const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { reason: { type: 'string' } } });
+      if (positionals.length !== 1) return fail('usage: hub cancel L-7 [--reason TEXT]', 2);
+      const id = positionals[0];
+      const target = await client.landing(id);
+      let l: Landing;
+      try {
+        // Its author cancels as the agent; anyone else needs an approver's credentials.
+        if (target.agent === cfg.agent) l = await client.cancel(id, { reason: values.reason });
+        else {
+          let creds;
+          try {
+            creds = approverCredentials(process.env);
+          } catch (err) {
+            return fail(`${id} is ${target.agent}'s landing: cancelling it needs its author or an approver's credentials (${(err as Error).message})`);
+          }
+          l = await client.cancel(id, { reason: values.reason }, creds);
+        }
+      } catch (err) {
+        if (err instanceof HubApiError && err.code === 'too_late') return fail(`${id} is being pushed to trunk right now, so it can't be cancelled; wait a few seconds.`);
+        throw err;
+      }
+      return ok(`cancelled: ${landingLine(l, Date.now(), viewOptions(cfg).trunk)}`);
+    }
+
+    case 'approve':
+    case 'reject': {
+      const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { note: { type: 'string' }, reason: { type: 'string' } } });
+      return decideCommand(cfg, client, positionals[0], { decision: cmd, note: values.note, reason: values.reason, env: process.env, term: processTerminal() });
+    }
+
+    case 'lander': {
+      const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { 'accept-trunk': { type: 'string' } } });
+      return landerCommand(client, { sub: positionals[0], acceptTrunk: values['accept-trunk'], env: process.env, term: processTerminal() });
+    }
+
+    case 'sync': {
+      const { values } = parseArgs({ args: argv, options: { merge: { type: 'boolean' }, recover: { type: 'boolean' } } });
+      need();
+      if (!cfg.root) return fail('hub sync: not in a git checkout', 2);
+      const r = await syncWorkspace(cfg.root, cfg, client, { reason: 'explicit', mode: values.merge ? 'merge' : 'update', recover: values.recover });
+      const text = syncToolText(r);
+      // Exit 0 when the workspace is where it should be (or was left alone on purpose, dirty); 1 when the sync couldn't do its job.
+      const fine = r.kind === 'up_to_date' || r.kind === 'synced' || r.kind === 'merged' || r.kind === 'behind_dirty' || (r.kind === 'needs_human' && r.cleared);
+      return fine ? ok(text) : fail(text);
+    }
+
+    case 'doctor':
+      return doctor(cfg, client);
 
     default:
       return fail(`unknown command "${cmd}"; run hub --help`, 2);
   }
+}
+
+/** The trunk name and check command for queue views, from trunk's agenthub.json (lenient: a view never fails over it). */
+function viewOptions(cfg: HubConfig): { trunk: string; check: string | null } {
+  const land = cfg.root ? teamSections(cfg.root, { strict: false }).sections.land : null;
+  return { trunk: land?.trunk ?? 'main', check: land?.check ?? null };
+}
+
+/**
+ * `hub doctor`: one line per check, exit 1 on any failure. The config
+ * (strict, as land reads it), the hub, push access to the land refs, and the
+ * git features sync needs.
+ */
+async function doctor(cfg: HubConfig, client: HubClient): Promise<HookOutcome> {
+  const lines: string[] = [];
+  let failed = false;
+  const good = (s: string) => lines.push(`ok    ${s}`);
+  const warn = (s: string) => lines.push(`warn  ${s}`);
+  const bad = (s: string) => {
+    failed = true;
+    lines.push(`FAIL  ${s}`);
+  };
+  if (cfg.agent) good(`identity ${cfg.agent} in project ${cfg.project}`);
+  else warn('no agent identity in this checkout: run `hub init --agent <human>/<agent>` (land needs one)');
+  for (const w of cfg.warnings) warn(w);
+  if (!cfg.root) {
+    bad('not in a git checkout');
+    return { stdout: `${lines.join('\n')}\n`, stderr: '', exitCode: 1 };
+  }
+  let land: ReturnType<typeof teamSections>['sections']['land'] = null;
+  try {
+    const team = teamSections(cfg.root, { strict: true });
+    land = team.sections.land;
+    if (land) good(`${team.where}: landing queue on (trunk ${land.remote}/${land.trunk}, check \`${land.check}\`)`);
+    else good(`${team.where === cfg.root ? 'agenthub.json' : team.where}: no "land" section, so land records the landing (Phase 1)`);
+    if (team.source === 'worktree') warn(`read this checkout's agenthub.json: there is no fetched copy on ${team.remote}/${team.trunk} (git fetch ${team.remote})`);
+  } catch (err) {
+    bad(`config: ${(err as Error).message}`);
+  }
+  try {
+    const s = await client.status();
+    good(`hub ${cfg.url} answers${s.lander ? ` (lander ${s.lander.holder} active)` : ' (no lander is running: landings wait)'}`);
+  } catch (err) {
+    bad(`hub ${cfg.url}: ${classifyFailure(err, cfg).message}`);
+  }
+  const g = gitops.open(cfg.root, { isolated: false });
+  if (land) {
+    const head = fullHead(cfg.root);
+    if (!head) warn('no commit yet, so push access to the land refs was not probed');
+    else {
+      const ref = landRef(land.refPrefix, head);
+      const r = await g.run(['push', '--dry-run', '--porcelain', land.remote, `${head}:${ref}`], { timeoutMs: 30_000, ok: [0, 1, 128] }).catch((err: Error) => ({ code: -1, stdout: '', stderr: err.message }));
+      if (r.code === 0) good(`can push land refs to ${land.remote} (${land.refPrefix}land/…, dry run)`);
+      else bad(`can't push ${ref} to ${land.remote}: ${r.stderr.split('\n').find((l) => l.trim() && !l.startsWith('hint:'))?.trim() ?? `git push exited ${r.code}`}. If the host refuses custom ref namespaces, set land.refPrefix to "refs/heads/agenthub/"`);
+    }
+  }
+  const features = await gitops.features(g).catch(() => ({ mergeTreeBase: false, attrSource: false }));
+  if (features.mergeTreeBase) good('git merge-tree --write-tree --merge-base works: sync can replay your unlanded commits onto trunk');
+  else warn('git is older than 2.40 (no merge-tree --merge-base): sync only fast-forwards; upgrade git for replays');
+  return { stdout: `${lines.join('\n')}\n`, stderr: '', exitCode: failed ? 1 : 0 };
 }

@@ -9,7 +9,7 @@ import { Feed } from '../src/feed.js';
 import { createMcpServer } from '../src/mcp.js';
 import { A, B, PROJECT, client, failingHub, git, hubCli, makeRepo, preToolUseInput, sessionEventInput, sleep, startHub, testEnv, type SampleRepo } from './helpers.js';
 
-const TOOLS = ['claim', 'decide', 'hub_post', 'hub_status', 'hub_wait', 'inbox', 'land', 'release', 'task_create', 'task_list', 'task_take'];
+const TOOLS = ['claim', 'decide', 'hub_post', 'hub_status', 'hub_sync', 'hub_wait', 'inbox', 'land', 'land_cancel', 'landing_status', 'release', 'task_create', 'task_list', 'task_take'];
 
 let srv: RunningServer;
 let repo: SampleRepo;
@@ -50,7 +50,7 @@ async function connect(agent: string, root: string, env: NodeJS.ProcessEnv = tes
 }
 
 describe('hub mcp', () => {
-  it('exposes exactly the Phase 1 tools', async () => {
+  it('exposes exactly the Phase 1 tools and the landing queue ones', async () => {
     const { mcp } = await connect(A, repo.wtA);
     const { tools } = await mcp.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(TOOLS);

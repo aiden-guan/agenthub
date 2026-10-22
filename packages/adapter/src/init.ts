@@ -67,8 +67,9 @@ export const HOOKS_PATH_LINE =
  *  - `.mcp.json` entry for the `hub mcp` server
  *  - the git guard, as pre-commit, as prepare-commit-msg (for the commits git
  *    revert, cherry-pick and rebase make without pre-commit), as
- *    pre-merge-commit (merges git commits itself) and as pre-applypatch
- *    (git am, git rebase --apply); an existing hook is kept and runs after the
+ *    pre-merge-commit (merges git commits itself), as pre-applypatch
+ *    (git am, git rebase --apply) and as pre-push (no pushes to trunk or to
+ *    candidate refs); an existing hook is kept and runs after the
  *    guard (a shell script as its own file, anything else from
  *    .git/agenthub-kept). Hooks core.hooksPath sends git to get the guard the
  *    same way when the directory is the repository's own and git ignores it
@@ -287,6 +288,7 @@ function guardHooks(command: string, kept: boolean): Array<[name: string, script
     ['prepare-commit-msg', sequencerGuardScript(command, kept)],
     ['pre-merge-commit', mergeGuardScript(command, kept)],
     ['pre-applypatch', applyPatchGuardScript(command, kept)],
+    ['pre-push', prePushGuardScript(command, kept)],
   ];
 }
 
@@ -559,6 +561,34 @@ ${FAIL_CLOSED_SH}
 
 ${runGuardSh(command, ' --sequencer')}
 ${kept ? runKeptSh('pre-applypatch') : ''}${chainSh('pre-applypatch')}`;
+}
+
+/**
+ * pre-push (design §2.3.6): refuses pushes that update trunk or the lander's
+ * candidate refs. git gives the refs being pushed on stdin, which both the
+ * guard and the hook chained after it must read: they are kept in a file in
+ * the git dir for the guard, then become the chained hook's stdin (the file
+ * is unlinked once open, so nothing is left behind).
+ */
+export function prePushGuardScript(command: string, kept = true): string {
+  return `#!/bin/sh
+${GUARD_MARKER} (installed by \`hub init\`)
+${keptSh('pre-push')}
+# Refuses pushes that update the trunk branch or the lander's candidate refs:
+# trunk moves only through the landing queue (hub land).
+# Bypass in an emergency: HUB_GUARD=off git push ...
+
+${FAIL_CLOSED_SH}
+
+agenthub_refs="$(git rev-parse --git-dir 2>/dev/null)/agenthub-pre-push.$$"
+trap 'rm -f "$agenthub_refs"' EXIT
+cat > "$agenthub_refs" || exit 1
+
+${runGuardSh(command, ' --pre-push "$@" < "$agenthub_refs"')}
+exec < "$agenthub_refs"
+rm -f "$agenthub_refs"
+trap - EXIT
+${kept ? runKeptSh('pre-push') : ''}${chainSh('pre-push')}`;
 }
 
 /**

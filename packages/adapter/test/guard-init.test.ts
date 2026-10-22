@@ -1097,7 +1097,7 @@ describe('hub init where git runs hooks from somewhere else (core.hooksPath)', (
         expect(git(cwd, 'status', '--porcelain', '--untracked-files=all', '--', '.githooks')).toBe('');
       }
       const common = git(x.main, 'rev-parse', '--path-format=absolute', '--git-common-dir').trim();
-      expect(readdirSync(path.join(common, 'agenthub-hooks')).sort()).toEqual(['pre-applypatch', 'pre-commit', 'pre-merge-commit', 'prepare-commit-msg']);
+      expect(readdirSync(path.join(common, 'agenthub-hooks')).sort()).toEqual(['pre-applypatch', 'pre-commit', 'pre-merge-commit', 'pre-push', 'prepare-commit-msg']);
     } finally {
       x.cleanup();
     }

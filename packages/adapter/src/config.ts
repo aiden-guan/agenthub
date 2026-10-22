@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { parseTeamSections, type TeamSections } from '@agenthub/contract';
 import { deriveProject, findRepoRoot, git, gitRaw, isTracked, recordedSettings } from './git.js';
 
 export const DEFAULT_URL = 'http://127.0.0.1:7077';
@@ -293,6 +294,97 @@ export function parseConfigFile(text: string, file: string): ConfigFile {
   }
   if (value.failClosed !== undefined && typeof value.failClosed !== 'boolean') throw new Error(`${file}: "failClosed" must be true or false`);
   return value as ConfigFile;
+}
+
+/** The Phase 2/3 sections of agenthub.json (land, sync, symbols), and where they were read. */
+export interface TeamConfig {
+  sections: TeamSections;
+  /** Lenient mode only: each problem found, with the bad value replaced by its default. */
+  problems: string[];
+  /** `trunk`: the copy committed on the remote-tracking trunk; `worktree`: this checkout's file; `none`: neither exists. */
+  source: 'trunk' | 'worktree' | 'none';
+  /** Where it was read, for messages: `agenthub.json on origin/main`, or the file's path. */
+  where: string;
+  /** The remote and trunk branch the trunk copy was looked up on (the worktree copy's land.remote/trunk, else origin/main). */
+  remote: string;
+  trunk: string;
+}
+
+/** A remote or branch name that is safe to splice into `refs/remotes/<remote>/<trunk>:agenthub.json`. */
+const REF_PART = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$/;
+
+/**
+ * The land, sync and symbols sections, preferring trunk's committed copy
+ * (`git show refs/remotes/<remote>/<trunk>:agenthub.json`, as fetched last)
+ * and falling back to the worktree's, through the contract's
+ * parseTeamSections. The lander reads trunk's copy too, so that is what
+ * decides how this project lands; a branch that edits agenthub.json changes
+ * nothing until it has landed.
+ *
+ * Strict (the `land` tool, `hub doctor`): the first problem throws, naming the
+ * key, unknown keys and invalid JSON included. Lenient (hooks, digest): never
+ * throws; problems come back in `problems` and each bad value is its default,
+ * because a config error in a hook would block every edit.
+ */
+export function teamSections(root: string, opts: { strict: boolean }): TeamConfig {
+  const problems: string[] = [];
+  const read = (text: string, where: string): unknown => {
+    try {
+      // As parseConfigFile: an own "__proto__" key must not become a prototype.
+      return JSON.parse(text, (key, v) => (key === '__proto__' ? undefined : v));
+    } catch {
+      const msg = `${where} is not valid JSON`;
+      if (opts.strict) throw new Error(msg);
+      problems.push(msg);
+      return {};
+    }
+  };
+  const file = path.join(root, TEAM_CONFIG_FILE_NAME);
+  let local: string | null = null;
+  try {
+    local = readFileSync(file, 'utf8');
+  } catch {
+    // no worktree copy
+  }
+  // Which remote and trunk to look on: what this checkout's copy says, else the defaults. Not a parse:
+  // a bad value here only means looking in the default place.
+  let remote = 'origin';
+  let trunk = 'main';
+  if (local !== null) {
+    try {
+      const land = (JSON.parse(local) as { land?: { remote?: unknown; trunk?: unknown } } | null)?.land;
+      if (typeof land?.remote === 'string' && REF_PART.test(land.remote) && !land.remote.includes('..')) remote = land.remote;
+      if (typeof land?.trunk === 'string' && REF_PART.test(land.trunk) && !land.trunk.includes('..')) trunk = land.trunk;
+    } catch {
+      // reported below, if this copy is the one used
+    }
+  }
+  const onTrunk = gitRaw(root, ['cat-file', 'blob', `refs/remotes/${remote}/${trunk}:${TEAM_CONFIG_FILE_NAME}`]);
+  let source: TeamConfig['source'] = 'none';
+  let where = file;
+  let value: unknown = {};
+  if (onTrunk !== null) {
+    source = 'trunk';
+    where = `${TEAM_CONFIG_FILE_NAME} on ${remote}/${trunk}`;
+    value = read(onTrunk, where);
+  } else if (local !== null) {
+    source = 'worktree';
+    value = read(local, where);
+  }
+  if (opts.strict) {
+    const { sections } = parseTeamSections(value, { strict: true, where });
+    return { sections, problems, source, where, remote: sections.land?.remote ?? remote, trunk: sections.land?.trunk ?? trunk };
+  }
+  let parsed: ReturnType<typeof parseTeamSections>;
+  try {
+    parsed = parseTeamSections(value, { strict: false, where });
+  } catch (err) {
+    // Lenient never throws, whatever the contract does with a value it didn't foresee.
+    problems.push(`${where}: ${(err as Error).message}`);
+    parsed = parseTeamSections({}, { strict: false, where });
+  }
+  problems.push(...parsed.problems);
+  return { sections: parsed.sections, problems, source, where, remote: parsed.sections.land?.remote ?? remote, trunk: parsed.sections.land?.trunk ?? trunk };
 }
 
 /** Unset or empty: undefined (fall through to the files). Anything unrecognised is an error, never a silent "off". */
