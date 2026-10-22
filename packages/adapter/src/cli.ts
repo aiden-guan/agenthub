@@ -7,11 +7,12 @@ const HELP = `hub — agenthub adapter
 
 Agent integration
   hub mcp                    Run the MCP stdio server (tools: hub_status, task_list, task_take, task_create,
-                             claim, release, hub_wait, hub_post, inbox, decide, land, landing_status, land_cancel, hub_sync)
+                             claim, release, hub_wait, hub_post, inbox, decide, land, landing_status, land_cancel, hub_sync,
+                             who_uses, impacts)
   hub hook pre-edit          Claude Code PreToolUse hook (Edit|Write|MultiEdit|NotebookEdit): claim what the edit changes (the
                              declarations an Edit or MultiEdit changes, else the file) or deny the edit
-  hub hook post-edit         Claude Code PostToolUse hook: confirm the claim of an edit that ran, and claim what it changed
-                             beyond the simulated edit
+  hub hook post-edit         Claude Code PostToolUse hook: confirm the claim of an edit that ran, claim what it changed
+                             beyond the simulated edit, post its signature changes and say who uses them
   hub hook settle            Claude Code Stop/SubagentStop/UserPromptSubmit/SessionEnd hook: release claims of edits that never ran;
                              on UserPromptSubmit, sync the workspace with trunk (a safe point)
   hub hook digest            Claude Code SessionStart hook: sync the workspace with trunk, then team state as additionalContext
@@ -31,6 +32,7 @@ For humans
   hub post TO BODY           TO is human/agent or #channel
   hub inbox [--peek]
   hub decide SUMMARY [--why TEXT] [--file F]...
+  hub uses FILE#Symbol       Where this checkout uses a declaration, who holds those places, and callers_free
 
 Landing queue (with a "land" section in trunk's agenthub.json; without one, land records it as in Phase 1)
   hub land [--task T-1] [--summary TEXT] [--allow-untracked] [--wait]

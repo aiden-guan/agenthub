@@ -27,7 +27,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wri
 import path from 'node:path';
 import { entryCovers, isValidSymbolKey, matchesAny, type SymbolsConfig } from '@agenthub/contract';
 import type { ScopeEntry } from '@agenthub/hub/protocol';
-import type { FileLevelReason } from '@agenthub/symbols';
+import type { FileLevelReason, SignatureChange } from '@agenthub/symbols';
 import { stagedPaths } from './git.js';
 import { MARKER_STALE_MS, markerName, syncPaths } from './sync.js';
 
@@ -60,7 +60,7 @@ export const MAX_LAND_SYMBOL_ENTRIES = 4000;
  */
 const MAPPED_EXTENSIONS = new Set(['ts', 'mts', 'cts', 'tsx', 'js', 'mjs', 'cjs', 'jsx', 'py', 'pyi', 'go', 'rs', 'java']);
 
-function mappedExtension(file: string): boolean {
+export function mappedExtension(file: string): boolean {
   const base = file.slice(file.lastIndexOf('/') + 1);
   const dot = base.lastIndexOf('.');
   return dot > 0 && MAPPED_EXTENSIONS.has(base.slice(dot + 1).toLowerCase());
@@ -81,6 +81,8 @@ export interface EditScope {
   /** The file as it is, and as the edit will leave it (symbol-level only, for post-edit). */
   before: string | null;
   after: string | null;
+  /** Phase 3 impacts: the signature changes from before to after (symbol-level only), for post-edit to post. */
+  signatureChanges: SignatureChange[] | null;
 }
 
 interface TextEditInput {
@@ -106,7 +108,7 @@ function textEdits(tool: string, input: Record<string, unknown>): TextEditInput[
  * the whole file (with the reason).
  */
 export async function editScope(o: { tool: string; input: Record<string, unknown>; abs: string; file: string; config: SymbolsConfig }): Promise<EditScope> {
-  const whole = (reason: WholeFileReason): EditScope => ({ file: o.file, symbols: null, mapper: null, reason, before: null, after: null });
+  const whole = (reason: WholeFileReason): EditScope => ({ file: o.file, symbols: null, mapper: null, reason, before: null, after: null, signatureChanges: null });
   if (o.tool === 'NotebookEdit') return whole('notebook');
   if (o.tool !== 'Edit' && o.tool !== 'MultiEdit') return whole('whole_file_write');
   if (!o.config.enabled) return whole('disabled');
@@ -146,7 +148,7 @@ export async function editScope(o: { tool: string; input: Record<string, unknown
   if (diff.fileLevel) return whole(diff.reason);
   if (diff.symbols.length === 0) return whole('unchanged');
   if (diff.symbols.some((k) => !isValidSymbolKey(k))) return whole('parse_error');
-  return { file: o.file, symbols: diff.symbols, mapper: diff.mapper, reason: null, before, after };
+  return { file: o.file, symbols: diff.symbols, mapper: diff.mapper, reason: null, before, after, signatureChanges: diff.signatureChanges };
 }
 
 /** What a whole-file claim of an edit is for, in a deny reason: "it ...". */
@@ -193,10 +195,18 @@ export interface EditState {
   before: string;
   /** sha256 of the simulated result: what the tool should write. */
   after_sha256: string;
-  /** The keys pre-edit claimed, and their mapper. */
+  /** The keys pre-edit claimed, and their mapper ([] and '' for a whole-file edit). */
   symbols: string[];
   mapper: string;
   at: number;
+  /** The signature changes of the simulated edit (symbol-level edits), so post-edit needn't parse when the tool wrote exactly that. */
+  sigs?: SignatureChange[];
+  /**
+   * A whole-file edit of an existing file in a mapped language (Write, or an
+   * edit that couldn't be mapped): kept only so post-edit can post its
+   * signature changes (design §2.5); there is nothing to verify.
+   */
+  whole?: boolean;
 }
 
 export const sha256 = (s: string): string => createHash('sha256').update(s).digest('hex');
@@ -219,10 +229,32 @@ export function saveEditState(root: string, call: { session: string; tool: strin
       symbols: scope.symbols,
       mapper: scope.mapper,
       at: Date.now(),
+      sigs: scope.signatureChanges ?? [],
     };
     writeFileSync(path.join(p.edits, markerName(call)), JSON.stringify(state));
   } catch {
     // then post-edit has nothing to compare with
+  }
+}
+
+/**
+ * Save the file as it is before a whole-file edit (Write, or an Edit that
+ * couldn't be mapped), when it exists and its language is mapped: post-edit
+ * then posts the signature changes the edit made. Best effort.
+ */
+export function saveWholeEditState(root: string, call: { session: string; tool: string }, o: { file: string; abs: string; config: SymbolsConfig }): void {
+  const p = syncPaths(root);
+  if (!p || !o.config.enabled || !mappedExtension(o.file) || matchesAny(o.file, o.config.exclude)) return;
+  try {
+    const st = statSync(o.abs);
+    if (!st.isFile() || st.size > MAX_MAPPED_BYTES) return;
+    const before = readFileSync(o.abs, 'utf8');
+    mkdirSync(p.edits, { recursive: true });
+    pruneEditStates(p.edits);
+    const state: EditState = { v: 1, session: call.session, tool: call.tool, file: o.file, abs: o.abs, before, after_sha256: '', symbols: [], mapper: '', at: Date.now(), whole: true };
+    writeFileSync(path.join(p.edits, markerName(call)), JSON.stringify(state));
+  } catch {
+    // a new file, or unreadable: nothing to compare with
   }
 }
 
@@ -249,7 +281,8 @@ export function takeEditState(root: string, call: { session: string; tool: strin
     typeof state.after_sha256 === 'string' &&
     typeof state.mapper === 'string' &&
     Array.isArray(state.symbols) &&
-    state.symbols.every((k) => typeof k === 'string');
+    state.symbols.every((k) => typeof k === 'string') &&
+    (state.sigs === undefined || (Array.isArray(state.sigs) && state.sigs.every((x) => x && typeof x.symbol === 'string' && typeof x.kind === 'string' && typeof x.before === 'string')));
   return ok ? (state as EditState) : null;
 }
 

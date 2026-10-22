@@ -1,15 +1,18 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { SymbolsConfig } from '@agenthub/contract';
-import type { ClaimConflict, ClaimResult, Landing } from '@agenthub/hub/protocol';
+import { isValidSymbolKey, type SymbolsConfig } from '@agenthub/contract';
+import type { Claim, ClaimConflict, ClaimResult, Landing, StatusResult } from '@agenthub/hub/protocol';
 import { claimRoot, lendIdentity, recordLending } from './checkout.js';
 import { HubApiError, HubClient, classifyFailure, type HubFailure } from './client.js';
 import { hasOwnSettings, loadConfig, sameHub, teamSections, type HubConfig } from './config.js';
 import {
   denyReason,
   digestText,
+  editImpactNote,
   inline,
+  isLanderLease,
   postEditConflictText,
+  postEditImpactText,
   scopeNames,
   showName,
   showNames,
@@ -17,12 +20,26 @@ import {
   syncNoticeKey,
   syncPromptText,
   type DenyContext,
+  type DigestExtras,
 } from './format.js';
 import { currentBranch, headCommit, isIgnored, toRepoPath, unclaimableReason } from './git.js';
 import { commitGuardOff } from './guard-status.js';
 import { PendingClaims, type StoredClaim } from './pending.js';
 import { HOOK_SYNC_BUDGET_MS, clearMarkers, clearMarkersElsewhere, enterEdit, noteMarkerElsewhere, removeMarker, staleFiles, syncPaths, syncWorkspace, type SyncPaths, type SyncResult } from './sync.js';
-import { editScope, missingAfterEdit, saveEditState, symbolsModule, takeEditState, wholeFileWhy, type EditScope, type EditState } from './symbol-scope.js';
+import { cachedChanges, editImpacts, firstTimeInSession, isNews, readAcks, relevantAll, sortImpacts, whoUses, type WhoUses } from './impact.js';
+import {
+  MAX_MAPPED_BYTES,
+  editScope,
+  missingAfterEdit,
+  saveEditState,
+  saveWholeEditState,
+  sha256,
+  symbolsModule,
+  takeEditState,
+  wholeFileWhy,
+  type EditScope,
+  type EditState,
+} from './symbol-scope.js';
 
 export interface HookIO {
   stdin: string;
@@ -55,6 +72,8 @@ const SETTLE_RELEASE_MS = 4_000;
 const DIGEST_RESERVE_MS = 4_000;
 /** A hub request with less time than this left isn't started (its claim waits for the next try). */
 const MIN_REQUEST_MS = 200;
+/** Phase 3 impacts from the edit hooks are best effort within this (design §2.3.6: posting, and who_uses, 2 s each). */
+const IMPACT_BUDGET_MS = 2_000;
 
 /**
  * Let the edit through, and make sure someone sees that it isn't coordinated.
@@ -277,19 +296,28 @@ async function claimForEdit(input: Record<string, any>, io: HookIO, edited: { ro
     }
     if (res.status === 'granted') {
       trackClaim(input, target.root, cfg, res);
-      // For post-edit: the file as it was, and what the edit should leave, beside this call's marker.
+      // For post-edit: the file as it was, and what the edit should leave, beside this call's marker (a whole-file
+      // edit of a mapped file keeps only the file as it was, for the signature changes it makes).
       const ids = callIds(input);
       if (symbolic && scope && abs && ids?.tool) saveEditState(target.root, { session: ids.session, tool: ids.tool }, scope, abs);
+      else if (!symbolic && abs && ids?.tool && target.files.length === 1 && ['Edit', 'MultiEdit', 'Write'].includes(tool)) {
+        saveWholeEditState(target.root, { session: ids.session, tool: ids.tool }, { file: target.files[0], abs, config: symbols });
+      }
+      const notes: string[] = [];
       // On a new claim: has trunk changed the file since this worktree's base? (Said once per file and trunk tip.)
       const stale = res.renewed ? null : staleBaseNote(target.root, target.files, input, cfg);
+      if (stale) notes.push(`agenthub: ${stale}`);
+      // Phase 3: recent changes by others to names the edited declarations use (design §2.3.6 (5)).
+      const impact = target.files.length === 1 && abs ? await editImpactContext(target.root, cfg, input, target.files[0], abs, symbolic ? scope : null, symbols).catch(() => null) : null;
+      if (impact) notes.push(impact);
       if (unclaimed) {
         const out = allowWithWarning(unclaimed, 600);
-        if (!stale) return out;
+        if (!notes.length) return out;
         const json = JSON.parse(out.stdout);
-        json.hookSpecificOutput.additionalContext += `\nagenthub: ${stale}`;
+        json.hookSpecificOutput.additionalContext += `\n${notes.join('\n')}`;
         return { ...out, stdout: JSON.stringify(json) };
       }
-      return stale ? { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: `agenthub: ${stale}` } }), stderr: '', exitCode: 0 } : ALLOW;
+      return notes.length ? { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: notes.join('\n') } }), stderr: '', exitCode: 0 } : ALLOW;
     }
     const first = res.conflicts[0];
     if (!first) return deny(`Edit blocked: the hub denied the claim on ${showNames(target.files)} without naming a conflict. Tell your human.`);
@@ -311,6 +339,35 @@ async function claimForEdit(input: Record<string, any>, io: HookIO, edited: { ro
     }
     return allowWithWarning(`${failure.message}; edit allowed without a claim`);
   }
+}
+
+/**
+ * The pre-edit impact note (design §2.3.6 (5), §2.5): recent signature changes
+ * by other agents, from a listing at most 60 s old, to names that the
+ * declarations this edit changes use, in the file as the edit leaves it (the
+ * whole file for an edit that isn't mapped). Each is said once per session,
+ * and acknowledged ones not at all. Null when there is nothing to say.
+ */
+async function editImpactContext(root: string, cfg: HubConfig, input: Record<string, any>, file: string, abs: string, scope: EditScope | null, symbols: SymbolsConfig): Promise<string | null> {
+  if (!cfg.agent || !symbols.enabled) return null;
+  const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
+  let text = scope?.after ?? null;
+  if (text === null && input.tool_name === 'Write' && typeof toolInput.content === 'string') text = toolInput.content;
+  if (text === null) {
+    try {
+      text = statSync(abs).size <= MAX_MAPPED_BYTES ? readFileSync(abs, 'utf8') : null;
+    } catch {
+      text = null;
+    }
+  }
+  if (text === null) return null;
+  const changes = await cachedChanges(root, new HubClient({ ...cfg, timeoutMs: Math.min(cfg.timeoutMs, IMPACT_BUDGET_MS) }));
+  if (!changes?.some((c) => c.agent !== cfg.agent && isNews(c))) return null;
+  const hits = await editImpacts({ file, text, keys: scope?.symbols ?? null, me: cfg.agent, changes, acks: readAcks(root, cfg.project) });
+  if (!hits.length) return null;
+  const fresh = firstTimeInSession(root, callIds(input)?.session ?? 'unknown', hits.map((h) => h.change));
+  const told = hits.filter((h) => fresh.has(h.change.id));
+  return told.length ? editImpactNote(file, told) : null;
 }
 
 /** The absolute path of the file an edit tool call writes (Edit, MultiEdit, Write, NotebookEdit). */
@@ -495,9 +552,73 @@ export async function postEditHook(io: HookIO): Promise<HookOutcome> {
     for (const e of thread) if (e.tool === ids.tool) store.remove(e);
     await releasePending(store, thread.filter((e) => e.tool !== ids.tool), input, io);
   }
-  const context = state && root ? await verifyEdit(state, root, input, io) : null;
+  const verified = state && root && !state.whole ? await verifyEdit(state, root, input, io) : null;
+  // Phase 3: the signature changes the edit made go to the hub, and the agent hears who uses them (design §2.3.6).
+  const impact = state && root ? await announceSignatureChanges(state, root, input, io).catch(() => null) : null;
+  const context = [verified, impact].filter(Boolean).join('\n');
   if (!context) return ALLOW;
   return { stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: context } }), stderr: '', exitCode: 0 };
+}
+
+/**
+ * Post-edit's Phase 3 step (design §2.3.6, §2.5): the in-progress signature
+ * changes of the edit that ran (the simulated edit's when the tool wrote just
+ * that, else recomputed from what it wrote), posted with POST /symbol-changes
+ * (best effort, 2 s), then who uses each changed declaration in this checkout
+ * and who holds those places (who_uses, 2 s). Posting here, after the edit
+ * ran, means an edit rejected at the permission prompt leaves no phantom
+ * change. Null when the edit changed no signature, or nothing uses what it
+ * changed.
+ */
+async function announceSignatureChanges(state: EditState, root: string, input: Record<string, any>, io: HookIO): Promise<string | null> {
+  let cfg: HubConfig;
+  try {
+    cfg = configFor(root, input, io);
+  } catch {
+    return null;
+  }
+  if (!cfg.agent) return null;
+  const symbols = teamSections(root, { strict: false }).sections.symbols;
+  if (!symbols.enabled) return null;
+  let actual: string | null;
+  try {
+    actual = statSync(state.abs).size <= MAX_MAPPED_BYTES ? readFileSync(state.abs, 'utf8') : null;
+  } catch {
+    actual = null; // deleted: its signatures are the whole file's business
+  }
+  if (actual === null) return null;
+  let sigs = !state.whole && state.sigs && sha256(actual) === state.after_sha256 ? state.sigs : null;
+  if (sigs === null) {
+    const sym = await symbolsModule();
+    if (!sym) return null;
+    const diff = await sym.changedSymbols(state.file, state.before, actual, { maxSymbols: 1_000_000, exclude: symbols.exclude }).catch(() => null);
+    if (!diff || diff.fileLevel) return null;
+    sigs = diff.signatureChanges;
+  }
+  const changes = sigs.filter((c) => isValidSymbolKey(c.symbol) && !c.symbol.startsWith('@') && (c.renamed_to === undefined || isValidSymbolKey(c.renamed_to)));
+  if (!changes.length) return null;
+  const client = new HubClient({ ...cfg, timeoutMs: Math.min(cfg.timeoutMs, IMPACT_BUDGET_MS) });
+  let postError: string | null = null;
+  try {
+    await client.postSymbolChanges({
+      changes: changes.map((c) => ({ file: state.file, symbol: c.symbol, kind: c.kind, before: c.before, after: c.after, ...(c.renamed_to ? { renamed_to: c.renamed_to } : {}) })),
+    });
+  } catch (err) {
+    postError = classifyFailure(err, cfg).message;
+  }
+  // Who uses each changed declaration here, within the second 2 s; the hub's claims are read once.
+  const uses = new Map<string, WhoUses | null>();
+  const deadline = Date.now() + IMPACT_BUDGET_MS;
+  let claims: Promise<Claim[]> | null = null;
+  const claimsOnce = () => (claims ??= new HubClient({ ...cfg, timeoutMs: Math.max(1, deadline - Date.now()) }).claims());
+  for (const c of changes.slice(0, 3)) {
+    if (Date.now() >= deadline) {
+      uses.set(c.symbol, null);
+      continue;
+    }
+    uses.set(c.symbol, await whoUses(root, { file: state.file, symbol: c.symbol }, { me: cfg.agent, claims: claimsOnce, budgetMs: deadline - Date.now() }).catch(() => null));
+  }
+  return postEditImpactText(state.file, changes, uses, postError);
 }
 
 /**
@@ -692,7 +813,9 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
     const status = await hookClient(cfg, until).status();
     // The queue's median land→trunk time, when there is a queue to speak of.
     const stats = status.lander && (status.queue?.length ?? 0) > 0 && until - Date.now() >= MIN_REQUEST_MS ? await hookClient(cfg, until).landingStats().catch(() => null) : null;
-    const text = digestText(status, cfg.agent, cfg.url, { stats, trunk: team?.sections.land?.trunk, trunkLine });
+    // Phase 3: recent changes by others to what this agent's claims use (design §2.5), within what is left.
+    const impacts = cfg.root && team?.sections.symbols.enabled ? await digestImpacts(cfg, cfg.root, status, until).catch(() => null) : null;
+    const text = digestText(status, cfg.agent, cfg.url, { stats, trunk: team?.sections.land?.trunk, trunkLine, impacts });
     if (!warning) return context(text);
     return {
       stdout: JSON.stringify({ systemMessage: warning, hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: `${warning}\n\n${text}` } }),
@@ -709,4 +832,38 @@ export async function digestHook(io: HookIO): Promise<HookOutcome> {
     const mode = cfg.failClosed ? 'Edits will be blocked until it is back.' : 'Edits are not being coordinated until it is back.';
     return problem(`agenthub: the team hub is unavailable (${inline(failure.message, 200)}). ${mode}${also}${trunkAlso}`);
   }
+}
+
+/** `p`, or null once `ms` has passed. */
+function within<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), Math.max(0, ms));
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
+
+/**
+ * The digest's impacts (design §2.3.4, §2.5): the recent changes by others
+ * that this agent's live claims use, unacknowledged first, by the hook's
+ * deadline. Null when there are none, or no time.
+ */
+async function digestImpacts(cfg: HubConfig, root: string, status: StatusResult, until: number): Promise<DigestExtras['impacts']> {
+  const me = cfg.agent!;
+  const mine = status.claims.filter((c) => c.holder === me && !isLanderLease(c));
+  if (!mine.length || until - Date.now() < MIN_REQUEST_MS) return null;
+  const listing = await hookClient(cfg, until).symbolChanges();
+  if (!listing.changes.some((c) => c.agent !== me && isNews(c))) return null;
+  const items = await within(relevantAll(listing.changes, me, { root, claims: mine }), until - Date.now());
+  if (!items?.length) return null;
+  const acks = readAcks(root, cfg.project);
+  return { items: sortImpacts(items, acks), acks, now: listing.now };
 }

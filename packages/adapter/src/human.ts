@@ -5,7 +5,8 @@ import type { Landing, LandingStats, TaskStatus } from '@agenthub/hub/protocol';
 import { approverCredentials, decideCommand, landerCommand, processTerminal } from './approve.js';
 import { HubApiError, HubClient, classifyFailure } from './client.js';
 import { hasOwnSettings, loadConfig, teamSections, type HubConfig } from './config.js';
-import { claimNames, formatConflict, formatDecision, formatMessage, formatTask, landingLine, landingsText, statsText, statusText, syncToolText, UNTRUSTED_NOTE } from './format.js';
+import { claimNames, formatConflict, formatDecision, formatMessage, formatTask, landingLine, landingsText, statsText, statusText, syncToolText, UNTRUSTED_NOTE, whoUsesText } from './format.js';
+import { whoUses } from './impact.js';
 import { claimKey, lendIdentity, lendingSessions } from './checkout.js';
 import { fullHead, headCommit } from './git.js';
 import { commitGuardOff } from './guard-status.js';
@@ -245,6 +246,15 @@ async function command(cfg: HubConfig, cmd: string, argv: string[]): Promise<Hoo
       // Exit 0 when the workspace is where it should be (or was left alone on purpose, dirty); 1 when the sync couldn't do its job.
       const fine = r.kind === 'up_to_date' || r.kind === 'synced' || r.kind === 'merged' || r.kind === 'behind_dirty' || (r.kind === 'needs_human' && r.cleared);
       return fine ? ok(text) : fail(text);
+    }
+
+    case 'uses': {
+      // `hub uses src/auth.ts#login`: who_uses from a terminal (design §2.3.7).
+      if (argv.length !== 1) return fail('usage: hub uses FILE#Symbol (one declaration, e.g. src/auth.ts#login)', 2);
+      if (!cfg.root) return fail('hub uses: not in a git checkout', 2);
+      const [t] = claimTargets(argv, process.cwd(), (f) => files([f])[0]!);
+      if (!t || t.symbol === null) return fail(`hub uses takes FILE#Symbol, one declaration (e.g. src/auth.ts#login), not a whole file: ${argv[0]}`, 2);
+      return ok(whoUsesText(await whoUses(cfg.root, { file: t.file, symbol: t.symbol }, { me: cfg.agent, claims: () => client.claims() })));
     }
 
     case 'doctor':
