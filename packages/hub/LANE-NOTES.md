@@ -206,3 +206,19 @@ For the integrator:
   - symbol claims: `mapper` required with symbols, `invalid_symbol`, file-level across mappers;
   - `check` with `scope`;
   - the hardening (a lander sends its token on every request).
+
+## Integrator, CP2
+
+H5 merged (with L4, L5 and A5). H5 queued no contract-amendment or dependency requests, so nothing was applied; the lockfile is unchanged.
+
+**Ruling: the H5 change to the Phase 1 test `hub.test.ts` "is file-level in Phase 1: different symbols in one file still conflict" stands.** The frozen contract is normative (§6.3): the `ClaimRequest.mapper` comment ("required when any scope entry has a symbol … 400 invalid_symbol otherwise") and §1.9's `invalid_symbol` row make a symbol entry without a mapper a 400, so "Phase 1 suites unchanged" (§5.1, the H5 brief) can't hold for that one request. The test keeps the Phase 1 intent where it still applies: what a Phase 1 database stored (a symbol with `mapper: null`) compares as its whole file, so different symbols in one file still conflict for such rows (§1.10 mapper gating, §4.2 #8). No real client is affected (Phase 1 adapters send `files` only). The other reading (accept and compare file-level) is not adopted: it would let a mapper-less symbol claim through on a hub whose contract says it's an error.
+
+Integrator fixes at CP2 (each with a test; the tests fail without the fix):
+
+- **Queue-mode `land` never takes a claim under `RESERVED_PREFIX`** (`landings.ts` `queueLanding`). Before, a `lander/` id's `POST /land` selected the lander lease claim with its other claims, ended the lease ("moved to landing L-n") and made a never-expiring landing hold on `.git/agenthub/lander`, which a standby then waited behind until the landing ended. Test: `landings.queue.test.ts` "never takes a claim under RESERVED_PREFIX into a landing" (the lease stays a lease, lapses as one, and the standby is granted).
+- **The lander-token rule covers every way a `lander/` id can touch or follow its lease** (`server.ts`): besides `/heartbeat`, `/claims/release` and `GET /events` (H5), now `POST /claims` for any file (a claim renews every lease of its agent), `POST /land`, and the WebSocket feed (it heartbeats on connect and on `heartbeat` frames, and follows events). On a hub with `--lander-token`, a `lander/` id without the token gets 403 `forbidden` (the feed's upgrade too); agents and tokenless hubs are unchanged. Test: `server.landing.test.ts` "a lander/ agent id needs it on any claim, on land and on the WebSocket feed".
+- **Symbol entries are capped per file** (`scope.ts` `MAX_SYMBOLS_PER_FILE` = 100, `crowdedFiles`, `collapseCrowded`). Past 100 distinct symbols of one file, a claim or check request (`requestScope`) and a landing's scope (`normalizeLandingScope`, so `/land` and admit) name that whole file instead: the safe side, since the whole file overlaps every entry. 100 is the upper bound of `symbols.maxSymbolsPerEdit`, and the lander sends at most 40 per file, so no conforming client is affected. The verifier's 8,000-symbol request (1.5 s per later claim) now costs what a whole-file claim does. Tests: `symbol-scope.test.ts` "claims and checks the whole file past MAX_SYMBOLS_PER_FILE symbols of it" (with a timing bound), `landings.queue.test.ts` "names the whole file past MAX_SYMBOLS_PER_FILE".
+
+For lane H (performance observation from L4, no action required at CP2): `shownLanding`/`emitUpdated` recompute `queueView` per landing returned and per event; caching it per `write()` would make the lander's simulation several times faster (`listLandings` is about 40% of its CPU).
+
+README (CP2): the landing-queue section, the host setup guide, the new hub-server flags, the lander-token rule, the landing routes and events are documented. The Phase 3 hub items listed under H5 "README (frozen), CP3" are noted briefly (symbol entries need the mapper; the per-file cap) and get their full section at CP3.

@@ -253,9 +253,10 @@ export function duration(ms: number): string {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
 }
 
-/** Whole minutes, at least 1: `9 min`. */
+/** Whole minutes from a minute on (`9 min`); under a minute, seconds (`40 s`), so a short wait doesn't read as a minute. */
 export function minutes(ms: number): string {
-  return `${Math.max(1, Math.round(ms / 60_000))} min`;
+  if (ms < 59_500) return `${Math.max(1, Math.round(ms / 1000))} s`;
+  return `${Math.round(ms / 60_000)} min`;
 }
 
 /** `a`, `a or b`, `a, b or c`. */
@@ -481,7 +482,7 @@ export function landingsText(v: LandingsView): string {
   const clock = v.clock ?? localClock;
   const header = [`Landing queue for ${v.project}`];
   header.push(v.lander ? `${v.lander.holder} active${v.lander.standby.length ? ` (${v.lander.standby.length} standby)` : ''}` : 'no lander is running: landings wait');
-  if (v.control?.paused) header.push(`PAUSED (${word(v.control.paused.reason)} by ${word(v.control.paused.by)}): nothing starts until an approver runs \`hub lander resume\``);
+  if (v.control?.paused) header.push(`PAUSED (${word(v.control.paused.reason)} by ${word(v.control.paused.by)}): nothing starts until an approver runs \`${resumeCommand(v.control.paused.reason)}\``);
   if (v.stats) header.push(statsBrief(v.stats, v.trunk));
   const lines = [header.join(' · ')];
   if (v.queue.length) lines.push(...queueLines(v.queue, { now: v.now, clock, check: v.check, order: 'queue' }));
@@ -515,13 +516,26 @@ export function landerText(lease: LanderInfo | null, control: LanderControl, now
     lease
       ? `Lander: ${lease.holder} active (lease ${lease.claim_id}, renews within ${duration(Math.max(0, lease.expires_at - now))})${lease.standby.length ? `; standby: ${lease.standby.join(', ')}` : '; no standby'}.`
       : 'Lander: none is running, so landings wait. Start one with `hub-lander run`.',
-    control.paused
-      ? `Paused: ${word(control.paused.reason)} (by ${word(control.paused.by)}, ${ago(control.paused.at, now)}): ${oneLine(control.paused.detail, 400)}. An approver resumes it with \`hub lander resume\`${control.paused.reason === 'trunk_rewritten' ? ' --accept-trunk <sha>' : ''}.`
-      : 'Paused: no.',
+    control.paused ? pausedLine(control.paused, now) : 'Paused: no.',
     control.trunk ? `Trunk: ${short(control.trunk.sha)}${control.trunk.landing_id ? ` (${word(control.trunk.landing_id)})` : ' (pushed outside the queue)'}, ${ago(control.trunk.at, now)}.` : 'Trunk: no lander has reported it yet.',
     `Policy: claim gate ${control.policy.claim_gate}, ${control.policy.keep_place_retries} retries keep their place, claims kept ${control.policy.sendback_grace_min} min after a send-back, approvals time out after ${control.policy.approval_timeout_hours} h.`,
   ];
   return lines.join('\n');
+}
+
+/** What an approver runs to resume landing after a pause for `reason`: a rewrite also needs the trunk to accept. */
+export function resumeCommand(reason: string): string {
+  return reason === 'trunk_rewritten' ? 'hub lander resume --accept-trunk <sha>' : 'hub lander resume';
+}
+
+/**
+ * `hub lander`'s pause line: the reason, who and when, the detail, and how to
+ * resume, said once (the hub's own detail for a rewrite already says it).
+ */
+function pausedLine(p: NonNullable<LanderControl['paused']>, now: number): string {
+  const detail = oneLine(p.detail, 400).replace(/[\s.]+$/, '');
+  const how = detail.includes('hub lander resume') ? '' : ` An approver resumes it with \`${resumeCommand(p.reason)}\`.`;
+  return `Paused: ${word(p.reason)} (by ${word(p.by)}, ${ago(p.at, now)}): ${detail}.${how}`;
 }
 
 /** Whether a project uses the landing queue at all, as far as its status shows (Phase 1 views stay as they were otherwise). */
@@ -547,7 +561,7 @@ export function statusText(s: StatusResult, me: string | null, opts: { trunk?: s
     lines.push(
       s.lander ? `Lander: ${s.lander.holder} active${s.lander.standby.length ? ` (${s.lander.standby.length} standby)` : ''}.` : 'No lander is running: landings wait.',
     );
-    if (s.control?.paused) lines.push(`Landing is paused (${word(s.control.paused.reason)}): nothing starts until an approver runs \`hub lander resume\`.`);
+    if (s.control?.paused) lines.push(`Landing is paused (${word(s.control.paused.reason)}): nothing starts until an approver runs \`${resumeCommand(s.control.paused.reason)}\`.`);
     if (s.control?.trunk) {
       lines.push(`Trunk: ${trunk} at ${short(s.control.trunk.sha)} (${s.control.trunk.landing_id ? `${word(s.control.trunk.landing_id)} landed` : 'pushed outside the queue'}, ${ago(s.control.trunk.at, s.now)}).`);
     }
@@ -655,7 +669,7 @@ function digestLandingLines(s: StatusResult, me: string, extras: DigestExtras): 
     if (s.lander && extras.stats?.median_to_trunk_ms != null) parts.push(`median land→${trunk} ${minutes(extras.stats.median_to_trunk_ms)}`);
     out.push(`Landing queue: ${parts.join(', ')}.${s.lander ? '' : ' No lander is running: landings wait.'}`);
   }
-  if (s.control?.paused) out.push(`Landing is paused (${word(s.control.paused.reason)}): nothing lands until an approver runs \`hub lander resume\`.`);
+  if (s.control?.paused) out.push(`Landing is paused (${word(s.control.paused.reason)}): nothing lands until an approver runs \`${resumeCommand(s.control.paused.reason)}\`.`);
 
   const human = humanOf(me);
   const relay = queue.filter(
@@ -727,6 +741,19 @@ export interface LandContext {
   keepPlaceRetries: number;
   /** Heads-ups the preflight produced (a stale trunk, ...). */
   warnings: string[];
+  /** Trunk's `land.structural` is `auto` (the lander tries a structural driver, if it has one), and `land.resolver.enabled`; absent, the config's defaults (auto, off). */
+  structural?: boolean;
+  resolver?: boolean;
+}
+
+/** What the lander tries on a conflict git already sees, per trunk's config, and what happens if that fails. */
+function conflictPlan(c: Pick<LandContext, 'structural' | 'resolver'>): string {
+  const structural = c.structural ?? true;
+  const resolver = c.resolver ?? false;
+  if (structural && resolver) return "The lander tries a structural merge (if it has a structural driver) and then the AI resolver; if neither can combine them, it comes back to you with both sides.";
+  if (structural) return "The lander tries a structural merge (if it has a structural driver); if that can't combine them, it comes back to you with both sides.";
+  if (resolver) return "The lander tries the AI resolver; if it can't combine them, it comes back to you with both sides.";
+  return 'No structural merge or AI resolver is set up for this project, so it comes back to you with both sides unless trunk changes first; merging trunk now (hub_sync {"mode": "merge"}) saves that round trip.';
 }
 
 /** What `land` says once the hub has queued (or already had) the commit. */
@@ -776,7 +803,7 @@ export function landQueuedText(res: LandResult, c: LandContext): string {
       return `${showName(f.file)}${who.length ? ` (${andList(who)} changed it since your base)` : ''}`;
     });
     lines.push(
-      `Heads-up: git already sees a conflict with ${c.trunk} in ${where.join(', ')}. The lander tries a structural merge first; if that can't combine them, it comes back to you with both sides.`,
+      `Heads-up: git already sees a conflict with ${c.trunk} in ${where.join(', ')}. ${conflictPlan(c)}`,
     );
   }
   for (const w of c.warnings) lines.push(`Heads-up: ${w}`);

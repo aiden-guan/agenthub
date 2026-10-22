@@ -2,6 +2,7 @@ import { HOLD_EXPIRES, LANDER_LEASE_KEY } from '@agenthub/contract';
 import { describe, expect, it } from 'vitest';
 import { startServer } from '../src/index.js';
 import { phase1Landing } from '../src/landing-row.js';
+import { MAX_SYMBOLS_PER_FILE } from '../src/scope.js';
 import { A, B, C, HOUR, LANDER, LANDER_AUTH, MIN, P, STANDBY, errorOf, failLanding, setRunning, setup, sha } from './landing-setup.js';
 
 // H2 (design §1.4 T0, T1, T15; §2.1 queueLanding): queue-mode land, replay,
@@ -137,6 +138,29 @@ describe('queue-mode land', () => {
     expect(store.getClaim(P, kept.id)!.status).toBe('active');
   });
 
+  it('never takes a claim under RESERVED_PREFIX into a landing: the lander lease stays a lease, and a standby still gets it when it lapses (CP2)', () => {
+    const { hub, store, advance } = setup();
+    // A lander/ id holds the lease and an ordinary file (the server lets it, with the lander token).
+    const lease = hub.claim(P, LANDER, { files: [LANDER_LEASE_KEY], queue: true, ttl_ms: MIN }, LANDER_AUTH).claim!;
+    const file = hub.claim(P, LANDER, { files: ['x.ts'] }).claim!;
+    const standby = hub.claim(P, STANDBY, { files: [LANDER_LEASE_KEY], queue: true, ttl_ms: MIN }, LANDER_AUTH);
+    expect(standby.status).toBe('queued');
+
+    const r = hub.land(P, LANDER, { commit: sha('1'), queue: true, files: ['x.ts'] });
+    expect(r.released.map((c) => c.id)).toEqual([file.id]);
+    expect(r.held[0].scope).toEqual([{ file: 'x.ts' }]);
+    expect(store.getClaim(P, lease.id)).toMatchObject({ status: 'active', landing_id: null });
+    expect(store.claimsForFiles(P, [LANDER_LEASE_KEY], ['active']).every((c) => c.landing_id === null && c.expires_at !== HOLD_EXPIRES)).toBe(true);
+
+    // The lease lapses as a lease does (no hold keeps it), and the standby is granted.
+    advance(40_000);
+    hub.heartbeat(P, STANDBY);
+    advance(30_000);
+    hub.sweep();
+    expect(store.getClaim(P, lease.id)!.status).toBe('expired');
+    expect(store.getClaim(P, standby.claim.id)!.status).toBe('active');
+  });
+
   it('keeps symbol entries only with a mapper, and a whole-file entry covers the symbols of its file', () => {
     const { hub } = setup();
     const mapper = 'sym1;vtsw0.3.1;wts0.27.0;4be1c2d9';
@@ -160,6 +184,16 @@ describe('queue-mode land', () => {
     expect(errorOf(() => hub.land(P, B, { commit: sha('2'), queue: true, files: Array.from({ length: 20_001 }, (_, i) => `f${i}.ts`) })).code).toBe('bad_request');
     expect(errorOf(() => hub.land(P, B, { commit: sha('2'), queue: 'yes' as unknown as boolean })).code).toBe('bad_request');
     expect(hub.land(P, B, { commit: sha('2'), queue: true, files: Array.from({ length: 300 }, (_, i) => `f${i}.ts`) }).held[0].scope).toHaveLength(300);
+  });
+
+  it('names the whole file past MAX_SYMBOLS_PER_FILE symbols of it in one landing scope (CP2)', () => {
+    const { hub } = setup();
+    const mapper = 'sym1;vtsw0.3.1;wts0.27.0;4be1c2d9';
+    const many = (file: string, n: number) => Array.from({ length: n }, (_, i) => ({ file, symbol: `f${i}` }));
+    const r = hub.land(P, A, { commit: sha('1'), queue: true, branch: 'x', scope: [...many('big.ts', MAX_SYMBOLS_PER_FILE + 1), ...many('ok.ts', MAX_SYMBOLS_PER_FILE)], mapper });
+    expect(r.landing.scope!.filter((e) => e.file === 'big.ts')).toEqual([{ file: 'big.ts' }]);
+    expect(r.landing.scope!.filter((e) => e.file === 'ok.ts')).toHaveLength(MAX_SYMBOLS_PER_FILE);
+    expect(r.held[0].scope.filter((e) => e.file === 'big.ts')).toEqual([{ file: 'big.ts' }]);
   });
 
   it('refuses a commit that is not a full lowercase sha (400 bad_commit) and creates nothing', () => {

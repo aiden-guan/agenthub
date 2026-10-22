@@ -47,12 +47,16 @@ describe('deterministic protocol simulation (design §5.2)', () => {
     it(`mutation guard: ${mutation} makes the invariants fail`, async () => {
       for (let seed = 1; seed <= MUTATION_SEEDS; seed++) {
         const r = await runSeed(seed, mutation);
-        if (r.violation) {
-          console.log(`mutation ${mutation}: caught at seed ${seed}: ${r.violation}`);
-          return;
+        if (!r.violation) continue;
+        // Only a broken invariant counts as the catch: an error the lander didn't expect is not what the guard is for (CP2).
+        if (/ logged an unexpected error: /.test(r.violation)) {
+          console.log(`mutation ${mutation}: seed ${seed} ended in an unexpected error, not an invariant: ${r.violation.slice(0, 300)}`);
+          continue;
         }
+        console.log(`mutation ${mutation}: caught at seed ${seed}: ${r.violation}`);
+        return;
       }
-      expect.fail(`no seed in 1..${MUTATION_SEEDS} caught the ${mutation} mutation`);
+      expect.fail(`no seed in 1..${MUTATION_SEEDS} broke an invariant under the ${mutation} mutation`);
     }, 600_000);
   }
 });

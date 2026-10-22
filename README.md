@@ -1,15 +1,22 @@
-# agenthub — Phase 1
+# agenthub — Phases 1 and 2
 
 A coordination hub for several people, each running their own coding agents (Claude Code, Codex, Cursor), working on one Git repository. Each agent keeps its own worktree. The hub holds what the team knows right now: who is online, who is working on which task, which files are claimed and why, what was decided, and messages between agents.
 
 Claims are **enforced inside the edit path**: a Claude Code `PreToolUse` hook asks the hub for a lease before every `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, and blocks the edit if another agent holds the file. Agents without hooks are covered by a git guard that runs on every commit git makes. Every claim is a **lease** that expires when its holder stops sending heartbeats, so a crashed agent can't hold code hostage.
 
-Phase 1 is file-level only. Function-level claims (tree-sitter), the landing queue and the dashboard come in later phases.
+Phase 2 adds the **landing queue**, which replaces internal pull requests. An agent that finishes a task calls `land`. A lander process (`hub-lander`) merges the change onto the latest trunk (a plain merge, then a structural merge driver, then optionally an AI resolver), runs the team's checks on exactly that tree, and moves trunk to it with a compare-and-swap push. If anything fails, the change goes back to its agent with a fix-it brief. Nothing reaches trunk unchecked, and only the lander moves it. See [The landing queue](#the-landing-queue-phase-2) and the [Host setup guide](#host-setup-guide).
+
+Phase 3 (function-level claims through tree-sitter, impact warnings) is in progress: the hub already compares symbol-scope claims, and the agent side follows. The dashboard and the planner are Phase 4. The design for Phases 2 and 3 is [docs/design-phase2-3.md](docs/design-phase2-3.md).
 
 ```
-packages/hub       @agenthub/hub      hub server: SQLite + HTTP + WebSocket   (bin: hub-server)
-packages/adapter   @agenthub/adapter  agent-side CLI: MCP server, hooks, guard (bin: hub)
-scripts/demo.sh    scripted two-agent demo
+packages/contract  @agenthub/contract  shared rules and constants (config parser, globs, overlap rules); no dependencies
+packages/gitops    @agenthub/gitops    git plumbing for the lander and the adapter (merge-tree, CAS push, trailers)
+packages/symbols   @agenthub/symbols   tree-sitter outlines and symbol diffs (Phase 3)
+packages/hub       @agenthub/hub       hub server: SQLite + HTTP + WebSocket                   (bin: hub-server)
+packages/lander    @agenthub/lander    the lander: admission, merge, checks, CAS push, AI resolver (bin: hub-lander)
+packages/adapter   @agenthub/adapter   agent-side CLI: MCP server, hooks, guards, sync         (bin: hub)
+packages/e2e       (private)           end-to-end suite: two agents and a lander               (npm run test:e2e)
+scripts/demo.sh    scripted demo: claims (Part 1), then the landing queue (Part 2)
 ```
 
 ## Quick start
@@ -17,10 +24,12 @@ scripts/demo.sh    scripted two-agent demo
 Needs Node 22.12+ and git.
 
 ```bash
-npm install
-npm test                                   # builds both packages, runs the test suite
-export PATH="$PWD/node_modules/.bin:$PATH"  # puts `hub` and `hub-server` on PATH
-npm run demo                               # scripted two-agent run, see below
+npm ci
+npm test                                   # builds every package, runs the test suite (about 5 minutes: the simulation and crash tests)
+npm run test:e2e                           # the end-to-end suite: two agents and a lander against a real hub and a bare remote
+npm run typecheck
+export PATH="$PWD/node_modules/.bin:$PATH"  # puts `hub`, `hub-server` and `hub-lander` on PATH
+npm run demo                               # scripted run of both parts, see below
 ```
 
 `hub` is the name the brief asked for. If you have GitHub's old `hub` CLI installed, the `PATH` line above makes this one win in that shell.
@@ -84,10 +93,13 @@ Notes:
 - Launch `claude` from a shell where `hub` is on `PATH`; the hooks and the MCP server call `hub`. The pre-edit hook entry has `"onFailure": "block"`, so if `hub` crashes or times out, Claude Code blocks the edit instead of letting it through. If `hub` (or node) isn't installed at all, the edit goes ahead with a warning the user sees, as in a checkout with no identity, unless `HUB_FAIL_CLOSED` (or `failClosed` in the project's `agenthub.json` or `.hub.json`) is set, which blocks it.
 - `hub init` adds the `hub` server to `.mcp.json` and pre-approves it with `enabledMcpjsonServers` in `.claude/settings.json`. If Claude Code still asks, approve the `hub` MCP server.
 - The MCP server sends the heartbeats that keep A's claims alive while A's session runs. When the session ends, the claims expire after the lease (2 minutes by default).
+- This sample has no `land` section in `agenthub.json`, so `land` only records the request (Phase 1). To try the landing queue with Claude Code, give the project a remote and a `land` section and start a lander, as Part 2 of the scripted demo does and [The landing queue](#the-landing-queue-phase-2) describes; then A's `land` queues its commit, and B's workspace follows trunk at its next prompt.
 
 ### Scripted, without Claude
 
-`npm run demo` does all of the above and drives the real `hub hook` commands with the JSON Claude Code would send. Abridged output:
+`npm run demo` runs two parts against one hub. It needs Node, git and curl; Part 2 uses python3, when it is there, to give `hub approve` a terminal. `DEMO_PART=1` or `DEMO_PART=2` runs one part, and `KEEP=1` keeps the sample repositories.
+
+**Part 1, claims (steps 1–11).** It does all of the above and drives the real `hub hook` commands with the JSON Claude Code would send. Abridged output:
 
 ```
 == 4. maya/claude-1 edits src/auth.ts: the PreToolUse hook claims it
@@ -145,7 +157,282 @@ Phase 1 records the landing request only; nothing was merged. Push or merge your
 (no output: edit allowed)
 ```
 
-The script ends with `hub status` and the hub's event log. `KEEP=1 npm run demo` keeps the sample repo.
+Part 1 ends with `hub status` and the hub's event log.
+
+**Part 2, the landing queue (steps 12–20).** A bare remote whose `update` hook stands in for the host rule (only the lander's identity moves `main`), seeded with a project whose `agenthub.json` turns the queue on (`land.check: "node check.mjs"`, `protected: ["migrations/**"]`, the resolver on). Two clones, one per agent. `hub-lander run` with the hub's lander token and a stub resolver (`packages/e2e/fixtures/stub-resolver.mjs`: no API key, no network). Then the flows of design §3, each with the real CLI. Abridged output:
+
+```
+== 13. maya/claude-1 finishes a task and lands it (design 3.1)
+$ git push origin HEAD:main            (nothing reaches main outside the queue)
+hub guard: push blocked: main is updated only by the landing queue. Call land (MCP) or `hub land`. Emergency bypass: HUB_GUARD=off.
+$ HUB_GUARD=off git push origin HEAD:main   (past the local guard, the host rule refuses)
+remote: only the lander may update main (committer: Demo <demo@example.com>)
+$ hub land --task T-1 --summary "login lower-cases user names" --wait
+Queued L-1 for T-1 "Lower-case user names at login": position 1, about 5 min to main.
+Next: the lander merges your 1 commit onto main, runs `node check.mjs`, and lands it. Your claims on src/auth.ts are held by the landing until then.
+…
+L-1 for T-1 landed on main as 7328980, 1 s after land (checks 0s). T-1 is done. Your holds are released.
+$ git log -1 main   (on the remote: the squash commit and its trailers)
+7328980 Lower-case user names at login (L-1)  (committer: agenthub lander)
+
+Agenthub-Landing: shop/L-1
+Agenthub-Hub: 105779b9-ff61-4186-b592-f8d4e32040d3
+Agenthub-Source: 89c3ab38617fb4021275781d4434806037f25be0
+Agenthub-Attempt: 1
+Agenthub-Task: T-1
+Agenthub-Agent: maya/claude-1
+Agenthub-Resolved: clean
+Agenthub-Checked: 616d590d3b05
+
+== 14. sam/claude-1's workspace follows trunk; uncommitted work is never touched (design 3.10)
+$ hub sync   (uncommitted changes: nothing moves)
+main moved (L-1). Your workspace wasn't updated because you have uncommitted changes (M src/users.ts); merging them would not conflict. …
+$ hub sync   (committed: the branch is replayed onto trunk, with a backup ref)
+Synced your workspace to main 7328980 (L-1 landed: src/auth.ts changed); replayed your 1 unlanded commit on top. … Undo: git reset --keep refs/agenthub/backup/agent-b/1792662265570.
+
+== 15. sam's landing fails its checks and comes back with what to fix (design 3.6, 3.9)
+L-2 for T-2 came back: checks failed on your change merged with main 7328980.
+`node check.mjs` exited 1 after 0s. Failing tests (1):
+<untrusted from="lander" kind="failed-tests">
+  src/users.ts > checks > has no failure marker
+</untrusted>
+The same checks passed on 7328980 itself, so the failure comes from your change.
+…
+To reproduce exactly: git fetch origin refs/agenthub/cand/105779b9/L-2/e589d4f0cdba && git worktree add /tmp/agenthub-L-2 e589d4f0cdba… && (cd /tmp/agenthub-L-2 && node check.mjs)
+Fix it, commit, and call land again: you keep your place in the queue (retry 1 of 2). Your claims are yours for at least 30 min.
+$ hub land --task T-2 --wait   (the retry keeps its place in the queue)
+Queued L-3 for T-2 "Add lee to the users": position 1, about 1 s to main.
+It is retry 1 of 2 after L-2 came back, so it keeps that landing's place.
+L-3 for T-2 landed on main as 1390d9a, 1 s after land (checks 0s). T-2 is done. Your holds are released.
+
+== 16. maya lands a migration: a protected path waits for a human (design 3.7)
+L-4 for T-3 passed its checks and waits for an approval of migrations/002_add_name.sql (an approver). Tell your human: `hub approve L-4` in a terminal. You can't approve it.
+$ echo L-4 | hub approve L-4   (no terminal: refused)
+hub: hub approve needs an interactive terminal (a TTY on stdin and stdout): approvals come from a human, never from an agent or a script. Run it yourself in a terminal.
+$ hub approve L-4   (sam, in a terminal: shows the diff, then asks for the landing id)
+Type L-4 to approve it as sam (anything else cancels): L-4
+Approved L-4 (protected: migrations/002_add_name.sql) as sam. …
+$ hub landing L-4
+L-4 for T-3 landed on main as e26a75d, 1 s after land (checks 0s). T-3 is done. Your holds are released.
+
+== 17. A standby lander takes over when the active one stops (design 3.11)
+Lander: lander/buildbox-30347-e052 active (lease C-1, renews within 59s); standby: lander/laptop-31757-94af.
+$ kill -TERM <the buildbox lander>   (it hands the lease back on the way out)
+Lander: lander/laptop-31757-94af active (lease C-7, renews within 1m00s); no standby.
+
+== 18. Both agents change the same lines; the AI resolver (a stub here) combines them (design 3.3, 3.4)
+$ hub land --task T-5 --wait   (sam's branch never saw lee: git sees a conflict)
+Heads-up: git already sees a conflict with main in src/allowlist.ts (L-5 by maya/claude-1 changed it since your base). The lander tries a structural merge (if it has a structural driver) and then the AI resolver; if neither can combine them, it comes back to you with both sides.
+L-6 for T-5 landed on main as 2e97feb, 1 s after land (AI-resolved conflict in src/allowlist.ts, checks 0s). T-5 is done. Your holds are released.
+Review the AI resolution: git show 2e97feb -- src/allowlist.ts
+
+== 19. The queue, the stats and trunk
+$ hub landings --stats
+Landings in the last 7 days: 5 landed.
+Land → main per chain (first land of a task to its landing): median 1 s, p90 2 s.
+First-try rate: 80%.
+Sent back: checks_failed 1.
+Resolved by: clean 4, ai 1.
+$ git log --first-parent --oneline main   (one checked squash commit per landing, all by the lander)
+2e97feb Allow kim (L-6)  (agenthub lander)
+2460187 Allow lee (L-5)  (agenthub lander)
+e26a75d Add a name column (L-4)  (agenthub lander)
+1390d9a Add lee to the users (L-3)  (agenthub lander)
+7328980 Lower-case user names at login (L-1)  (agenthub lander)
+ebb68ff shop: initial import  (Demo)
+```
+
+Part 2 ends with the lander's own log.
+
+## The landing queue (Phase 2)
+
+An agent's finished work reaches trunk only through the queue. One invariant carries the safety: **trunk moves only by a compare-and-swap fast-forward from the tip the lander merged onto, to a commit whose exact tree passed trunk's checks.** Claims, merge drivers, the AI resolver and workspace sync can each be wrong; the cost is time, never an unchecked trunk.
+
+### What happens when an agent lands
+
+1. **`land`** (MCP tool, or `hub land` for humans) checks the worktree first and sends nothing if it finds a problem: uncommitted changes, untracked files (unless `allow_untracked`), a git operation in progress, or nothing to land. Then it pushes `HEAD` to `refs/agenthub/land/<sha>` (a plain push, never forced) and queues the commit with the hub. The agent's claims on the change become **holds**: they stay held while the landing is live, never expire, and are released when it lands. The result names the queue position and an ETA, says when no lander is running, and warns when git already sees a conflict with trunk.
+2. **Admission.** The lander fetches the land ref, checks that its tip is the queued commit, and works out the change from its *landed base* (the newest commit of the branch already on trunk, so repeated squash landings from one branch work). It refuses a change that is empty (`nothing_to_land`), over `land.maxFiles` (`too_large`), or contains another agent's unlanded work (`contains_unlanded`), and, with `claimGate: fail`, one that touches code another agent holds (`claim_conflict`). Protected paths get approval requirements.
+3. **The merge ladder**, onto the latest trunk `T0`, in the lander's own bare mirror: `git merge-tree --write-tree`, with trunk's own attributes and no repository hooks or drivers; then a structural merge driver (Mergiraf, auto-detected on the lander's `PATH`, when `land.structural` is `auto`); then, if trunk's config enables it and the lander has a resolver, the AI resolver for the remaining content conflicts (see [What the resolver sends](#6-what-the-ai-resolver-sends-to-the-anthropic-api)). Whatever is still conflicted goes back to the agent with both sides of each hunk.
+4. **The checks** (`land.check`, e.g. `npm ci && npm test`) run in a fresh worktree of the candidate commit `C` (one squash commit onto `T0`), with an allowlisted environment, a scratch `HOME`, and `land.checkTimeoutMin` (20). They pass on exit 0 with an unchanged tree. There are no automatic retries.
+5. **Approvals.** A change to a protected path (or an AI resolution with `resolver.requireApproval`) parks once its checks have passed, with the checked candidate staged, until a human runs `hub approve L-7` in a terminal. If trunk hasn't moved by then, that exact candidate is pushed without running the checks again; otherwise it is merged and checked again, and an approval carries over only while the content it approved is unchanged. Unapproved landings fail after `approval.timeoutHours` (24).
+6. **The push.** The lander stages `C` at `refs/agenthub/cand/<epoch8>/<L-id>/<sha12>`, records `pushing` with the hub (the write-ahead), and pushes `C` to trunk with `--force-with-lease=<trunk>:<T0>`, deleting the land ref in the same atomic push. If trunk moved meanwhile, the push is refused and the landing is merged again onto the new tip. The commit on trunk carries trailers: `Agenthub-Landing`, `-Hub` (the hub database's epoch), `-Source`, `-Attempt`, `-Task`, `-Agent`, `-Resolved` (`clean`, `structural <paths>` or `ai:<model> <paths>`), `-Checked` (a hash of the check command), and `-Approved` when approvals were needed. Agent-written text in the message is stripped of anything that looks like a trailer.
+7. **Landed or sent back.** A landing that lands marks its task done and releases its holds. One that fails comes back to its agent as a **fix-it brief** (`hub_wait {"landing_id"}` or `landing_status`): what failed, the check output and failing tests, the conflict hunks with who changed trunk's side and why, `passes_on_trunk`, an exact `reproduce` line, and what to do next. Check output and other agents' text are wrapped as untrusted data. The holds go back to the agent as claims for at least `sendbackGraceMin` (30 min), and a fixed re-land keeps the queue place for `keepPlaceRetries` (2) retries.
+
+A crashed lander loses nothing. A landing it was working on is requeued when its lease lapses; one it was pushing is left *in doubt* and resolved by the next lease holder, which pushes the same candidate or finds it on trunk, so a landing never lands twice. A standby lander (on another machine) waits on the lease and takes over within the lease TTL (60 s), or at once when the active one stops gracefully.
+
+Every workspace follows trunk at safe points: the `UserPromptSubmit` and `SessionStart` hooks, and `hub_sync`. A clean worktree is fast-forwarded, or its unlanded commits are replayed onto trunk, in one `git reset --keep` behind a compare-and-swap on `HEAD`, after a backup ref (`refs/agenthub/backup/<branch>/<ms>`). A worktree with uncommitted changes is never touched: the agent is told it is behind, and whether its changes would conflict. Edits and syncs exclude each other, and untracked or ignored files are never overwritten.
+
+### Turning it on
+
+Add a `land` section to the committed `agenthub.json`. The lander reads trunk's copy, never a branch's, so a change to it applies to later landings only (and `agenthub.json` and `.gitattributes` are always protected).
+
+```jsonc
+{
+  "project": "acme/web",
+  "url": "http://hub.internal:7077",
+  "land": {
+    "check": "npm ci && npm test",            // required: without a check there is no queue
+    "remote": "origin", "trunk": "main",
+    "checkTimeoutMin": 20,
+    "checkEnv": { "CI": "1" },                 // non-secret values only
+    "protected": [
+      "migrations/**",                          // any approver
+      { "paths": [".github/**", "package.json", "package-lock.json"], "approvers": ["maya", "sam"], "distinct": true }
+    ],
+    "approval": { "distinct": true, "timeoutHours": 24 },   // distinct: the author's own human can't approve
+    "refPrefix": "refs/agenthub/",
+    "structural": "auto",                      // auto | off
+    "resolver": { "enabled": false, "model": "claude-opus-5-5", "maxFiles": 4, "maxFileBytes": 65536,
+                  "exclude": ["**/.env*", "**/*.pem", "**/*.key", "**/secrets/**"], "requireApproval": false },
+    "claimGate": "fail",                       // fail | warn: a landing that touches code another agent holds
+    "keepPlaceRetries": 2,
+    "sendbackGraceMin": 30,
+    "maxFiles": 2000,
+    "externalPushes": "warn"                   // warn | pause: commits on trunk that didn't come through the queue
+  },
+  "sync": { "auto": true, "staleEdit": "warn" }
+}
+```
+
+The lander, `land` and `hub doctor` read this strictly: an unknown key or a bad value is an error, and the lander pauses landing (`config_invalid`) rather than drop a protection. The hooks read it leniently: a problem becomes a warning in the session digest, and edits keep working. Without a `land` section, `land` records the request as in Phase 1.
+
+Then start the hub with a lander token and the approvers' token digests, set up the lander, and check it:
+
+```bash
+hub-server --host 0.0.0.0 --token "$HUB_TOKEN" --lander-token "$HUB_LANDER_TOKEN" --approvers /etc/agenthub/approvers.json
+hub-lander init --remote git@github.com:acme/web.git --dir /var/lib/agenthub-lander   # a bare mirror, and lander.json (0600)
+hub-lander doctor --dir /var/lib/agenthub-lander     # git features, remote, trunk config, ref namespace, drivers, resolver, hub, lander token, isolation
+HUB_LANDER_TOKEN=… hub-lander run --dir /var/lib/agenthub-lander   # claims the lander lease, or stands by
+```
+
+### The lander (`hub-lander`)
+
+| Command | |
+|---|---|
+| `hub-lander init --remote <url> [--dir D] [--hub URL] [--project ID]` | Creates the workdir (0700; without `--dir`, `~/.agenthub/lander/<project>`) with a bare mirror of the remote and `lander.json` (0600). The operator's git `credential.helper` values are copied into the mirror; nothing else of the operator's git config is read |
+| `hub-lander run [--once] [run flags]` | Claims the lander lease (a reserved claim on the hub) or stands by for it; admits and lands queued changes, one at a time. `--once` processes at most one landing and exits. SIGTERM hands the current landing back to the queue (after resolving one it was pushing) and releases the lease |
+| `hub-lander doctor [run flags]` | One line per check (`ok`, `FAIL`, `warn`, `skip`, `note`); exit 1 on any `FAIL` |
+| `hub-lander resolve-anthropic` | The built-in AI resolver command (the lander runs it) |
+
+Run flags: `--hub URL`, `--project ID` (both default to trunk's `agenthub.json`), `--dir D`, `--id-prefix lander/<name>`, `--resolver-command CMD`, `--driver name=CMD@pattern[,pattern...]`, `--check-wrapper CMD`, `--lease-ttl-ms N` (60000), `--poll-trunk-ms N` (15000). Environment: `HUB_URL`, `HUB_PROJECT`, `HUB_TOKEN`, `HUB_LANDER_TOKEN`, `HUB_LANDER_ID`, `ANTHROPIC_API_KEY`. The same keys (but no API key, which comes only from the environment) can go in `<workdir>/lander.json`: `hub`, `project`, `token`, `landerToken`, `idPrefix`, `remoteUrl`, `committer` (default `agenthub lander <lander@localhost>`), `drivers`, `resolverCommand`, `resolverMaxPerHour` (20), `passEnv` (names of variables the checks may see, such as `NPM_TOKEN`), `checkWrapper`, `leaseTtlMs`, `pollTrunkMs`. The lander refuses a `lander.json` that group or others can read. Exit codes: 0, 1 (a doctor check failed), 2 (bad configuration, or the hub refused the lease).
+
+The lander reads `ANTHROPIC_API_KEY`, `HUB_TOKEN` and `HUB_LANDER_TOKEN` and deletes them from its environment before anything runs, so neither git, merge drivers nor checks inherit them. Check output is redacted (the exact secret values, and token-shaped strings) before it leaves the lander.
+
+### Approving
+
+Approvals come from humans, never from agents: there is no MCP route for them, and `hub approve` refuses without a terminal. Each approver has a token. The hub keeps only its sha256 digest:
+
+```bash
+TOKEN=$(openssl rand -hex 32)                              # the approver keeps this
+printf 'sha256:%s\n' "$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"   # goes in the hub's approvers file
+```
+
+The hub's `--approvers FILE` is `{"maya": "sha256:<hex>", "sam": "sha256:<hex>"}` (no secrets in it). Each human keeps `{"name": "maya", "token": "<token>"}` in `~/.config/agenthub/approver.json` (`$XDG_CONFIG_HOME` is honoured), mode 0600 (the CLI refuses it otherwise), or sets `HUB_APPROVER` and `HUB_APPROVER_TOKEN` together. `hub approve L-7` fetches the change, shows the protected files' diff with control and invisible characters made visible, recomputes the digest the hub asks for, and approves only after the human types `L-7`. `hub reject L-7 --reason …` sends the landing back. `hub lander resume` (after a pause) needs the same credentials.
+
+### Agent tools and CLI added in Phase 2
+
+| MCP tool | |
+|---|---|
+| `land` | Queue the committed work (`task_id`, `summary`, `allow_untracked`, `wait_s`). Idempotent per commit |
+| `landing_status` | One landing in detail, with the fix-it brief when it came back; without an id, your landings and the queue |
+| `land_cancel` | Take your landing out of the queue; its task and claims come back to you. Not while it is being pushed |
+| `hub_wait {landing_id}` | Wake when the landing lands, comes back or parks for an approval |
+| `hub_sync` | Bring the worktree up to trunk now (`update`, or `merge` to merge trunk into the branch) |
+
+For humans: `hub land`, `hub landings [--all] [--watch] [--stats [--days N]]`, `hub landing L-7 [--log]`, `hub cancel L-7`, `hub approve L-7`, `hub reject L-7 --reason …`, `hub lander` and `hub lander resume [--accept-trunk SHA]`, `hub doctor`, `hub sync [--merge] [--recover]`. `hub init` also installs a `pre-push` guard that refuses pushes to trunk and to candidate refs (`HUB_GUARD=off` bypasses it; the host rule doesn't).
+
+`hub landings --stats` measures the goal: the median time from a task's first `land` to its landing on trunk, the first-try rate, send-backs by cause, and check and queue times.
+
+### When trunk moves outside the queue
+
+The lander reads trunk's first-parent history at every attempt. A commit without this hub's trailers is reported as foreign (`trunk.moved {foreign: true}`): agents' digests say it wasn't checked, and with `externalPushes: pause` landing stops until an approver runs `hub lander resume`. A rewrite (trunk no longer descends from the tip the hub knew) always pauses landing until an approver looks at trunk and runs `hub lander resume --accept-trunk <sha>`. To undo a landing, land a revert (`git revert <sha>` on a branch, then `land`).
+
+## Host setup guide
+
+The queue is only as strong as the rules on the git host. Set these up before turning off internal pull requests.
+
+### 1. Restrict trunk to the lander
+
+Only the lander may update `main`; nobody may force-push or delete it. On GitHub, add a branch ruleset (Settings → Rules → Rulesets) targeting the default branch with **Restrict updates**, **Restrict deletions** and **Block force pushes** turned on, and put only the lander's identity on the ruleset's bypass list:
+
+- a **deploy key** with write access, used only by the lander's OS user (the lander pushes over SSH with it), or
+- a **GitHub App** installed on the repository with contents write access, whose installation token the lander's git gets through a credential helper (`hub-lander init` copies the operator's `credential.helper` into the mirror).
+
+Don't add humans or CI bots to the bypass list. Without this rule, a direct push is detected (a foreign commit, above) but not prevented: `hub-lander doctor` can't verify the host rule and prints a reminder. On other hosts use the equivalent protected-branch setting; on a bare remote you control, an `update` hook like the demo's does the same. Branch-protection rules that require pull requests or status checks would block the lander's pushes unless it bypasses them; the lander's own checks replace them.
+
+### 2. Custom refs: `refs/agenthub/*`
+
+Agents push their work to `refs/agenthub/land/<sha>`, and the lander stages candidates under `refs/agenthub/cand/`. Both must be allowed: agents need push access to `refs/agenthub/land/*`, the lander to `refs/agenthub/cand/*`. `hub-lander doctor` probes this (it pushes and deletes a probe ref), and `hub doctor` checks an agent's push access with a dry run. If the host refuses refs outside `refs/heads/` and `refs/tags/`, set `"land": {"refPrefix": "refs/heads/agenthub/"}`: land and candidate refs then show as branches (which may trigger CI on push, and which branch rulesets may cover). The lander deletes them as landings end: a land ref with its landing's trunk push, or an hour after the landing ended otherwise; a candidate when its landing lands, or 7 days after it ended otherwise (it is what `reproduce` fetches).
+
+### 3. Run the lander as a service
+
+The lander runs the repository's own check command, so a check can read whatever the lander's OS user can read, its push credentials included. Isolate it one of two ways (`hub-lander doctor` warns when neither is in place):
+
+- **A dedicated OS user** that owns the lander workdir and the push credentials, and nothing else of value. The check environment is already an allowlist (no `SSH_AUTH_SOCK`, no `*_TOKEN`, no `GIT_*`, a scratch `HOME`), but a determined check can still read files that user can read.
+- **`checkWrapper`**, a container with no credential mounts, for example `"checkWrapper": "docker run --rm --network none -v {wt}:/w -w /w node:22 sh -c"` (the lander replaces `{wt}` with the candidate's worktree and appends the quoted check command). Drop `--network none` if the check needs the network (`npm ci`).
+
+A systemd unit for the dedicated-user setup:
+
+```ini
+# /etc/systemd/system/agenthub-lander.service
+[Unit]
+Description=agenthub lander
+After=network-online.target
+
+[Service]
+User=agenthub-lander
+EnvironmentFile=/etc/agenthub/lander.env      # HUB_LANDER_TOKEN=…, HUB_TOKEN=…, ANTHROPIC_API_KEY=… (mode 0600, owned by root)
+ExecStart=/usr/bin/env hub-lander run --dir /var/lib/agenthub-lander
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Run a **standby** on a second machine with its own `hub-lander init`: it waits on the lease and takes over within the lease TTL if the active lander dies. Exit code 2 means bad configuration (or the hub refused the lander token): `Restart=always` will keep retrying, so check `journalctl` after changes. Check logs (`<workdir>/logs/<L-id>.<attempt>.log`) and the `log_tail` in send-backs are visible to the whole team; don't print secrets in checks.
+
+### 4. Approver tokens
+
+- One token per human, generated as above; the hub's approvers file holds only digests, so it can live in configuration management.
+- Keep the token where agents can't read it: `~/.config/agenthub/approver.json` with mode 0600, or a keychain-backed `HUB_APPROVER_TOKEN`. `hub init` never writes one, and no MCP tool or hook output ever carries one.
+- The terminal requirement and the absence of an MCP route stop agents from approving through ordinary tool use, not a determined process running as the approver's own OS user with shell access. Teams that need more keep approver tokens only on machines where no agents run as that user.
+- `--allow-unauthenticated-approvals` (names alone, no tokens) is for demos and tests, and works only on a loopback hub.
+- Rotate a token by changing its digest in the approvers file and restarting the hub.
+
+### 5. Protect what defines the checks
+
+A change can weaken what the checks check. `agenthub.json` and `.gitattributes` are always protected. Also protect, at least:
+
+```jsonc
+"protected": [
+  "migrations/**",
+  { "paths": ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+              ".github/**", "scripts/ci/**", "vitest.config.*", "jest.config.*", "tsconfig*.json",
+              "pytest.ini", "pyproject.toml", "Dockerfile*"], "approvers": ["maya", "sam"], "distinct": true }
+]
+```
+
+adjusted to wherever your test runner, CI and build configuration live. The check command itself can also live outside the repository on the lander machine (`"check": "/opt/acme/check.sh"`). The lander adds a warning to a landing that deletes test files or removes more lines than it adds in test files.
+
+### 6. What the AI resolver sends to the Anthropic API
+
+The resolver is off by default, and needs both opt-ins: trunk's `land.resolver.enabled: true`, and the lander operator providing `ANTHROPIC_API_KEY` (or a `resolverCommand`). It runs only on the lander machine, only for content conflicts that git, and the structural driver if any, couldn't merge. For each conflicted file it may send (one request per file, at most `maxFiles` (4) files per attempt, `resolverMaxPerHour` (20) calls per lander):
+
+- the file's path and language, and its three versions (base, trunk, incoming) in full, plus git's merge of them with the conflict hunks numbered;
+- the incoming landing's task title and description, its summary, the intents of the claims it holds, and up to 5 related decisions;
+- for up to 5 trunk commits that changed the file since the base: their landing, task, summary and decisions.
+
+It never sends protected files, files matching `resolver.exclude` (by default `**/.env*`, `**/*.pem`, `**/*.key`, `**/secrets/**`), binary or non-UTF-8 files, files over `maxFileBytes` (64 KiB per version), or any other file of the repository. The built-in command calls the API through the official SDK with the model in `land.resolver.model` (`claude-opus-5-5` by default), with the API key from the lander's memory and no other credential source; the lander gives it only `PATH`, a scratch `HOME` and the key, so a lander that reaches the internet only through an HTTPS proxy needs a `resolverCommand` wrapper that sets the proxy. The model may only replace the conflict hunks; its output must pass schema, marker, size and novelty gates, and then the checks, like any landing. A resolved landing carries `Agenthub-Resolved: ai:<model> <paths>`, both authors are told to review it, and `resolver.requireApproval: true` adds a human approval of the exact result. The worst case is about $0.80 per file at list prices; each landing's report records the tokens used.
+
+### 7. Before turning off internal pull requests
+
+- The host rule is in place (1), and the land and candidate refs work (2): `hub-lander doctor` is clean.
+- A lander runs as a service, with a standby (3).
+- Approvers have tokens (4), and the protected list covers what defines your checks (5).
+- After a few days, `hub landings --stats` shows a median land→trunk under 15 minutes. A serial queue serves about 10 landings an hour with 4-minute checks; faster checks raise that.
 
 ## How it works
 
@@ -153,7 +440,7 @@ The script ends with `hub status` and the hub's event log. `KEEP=1 npm run demo`
 
 Every state change goes through `Hub.write()` ([hub.ts](packages/hub/src/hub.ts)). It runs synchronously inside one SQLite `BEGIN IMMEDIATE` transaction and refuses re-entry, so two claim decisions can never interleave, even with a second process on the same database file. Events are published only after the transaction commits.
 
-- **Scope**: `[{file, symbol?}]`, with repo-relative POSIX paths, so the same file matches across worktrees. The hub stores and compares paths in Unicode NFC, so the decomposed name macOS may keep on disk and git's composed one are the same claim. It refuses (400 `invalid_path`, with the path escaped in the message) paths with control, line-separator or bidi characters or unpaired surrogates, absolute paths (`/x`, or a drive root like `C:/x` or `C:\x`), and `.`, `..` or empty segments. Those are refused, not cleaned up: `./a.ts`, `a/` and `a//b` get 400. Names like `a:b.md`, `..env` or ones with spaces are legal. A file whose name the hub refuses can't be claimed by anyone, so it never conflicts: the adapter applies the same rules, leaves such a file out of a claim or a commit check, and says so. Phase 1 compares files only and stores `symbol` for Phase 3. A claim with no intent gets one made from its task's title or its files, capped at 300 characters like a given one.
+- **Scope**: `[{file, symbol?}]`, with repo-relative POSIX paths, so the same file matches across worktrees. The hub stores and compares paths in Unicode NFC, so the decomposed name macOS may keep on disk and git's composed one are the same claim. It refuses (400 `invalid_path`, with the path escaped in the message) paths with control, line-separator or bidi characters or unpaired surrogates, absolute paths (`/x`, or a drive root like `C:/x` or `C:\x`), and `.`, `..` or empty segments. Those are refused, not cleaned up: `./a.ts`, `a/` and `a//b` get 400. Names like `a:b.md`, `..env` or ones with spaces are legal. A file whose name the hub refuses can't be claimed by anyone, so it never conflicts: the adapter applies the same rules, leaves such a file out of a claim or a commit check, and says so. Phase 1 compared files only. From Phase 3 the hub compares symbol entries (`{file, symbol}`) that come with the `mapper` (the extractor version) that produced them, under the overlap rules of `@agenthub/contract`; across mappers they count as whole files, a symbol entry without a mapper is refused (400 `invalid_symbol`), and past 100 symbols of one file a request names the whole file. The agent side still claims whole files until its Phase 3 step. A claim with no intent gets one made from its task's title or its files, capped at 300 characters like a given one.
 - **Modes**: `exclusive` conflicts with everything; `shared` coexists with other shared holders (use it for files everyone appends to). The edit hook asks for `auto`: exclusive if the file is free, shared if only shared holders have it, denied if someone holds it exclusively, or if another agent's earlier queued claim on the file is waiting for it (an exclusive waiter, or any waiter when the request would be exclusive). Such a denial lists the waiter with status `queued`.
 - **Re-claiming your own file** renews it instead of conflicting.
 - **Queue**: a contended claim with `queue: true` waits in FIFO order and is granted in the same transaction that releases or expires the blocker. Deciding the line stays quick when it is long: a release with a thousand agents waiting for one file takes tens of milliseconds. A later request, queued or not, can't overtake an earlier waiter for the same file. The one exception is a waiter whose agent already waits, directly or through others, for the requesting agent: it goes behind the request, because it can't be granted before that agent lets go anyway. A queue request that would close a hold-and-wait cycle (two shared holders both asking to upgrade to exclusive, say) is refused with 409 `deadlock`, naming the cycle and the claim to release; the refusal still renews the agent's leases. A denial whose wait could never end carries a `deadlock` field that says why.
@@ -185,11 +472,12 @@ The hook payload fields (`tool_input.file_path`, `cwd`, `hookSpecificOutput.perm
 | `task_create` | Add a task, optionally with dependencies |
 | `claim` | Lease files with a one-line intent: exclusive or shared, queued if contended (default). A queue that would deadlock is refused with the cycle and the claim to release |
 | `release` | Release by claim id, by files (the rest of the claim stays held), by task, or all |
-| `hub_wait` | Block until files are free, your queued claim is granted, or a message arrives. Returns at once if that already happened. For files, "free" is what the edit hook would get: the hub answers it, so an earlier waiter you may not overtake counts, and a wait that could never end says so at once |
+| `hub_wait` | Block until files are free, your queued claim is granted, your landing lands or comes back (`landing_id`), or a message arrives. Returns at once if that already happened. For files, "free" is what the edit hook would get: the hub answers it, so an earlier waiter you may not overtake counts, and a wait that could never end says so at once |
 | `hub_post` | Message an agent (`maya/claude-2`) or a channel (`#general`) |
 | `inbox` | Read unread messages, each labeled with its sender |
 | `decide` | Append a decision others must follow to the append-only log |
-| `land` | Phase 1 stub: records the landing request, marks the task done (unblocking dependents) and releases its claims. Nothing is merged. The note lists the claims still held and which landing, if any, would release them |
+| `land` | With a `land` section on trunk: queue the committed work for the lander (see [The landing queue](#the-landing-queue-phase-2)). Without one (Phase 1): record the landing request, mark the task done (unblocking dependents) and release its claims; nothing is merged |
+| `landing_status`, `land_cancel`, `hub_sync` | The landing queue's tools: see [Agent tools and CLI added in Phase 2](#agent-tools-and-cli-added-in-phase-2) |
 
 ### Messages from other agents are untrusted data
 
@@ -231,17 +519,26 @@ Server: `hub-server [--port 7077] [--host 127.0.0.1] [--db hub.db] [--lease-ttl-
 - `--port`: 0 to 65535, except the ports the Fetch standard blocks (6667 or 10080, say), which Node's fetch, and so the adapter, won't connect to.
 - Values that are not plain digits, or are out of range, make hub-server exit 2 with a one-line error naming the flag or variable, before the database is opened. An empty value means the default.
 - `--allow-origin` and `--allow-host`: see Security.
+- `--lander-token SECRET` / `HUB_LANDER_TOKEN`: the lander's routes and its lease need `x-hub-lander-token`, and so does every request from an `x-hub-agent` under `lander/` (heartbeats, claims, release, land, events, the feed). Without the flag, the lander routes work only on a loopback hub (which warns at startup); on a network address they answer 403 `lander_token_required`. Visible ASCII without spaces.
+- `--approvers FILE` / `HUB_APPROVERS_FILE`: `{"maya": "sha256:<hex of maya's token>", …}`, read once at startup (see [Approving](#approving)). Without it, approvals answer 403 `approvals_disabled`.
+- `--allow-unauthenticated-approvals`: approvals by name alone, for demos and tests. Refused unless the hub listens on loopback.
+- The landing flags are checked before the database opens, like the others; the startup lines say which are in effect.
+
+The agent side reads approver credentials only for `hub approve`, `hub reject` and `hub lander resume`: `HUB_APPROVER` and `HUB_APPROVER_TOKEN` together, else `~/.config/agenthub/approver.json`. The lander's own settings are in [The lander](#the-lander-hub-lander).
 
 ## Security
 
 - **Browsers**: HTTP requests and feed connections that carry an `Origin` header, which means browsers, are refused with 403 `forbidden_origin` unless their origin is given with `--allow-origin <scheme://host[:port]>` (repeatable, default none). The adapter's Node clients send no `Origin`.
 - **DNS rebinding**: on a loopback address (the default, 127.0.0.1), the hub answers only to requests addressed to an IP address, `localhost`, `*.localhost` or its `--host` name. Requests and feed connections for any other name get 403 `forbidden_host`. This stops a web page that rebinds its own domain to 127.0.0.1 from driving the hub through your browser. If your agents reach the hub by another name, list it with `--allow-host <name>` (repeatable). For example, agents in Docker Desktop containers using `HUB_URL=http://host.docker.internal:7077` need `hub-server --allow-host host.docker.internal`; so does a reverse proxy or tunnel that keeps the original Host header, or an `/etc/hosts` alias. The 403 message names the refused host and the exact flag to add, and the edit hook and guard show it as is. On a network address (`--host 0.0.0.0`) the hub serves any name unless `--allow-host` is given, in which case only the listed names, IPs and localhost are served; use `--token` there.
 - **Bad clients**: a feed connection that sends an oversized or malformed frame is dropped, and a client that resets its connection while its feed upgrade is refused can't take the process down.
-- **Identity**: see Phase 1 limits.
+- **The lander**: on a hub with `--lander-token`, nothing without the token can act as a lander: the lander routes, the lease claim, and any request from a `lander/` agent id (which could otherwise renew, release, move or follow the lease) answer 403. Even a forged lander can't move trunk: only the lander's git identity may (the host rule), and every landing on trunk is checked against git by the trunk scan. A stale lander that lost its lease is fenced: its writes answer `not_lander` or `landing_stale`, and its push, by compare-and-swap, can only land the same checked commit or be refused.
+- **Approvals** need a per-human token whose sha256 digest is in the hub's approvers file, through a CLI that insists on a terminal; the approval audit is append-only. See [Approver tokens](#4-approver-tokens).
+- **Checks run repository code** on the lander machine: isolate them (a dedicated OS user or `checkWrapper`), see [Run the lander as a service](#3-run-the-lander-as-a-service).
+- **Identity**: see Limits.
 
 ## Hub API
 
-All routes are under `/v1/p/:project`. The caller's identity goes in the `x-hub-agent` header. Errors look like `{"error":{"code","message"}}`: 400 for a bad request (`invalid_path`, `bad_request`, `bad_agent`, ...), 401 `unauthorized` for a missing or wrong token, 403 for `forbidden_origin`, `forbidden_host` or another agent's claim or task, 404, 409 (`task_blocked`, `task_closed`, `task_taken`, `deadlock`), 413 for a body over 1 MB.
+All routes are under `/v1/p/:project`. The caller's identity goes in the `x-hub-agent` header; a lander also sends `x-hub-lander-token`, an approver `x-hub-approver` and `x-hub-approver-token`. Errors look like `{"error":{"code","message","details"?}}`: 400 for a bad request (`invalid_path`, `invalid_symbol`, `bad_commit`, `bad_request`, `bad_agent`, ...), 401 `unauthorized` for a missing or wrong token, 403 for `forbidden_origin`, `forbidden_host`, `lander_token_required`, `approvals_disabled`, `not_approver` or another agent's claim or task, 404, 409 (`task_blocked`, `task_closed`, `task_taken`, `task_landing`, `deadlock`, `claim_conflict` with `details.conflicts`, `too_late`, `landing_closed`, `held_by_landing`, `landing_queue_active`, `not_lander`, `landing_stale`, `approval_missing`, `approval_stale`), 413 for a body over 1 MB.
 
 | Route | |
 |---|---|
@@ -250,14 +547,19 @@ All routes are under `/v1/p/:project`. The caller's identity goes in the `x-hub-
 | `GET /tasks` · `POST /tasks` · `POST /tasks/:id/take` · `POST /tasks/:id/update` | task graph |
 | `GET /claims` · `POST /claims` · `GET /claims/:id` | `POST` body: `{files \| scope, mode, intent, task_id, base_commit, ttl_ms, heartbeat_interval_ms, queue}`, returns `granted \| queued \| denied` with conflicts (each `active` or `queued`) and, on a denial whose wait could never end, `deadlock`. 409 `deadlock` when `queue: true` would close a wait cycle |
 | `POST /claims/release` | `{claim_id \| files \| task_id \| all}`; `files` must be a list (an empty one narrows nothing) |
-| `POST /claims/check` | `{files, mode?}`: without `mode`, other agents' active exclusive claims (used by the guard); with it, what a `queue: false` claim of each file in that mode would be denied for, queued waiters included (used by `hub_wait`, with `auto`). Changes nothing |
+| `POST /claims/check` | `{files, scope?, mapper?, mode?}`: without `mode`, other agents' active exclusive claims and landing holds (used by the guard); with it, what a `queue: false` claim of each file's entries in that mode would be denied for, queued waiters included (used by `hub_wait`, with `auto`). Changes nothing |
 | `POST /messages` · `GET /inbox?peek=1` | direct and channel messages |
 | `GET /decisions` · `POST /decisions` | append-only decision log |
-| `POST /land` | Phase 1 landing stub |
+| `POST /land` | `{commit, task_id?, branch?, summary?, files, scope?, mapper?, queue: true}`: queue a commit for the lander (its claims become holds). Without `queue`, Phase 1's record mode, refused with 409 `landing_queue_active` once the project has had a lander |
+| `GET /landings?status=a,b&agent=&task=&limit=` · `GET /landings/:id` · `GET /landings/stats?days=7` | landings (live ones first, in queue order), one landing with its report, and the land→trunk statistics |
+| `POST /landings/:id/cancel` | by its author, or by an approver |
+| `POST /landings/:id/approve` · `POST /landings/:id/reject` | approver: `{kind, digest, note?}` (the digest of a pending requirement) · `{reason}` |
+| `GET /lander` · `POST /lander/resume` | the lease, standbys and control (pause flag, trunk tip, policy) · approver: `{accept_trunk?}` |
+| `POST /lander/next` · `POST /landings/:id/admit` · `POST /landings/:id/advance` · `POST /landings/:id/resolve` · `POST /lander/trunk` · `POST /lander/pause` | lander only, fenced by its lease (`{lease_claim_id, epoch}`) |
 | `GET /events?since=N&wait_ms=M&types=a,b` | long-poll the event log. Returns `{events, seq, next_since, epoch}`: at most 500 events, from at most 5000 read, `seq` the latest, `next_since` the cursor for the next call (it moves past events the caller can't see or didn't ask for). A read that stopped short of `seq` answers at once, even with no events, so one request never holds up the hub for long; the caller reads on from `next_since`. `since` is optional and defaults to the latest seq; one from a recreated database reads on from the latest |
 | `WS /feed?agent=A&since=N` | push feed: `hello` (with `seq`, `epoch` and `heartbeat_interval_ms`), then `event` frames. Accepts `{type:"heartbeat"}` (answered with `heartbeat.ack` and `next_heartbeat_ms`) and `{type:"ping"}`. With `since`, every missed event the agent may see is replayed, however many there are, 500 at a time with other requests answered in between; new events follow in order, and then a `{type:"replayed", next_since}` frame gives the cursor to reconnect from, past events the agent can't see. A `since` from another database replays nothing |
 
-Events: `agent.online`, `claim.granted`, `claim.queued`, `claim.released`, `claim.expired`, `task.created`, `task.taken`, `task.updated`, `task.unblocked`, `message.posted`, `decision.recorded`, `land.requested`. Each has a per-project `seq`, and events with `targets` are delivered only to those agents. `epoch` is made once per database file and changes when the database is recreated; adapters reset their cursor and buffers when it does.
+Events: `agent.online`, `claim.granted`, `claim.queued`, `claim.released`, `claim.expired`, `task.created`, `task.taken`, `task.updated`, `task.unblocked`, `message.posted`, `decision.recorded`, `land.requested`, and from Phase 2 `landing.created`, `landing.updated`, `landing.needs_approval`, `landing.landed`, `landing.failed`, `trunk.moved`, `lander.paused`, `lander.resumed` (none carries agent-written text; read the landing for that). Each has a per-project `seq`, and events with `targets` are delivered only to those agents. `epoch` is made once per database file and changes when the database is recreated; adapters reset their cursor and buffers when it does.
 
 ## Storage, and the path to a Durable Object
 
@@ -267,7 +569,7 @@ The hub talks to storage only through the synchronous `Store` interface ([store.
 
 ## Tests
 
-`npm test` builds both packages and runs Vitest. It covers:
+`npm test` builds every package and runs Vitest, offline: no API key, no Mergiraf, no Docker, no global git config. `npm run test:e2e` runs the end-to-end suite. Phase 1's coverage:
 
 | Requirement | Where |
 |---|---|
@@ -279,16 +581,42 @@ The hub talks to storage only through the synchronous `Store` interface ([store.
 | Server hardening and settings | `server.test.ts`: bad feed frames, refused upgrades whose client resets, Origin and Host checks, path validation, bad ids answered 400, event paging, reads bounded behind a long run of invisible events, a long feed replay that leaves the hub answering, epochs, several hub processes on one database, `hub-server` flag validation (blocked ports included); `hub.test.ts`: a release with a thousand waiters |
 | Digest, guard, init, MCP tools, untrusted labeling, config | `hooks.test.ts`, `guard-init.test.ts` (real `git commit`, revert, cherry-pick, rebase, am and merge through the installed hooks; kept symlinked and non-shell hooks, husky, the guard in a nested worktree, a missing CLI), `mcp.test.ts`, `feed.test.ts`, `config.test.ts` |
 
-## Phase 1 limits
+Phase 2's:
+
+| Requirement | Where |
+|---|---|
+| The shared rules (config parser, globs, overlap and coverage) | `contract/test/contract.test.ts`: the frozen vectors |
+| git plumbing | `gitops/test`: against real git: the CAS push refusing a rewound trunk, a union-merge attack through attributes, conflict parsing, landed bases, forged trailers stripped, a replay conflict leaving the repository unchanged |
+| The hub's queue and lander protocol | `hub/test/landings.*.test.ts`, `holds.test.ts`, `lander-lease.test.ts` (fake clock: every transition and guard, fencing, in-doubt never requeued, approvals), `server.landing.test.ts` (every route over HTTP, the lander and approver credentials, the contract fixtures) |
+| The lander against a real hub and a real bare remote | `lander/test/lander.integration.test.ts` and `lander.ai.integration.test.ts` (design §5.3: the happy path, FIFO, structural and AI merges, send-backs, approvals and the fast path, trunk moving, foreign pushes and rewrites, a token-protected hub), over `startServer` from `@agenthub/hub` |
+| Crash safety | `lander/test/crash.test.ts`: the lander SIGKILLed at each of 10 fault points, a standby finishing the landing exactly once; a stale lander SIGSTOPped past its lease; the hub restarted mid-landing |
+| The protocol under faults | `lander/test/simulation*.test.ts`: the real lander and hub on a simulated clock, with fake git and checks, 2,000 seeded runs of crashes, freezes, dropped requests, foreign pushes, rewinds and recreated databases, checking the invariants after every step; five mutation guards each show the invariants catch a removed protection. `SIM_SEEDS` changes the seed count (lower it in CI if time matters; the 2,000 seeds take about 160 s on 4 cores) |
+| The AI resolver | `lander/test/resolver.test.ts` (eligibility, the nonce, every gate, the splice, the cap, approval binding and reuse) against a stub; the Anthropic request shape against a fake `fetch`; a live test only with `AGENTHUB_LIVE_AI=1` |
+| The agent side | `adapter/test/land.test.ts`, `landing-ux.test.ts` (the fix-it briefs as the design shows them), `sync.test.ts` (every sync outcome, files byte-identical when it refuses, crash recovery), `pre-push.test.ts`, `approve` through a pseudo-terminal |
+| End to end | `e2e/test/landing.e2e.test.ts`: two agents driven as Claude Code drives them (hooks fed its JSON, MCP servers in memory) and a lander, as separate processes, against a real hub and a bare remote with a host rule: landing, holds, dirty and clean sync, a send-back and its retry, an approval through a pseudo-terminal, an AI-resolved conflict, sync/edit exclusion, the trunk history and trailers, only lander pushes reaching `main`, GC, and a lander killed mid-check whose standby lands the change exactly once |
+
+## Limits
 
 - **Identity is self-asserted.** The hub trusts `x-hub-agent`. `--token` adds one shared bearer token, but that isn't per-agent authentication. Run the hub on localhost or a private network until per-agent auth (e.g. a GitHub App) lands.
 - **Fail-open when the hub is unreachable.** If the hub can't be reached (no answer, or HTTP 5xx), edits and commits go through with a warning the user and the agent see. Set `HUB_FAIL_CLOSED=1` to block instead. Refusals, auth errors and configuration errors always block.
-- **File-level only.** Two agents can't edit different functions in one file at the same time. `symbol` is stored but ignored until Phase 3.
-- **`land` is a stub.** It records the request, marks the task done and releases claims. You still push and merge yourself.
+- **File-level claims, for now.** Two agents can't edit different functions in one file at the same time. The hub compares symbol-scope claims (Phase 3), but the agent side still claims whole files.
+- **The host rule is setup, not code.** Without branch protection that admits only the lander, a direct push to trunk is detected (a foreign commit; `externalPushes: pause` stops landing) but not prevented.
+- **One landing at a time.** The queue is serial: about 10 landings an hour with 4-minute checks keeps land→trunk under 15 minutes; past that, waits grow quickly. Faster checks and fewer send-backs help first; speculative pipelining is left for later.
+- **Squash history.** One commit per landing on trunk; the squashed commits are listed in its message.
+- **Holds pin files while a landing waits**: for up to `approval.timeoutHours` when it waits for an approval, and indefinitely when no lander runs, until a human cancels it (`hub cancel`).
+- **Checks run repository code.** A change can weaken what the checks check unless those paths are protected, and a check can read what the lander's OS user can read unless it is isolated (see the host setup guide).
+- **A plausible but wrong AI resolution that passes the checks** lands like any agent's code; it is flagged for review in its trailer and in messages to both authors, and `requireApproval` adds a human.
 - **Not covered yet:** no maximum hold time per claim, the event log isn't compacted, and file writes made through the Bash tool don't go through the edit hook (the guard still checks the commit).
 - **Hooks `hub init` can't chain.** Hooks in a `core.hooksPath` directory the team tracks, or in a global one, don't get the guard until you add the line `hub init` prints; init, the session digest and `hub whoami` say the guard is off until then. A hook manager that writes its hooks again (`npm install` runs husky's) takes the guard out of `.husky/_` until `hub init` runs again, which the digest and `hub whoami` report. A chained shell hook that reads its own file through `$0` reads the guard's file instead. A hook moved to `.git/agenthub-kept` runs under its own name and at the same depth, but from that directory, so one that looks for helper files beside itself in `.git/hooks` doesn't find them.
 - **Unconfirmed claims linger for a turn.** A claim the edit hook took for an edit the user then rejected is released at the next settle point (end of turn, next prompt, session end), not at once.
 - **Untested here against a live Claude session.** The bundled Claude Code CLI wasn't logged in on the build machine. The hook commands are tested as a CLI with Claude Code-shaped payloads, and the payload and output fields were checked against the hooks reference.
+
+### Upgrading to Phase 2
+
+- **Upgrade the hub first.** It migrates a Phase 1 database in place, and Phase 1 adapters keep working against it until the project gets a lander: then their record-mode `land` is refused (`landing_queue_active`), so nobody marks a task done around the queue. A Phase 2 adapter against a Phase 1 hub falls back to record mode and tells the agent nothing was queued.
+- **Upgrade the adapters and the lander together.** Symbol-level claims (Phase 3) compare only between the same `MAPPER_VERSION`; across versions they fall back to whole files.
+- Run `hub init` again in each checkout, for the `pre-push` guard.
+- Then set up the host (see the [Host setup guide](#host-setup-guide)) and add the `land` section. Turn off internal pull requests only once the checklist in step 7 holds.
 
 ### Upgrading from the first Phase 1 build
 
@@ -300,6 +628,5 @@ The hub talks to storage only through the synchronous `Store` interface ([store.
 
 ## Next phases
 
-2. Landing queue: rebase, syntax-tree merge (Mergiraf/Weave), build and test, then land on trunk or send back. This replaces internal PRs.
-3. Function-level claims and impact warnings via tree-sitter.
-4. Planner agent and dashboard.
+3. Function-level claims and impact warnings via tree-sitter (in progress: the hub side and the symbol extractor are in; the agent side, the lander's symbol scopes and impact warnings follow).
+4. Planner agent, dashboard, and per-human authentication.

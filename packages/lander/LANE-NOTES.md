@@ -176,3 +176,19 @@ None. `@anthropic-ai/sdk` 0.131.0 and `zod` were already the lander's dependenci
 - **The command runner** no longer waits for `close` (see "The command" above); two tests with a grandchild in a new session holding the pipes (`setsid` through Node's `detached`).
 - **Minor:** gate 1 is closed (above); a reused resolution names the model that made it; `localCandidateRef` lives once, in `trunk.ts`.
 - **Left as recorded:** `resolveInDoubt` in a later process sends no AI-resolved messages (the resolution is in the attempt's memory only; the trailer lists at most 10 paths and the trunk-side authors would have to be attributed again). The trailer on `C` and the `requireApproval` gate still hold for that landing.
+
+## Integrator, CP2
+
+L4 and L5 (with repair round 1, 439376d) merged with H5 and A5. Neither queued a contract-amendment or dependency request, so nothing was applied; the lockfile is unchanged (`@anthropic-ai/sdk` and `zod` were already lander dependencies).
+
+- **L5 repair round 1 verified at the gate.** The full suite (resolver, AI integration rows, cli) and the e2e scenario 8 (the stub resolver run through `/bin/sh -c`, now from a directory whose name has a space and a quote) pass. The one item L5 left recorded stays open: `resolveInDoubt` in a later process sends no AI-resolved messages (the trailer and `requireApproval` still hold).
+- **Test rig on the real server (the CP1 ruling): done by L4.** `test/hub-http.ts` is gone; `Scenario` and `lease.test.ts` run on `startServer` from `@agenthub/hub`. The integrator added a `landerToken` option to `Scenario` (the hub gets `--lander-token`, the lander's `HubClient` sends it) and one integration row, "with the hub's lander token (H4's real server)": the real lander lands through the token-checked routes, its heartbeats, events and lease included, and a lander without the token (or with a wrong one) gets `LeaseRefused` and changes nothing.
+- **L4 verifier minors, the cheap ones fixed:**
+  - `after-admit` now checks its own row of the §2.2.7 table every time: the first lander runs `--once` there (admission first, then `next`), and the test asserts the landing is `queued`, not picked, at death. The fallback to the `after-next` expectations is gone.
+  - The mutation guards count only a broken invariant as a catch: a seed that ends in "logged an unexpected error" is skipped, and a guard fails unless some seed breaks an invariant. (All five still catch theirs within the first seeds.)
+- **Left as recorded (not cheap, or by design):**
+  - `after-trunk-push` and `before-landed-ack` stay adjacent: §2.2.7 gives them the same state and outcome (trunk pushed, the hub in `pushing`), so the two crash tests are deliberately the same death point. Moving one would also reshuffle every simulation seed's trace.
+  - The stale-lander test proves the hub's fencing with a late copy of the write-ahead, since the woken lander's own heartbeat timer notices the lost lease before it writes; the simulation covers stale writes with frozen clocks.
+  - The simulation takes about 160 s of wall time for 2,000 seeds on 4 cores (the design hoped for seconds; the real `Hub` dominates). `SIM_SEEDS` lowers it for CI; the README says so.
+  - Control runs (the same tuned profile without the mutation) would need the profile split from the mutation in `sim/world.ts`; the sweep itself shows the default profiles stay green.
+- **README** documents `hub-lander` (commands, flags, `lander.json`, secrets, exit codes), the lander as a service, `checkWrapper`, and what the resolver sends, including the note that the built-in command gets no proxy variables (a `resolverCommand` wrapper is the way through an HTTPS proxy).

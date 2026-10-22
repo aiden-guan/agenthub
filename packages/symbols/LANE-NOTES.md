@@ -393,3 +393,9 @@ Performance (design §2.4), for lanes A and L:
   and module import, runtime init and grammar load take about 40 ms together.
   If that matters, §7.2's long-running mapping server would make every call
   warm.
+
+## Integrator, CP2 (with CP3a)
+
+No new commits on `p23/symbols` in this stage: S1–S4 were merged at CP1a, so CP3a's "S1–S3 merged" holds. No requests queued; nothing applied.
+
+**Ruling deferred from CP1a, settled now: unkeyable top-level names stay `@toplevel`; the optional `unkeyable_name` amendment is not applied.** §1.10's "the whole file at top level" is read as the conservative intent, and `@toplevel` meets it where it matters: the region is claimed (the mapping invariant holds, property-tested in S3), and it conflicts with every whole-file and `@toplevel` claim. Treating it as the whole file would also block agents editing unrelated declarations of the file, which costs parallelism without protecting anything: claims are coordination, and the merge ladder and the checks are the gate (§4.2). If CP3's e2e or dogfood shows otherwise, the amendment is additive (`FileLevelReason` gains `'unkeyable_name'`) and S3 returns it in the same change.

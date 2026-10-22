@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { IMPORTS, TOPLEVEL, claimCovers, comparable, entriesOverlap, entryCovers, overlappingEntries, type ScopedLike } from '@agenthub/contract';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Hub, SqliteStore, startServer, type Claim, type ClaimRequest, type RunningServer, type ScopeEntry } from '../src/index.js';
-import { overlapping, scopesOverlap } from '../src/scope.js';
+import { MAX_SYMBOLS_PER_FILE, overlapping, scopesOverlap } from '../src/scope.js';
 import { A, B, C, LANDER, LANDER_AUTH, P, errorOf, setup, sha, takeLease } from './landing-setup.js';
 
 // H5 (design §1.10, §4.2): symbol-scope claims. A scope entry is {file,
@@ -147,6 +147,29 @@ describe('symbol-scope claims', () => {
     // A whole-file entry subsumes the symbol entries of its file in one request.
     expect(hub.claim(P, C, { scope: [at('x', 'b.ts'), { file: 'b.ts' }, at('y', 'b.ts'), at('z', 'c.ts')], mapper: M }).claim!.scope).toEqual([{ file: 'b.ts' }, at('z', 'c.ts')]);
     expect(hub.listClaims(P)).toHaveLength(2);
+  });
+
+  it('claims and checks the whole file past MAX_SYMBOLS_PER_FILE symbols of it, so one oversized request cannot stall the hub (CP2)', () => {
+    const { hub } = setup();
+    const names = (n: number, prefix = 'f') => Array.from({ length: n }, (_, i) => `${prefix}${i}`);
+    // At the bound, the symbols stand; one more and the request names the whole file.
+    expect(hub.claim(P, A, sym(names(MAX_SYMBOLS_PER_FILE))).claim!.scope).toHaveLength(MAX_SYMBOLS_PER_FILE);
+    const big = hub.claim(P, B, { scope: [...names(MAX_SYMBOLS_PER_FILE + 1, 'g').map((s) => at(s, 'big.ts')), at('h', 'small.ts')], mapper: M });
+    expect(big).toMatchObject({ status: 'granted', claim: { scope: [{ file: 'big.ts' }, at('h', 'small.ts')], mapper: M } });
+    // So it conflicts with any symbol of that file, as a whole-file claim does.
+    expect(hub.claim(P, C, sym(['unrelated'], {}, 'big.ts')).conflicts.map((c) => [c.holder, c.scope])).toEqual([[B, [{ file: 'big.ts' }]]]);
+    expect(hub.check(P, C, { scope: names(MAX_SYMBOLS_PER_FILE + 1).map((s) => at(s)), mapper: M }).conflicts.map((c) => [c.holder, c.scope])).toEqual([
+      [A, names(MAX_SYMBOLS_PER_FILE).map((s) => at(s))],
+    ]);
+
+    // An oversized request (thousands of symbols of one file, as the verifier sent) costs about what a whole-file one does.
+    const huge = (prefix: string) => ({ scope: names(8000, prefix).map((s) => at(s, 'huge.ts')), mapper: M, mode: 'shared' as const });
+    const t0 = performance.now();
+    expect(hub.claim(P, A, huge('a')).claim!.scope).toEqual([{ file: 'huge.ts' }]);
+    expect(hub.claim(P, B, huge('b')).status).toBe('granted');
+    expect(hub.claim(P, C, huge('c')).status).toBe('granted');
+    expect(hub.check(P, D, huge('d')).conflicts).toEqual([]);
+    expect(performance.now() - t0).toBeLessThan(1500);
   });
 
   it('queues and promotes waiters entry by entry', () => {

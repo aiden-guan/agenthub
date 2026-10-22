@@ -109,6 +109,12 @@ export interface ScenarioOptions {
    * with this stub config (design §5 "The stub resolver"); none by default.
    */
   resolver?: { stub: Record<string, unknown>; maxPerHour?: number };
+  /**
+   * Start the hub with this `--lander-token`; the lander's HubClient sends it
+   * (makeLander's `landerToken` overrides, null for none). Without it the hub
+   * is on loopback with no token, so lander/ ids need none.
+   */
+  landerToken?: string;
 }
 
 const SEED_FILES: Record<string, string> = {
@@ -174,8 +180,8 @@ export class Scenario {
       writeFileSync(wrapper, `#!/bin/sh\nexec "${process.execPath}" "${path.join(FIXTURES, 'fake-mergiraf.mjs')}" "$@"\n`);
       chmodSync(wrapper, 0o755);
     }
-    // Loopback: the lander routes are open without a lander token; approvals in the tests go to the hub in-process.
-    this.front = await startServer({ hub: this.hub, port: 0, host: '127.0.0.1', sweepIntervalMs: 100 });
+    // Loopback: without `landerToken` the lander routes are open without a lander token; approvals in the tests go to the hub in-process.
+    this.front = await startServer({ hub: this.hub, port: 0, host: '127.0.0.1', sweepIntervalMs: 100, ...(this.o.landerToken !== undefined ? { landerToken: this.o.landerToken } : {}) });
     await initWorkdir({ dir: this.workdir, remote: this.remote });
     this.lander = await this.makeLander();
   }
@@ -193,11 +199,12 @@ export class Scenario {
     return `${this.binDir}${path.delimiter}${process.env.PATH ?? ''}`;
   }
 
-  async makeLander(o: { faults?: Faults; agent?: string } = {}): Promise<Lander> {
+  async makeLander(o: { faults?: Faults; agent?: string; landerToken?: string | null } = {}): Promise<Lander> {
     const mirror = path.join(this.workdir, 'mirror.git');
     const agent = o.agent ?? landerId('lander/test');
     const env = { ...process.env, PATH: this.PATH };
-    const client: HubPort = new HubClient({ url: this.front.url, project: P, agent });
+    const landerToken = o.landerToken !== undefined ? o.landerToken : (this.o.landerToken ?? null);
+    const client: HubPort = new HubClient({ url: this.front.url, project: P, agent, landerToken });
     const plainGit: GitPort = openGitPort({ mirror, remote: 'origin', env: { PATH: this.PATH } });
     const hub = this.o.wrapHub ? this.o.wrapHub(client) : client;
     const git = this.o.wrapGit ? this.o.wrapGit(plainGit) : plainGit;

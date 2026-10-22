@@ -48,3 +48,16 @@ A Phase 2 run takes about 25 s.
 
 - **Feed fetches in worktrees race.** Both agents' feeds run their background `git fetch` of trunk into the same `refs/remotes/origin/main` (worktrees share refs), so one of them logs `cannot lock ref 'refs/remotes/origin/main': is at <new> but expected <old>`. The other fetch updated the ref, so nothing is lost. The adapter's feed could take a lock failure whose ref is already at the fetched tip as success (lane A, a later step).
 - **The protected-path texts** say "it lands once an approver approves" for a plain string rule (`"migrations/**"`, any approver), although this hub's approvers file names only maya. Same as the CP1 dogfood note; the hub doesn't tell agents who its approvers are.
+
+## Integrator, CP2
+
+No contract-amendment or dependency requests; nothing applied. The gate ran plain `npm run test:e2e`, which at CP2 auto-detects L5's resolver and so runs scenario 8 as well (10 passed; 1 and 2 skipped as Phase 3, with "1-2 without symbol claims" in their place). `AGENTHUB_E2E_PHASE=2` (3–7, 9, 10 and the crash run) passes too.
+
+The A5 verifier's minors, fixed by the integrator (each shown to bite):
+
+- **The refs before GC are exact.** `expectNoRefsAfterGc` asserts exactly the given leftovers exist before the GC pass (each matched once, nothing else): at gc-1 the send-back's land ref and candidate, at gc-2 none. Removing the atomic land-ref deletion from `gitops`' `pushTrunk` (the verifier's mutation) now fails scenario 10 with the landed landings' land refs listed.
+- **Only lander pushes moved `main`.** The remote's update hook logs every update of `main` that reaches it (`trunk-updates.log`). Scenario 3 asserts the log holds exactly the refused bypass push; `expectTrunkHistory` (scenario 10 and the crash run) asserts it is exactly that bypass followed by the first-parent landed commits, in order, each committed by the lander.
+- **The resolver command is safe with spaces.** The stub resolver and its config now live in a directory named `resolver tools 'stub'`, and `--resolver-command` quotes each word for `/bin/sh` (`shellQuote`), which is how L5 runs an operator's command (`/bin/sh -c`). Scenario 8 passes with it.
+- The `--stats` expectation accepts seconds (`median 1 s`), after the CP2 `minutes()` change.
+
+`scripts/demo.sh` (Part 2) reuses `fixtures/stub-resolver.mjs` and `fixtures/repo/check.mjs`; keep their command-line contract (config as the first argument; `node check.mjs` failing on the marker) or update the demo with them.

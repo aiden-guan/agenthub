@@ -83,6 +83,34 @@ describe('hub-lander against a real hub and a real remote (design §5.3)', () =>
   );
 
   it(
+    "with the hub's lander token (H4's real server): the lander lands with it; a lander without it is refused the lease and changes nothing (CP2)",
+    async () => {
+      const TOKEN = 'cp2-lander-token-7f3e9a';
+      const sc = await scenario({ landerToken: TOKEN });
+      const a = sc.clone('maya/claude-1');
+      const seedTip = sc.trunk();
+      a.commit('add c', { 'src/c.ts': 'export const c = 1;\n' });
+      const L = sc.land(a, { summary: 'add c' });
+
+      // Without the token (or with a wrong one) the reserved lease key is refused: LeaseRefused, as `run` exits 2 on.
+      for (const landerToken of [null, 'wrong']) {
+        const intruder = await sc.makeLander({ landerToken });
+        await expect(intruder.run({ once: true })).rejects.toMatchObject({ name: 'LeaseRefused' });
+      }
+      expect(sc.hub.landerStatus(P).lease).toBeNull();
+      expect(sc.landing(L.id).status).toBe('submitted');
+      expect(sc.trunk()).toBe(seedTip);
+
+      // With it, the real lander takes the lease, heartbeats, admits and lands over the token-checked routes.
+      await sc.once();
+      expect(sc.landing(L.id)).toMatchObject({ status: 'landed' });
+      expect(sc.firstParents(seedTip)).toEqual([sc.landing(L.id).trunk_sha]);
+      expect(sc.agenthubRefs()).toEqual([]);
+    },
+    T,
+  );
+
+  it(
     'FIFO with two clones: both land in queue order, the second merged onto the first',
     async () => {
       const sc = await scenario();

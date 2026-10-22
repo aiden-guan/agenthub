@@ -137,6 +137,11 @@ function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = cleanEnv()): 
   return execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
+/** One word for /bin/sh, whatever it holds (spaces, quotes, $). */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -212,6 +217,8 @@ let resolverConfig = '';
 let resolverCommand = '';
 let mayaConfigHome = '';
 let seedSha = '';
+/** The commit maya's agent tried to push to main past the guard (scenario 3), which the host rule refused. */
+let bypassSha = '';
 const procs: Proc[] = [];
 let hubProc: Proc;
 let lander: Proc;
@@ -280,6 +287,11 @@ const trunk = (): string => git(remote, ['rev-parse', 'refs/heads/main']).trim()
 const agenthubRefs = (): string[] => git(remote, ['for-each-ref', '--format=%(refname)', 'refs/agenthub/']).split('\n').filter(Boolean);
 /** Trunk's first-parent commits after the seed, oldest first. */
 const firstParents = (): string[] => git(remote, ['rev-list', '--first-parent', '--reverse', `${seedSha}..refs/heads/main`]).split('\n').filter(Boolean);
+/** Every update of main that reached the remote's update hook (the host rule), refused or not, oldest first. */
+const trunkUpdates = (): string[] => {
+  const log = path.join(remote, 'trunk-updates.log');
+  return existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean) : [];
+};
 const showOnTrunk = (file: string): string => git(remote, ['show', `refs/heads/main:${file}`]);
 
 /** A commit's trailers on the remote, by key. */
@@ -633,10 +645,14 @@ beforeAll(async () => {
   mkdirSync(binDir);
   writeFileSync(path.join(binDir, 'mergiraf'), `#!/bin/sh\nexec "${process.execPath}" "${path.join(FIXTURES, 'fake-mergiraf.mjs')}" "$@"\n`);
   chmodSync(path.join(binDir, 'mergiraf'), 0o755);
-  copyFileSync(path.join(FIXTURES, 'stub-resolver.mjs'), path.join(T, 'stub-resolver.mjs'));
-  resolverConfig = path.join(T, 'union.json');
+  // The resolver's files sit in a directory whose name has a space and a quote: the lander runs the
+  // command through /bin/sh -c (design §2.6, L5), so each word is quoted for sh.
+  const resolverDir = path.join(T, "resolver tools 'stub'");
+  mkdirSync(resolverDir);
+  copyFileSync(path.join(FIXTURES, 'stub-resolver.mjs'), path.join(resolverDir, 'stub-resolver.mjs'));
+  resolverConfig = path.join(resolverDir, 'union.json');
   copyFileSync(path.join(FIXTURES, 'union.json'), resolverConfig);
-  resolverCommand = `${process.execPath} ${path.join(T, 'stub-resolver.mjs')} ${resolverConfig}`;
+  resolverCommand = [process.execPath, path.join(resolverDir, 'stub-resolver.mjs'), resolverConfig].map(shellQuote).join(' ');
 
   // The approver's credentials, as maya keeps them: a 0600 file in her config directory.
   mayaConfigHome = path.join(T, 'maya-config');
@@ -809,6 +825,9 @@ describe('landing queue end to end: two agents and a lander', () => {
     expect(bypassed.code).not.toBe(0);
     expect(bypassed.stderr).toContain('only the lander may update main');
     expect(trunk()).toBe(seedSha);
+    // The host rule saw exactly that one attempt (the guard stopped the first push before it left).
+    bypassSha = git(A.wt, ['rev-parse', 'HEAD']).trim();
+    expect(trunkUpdates()).toEqual([bypassSha]);
 
     const queued = await A.land({ task_id: T1, summary: 'login lower-cases user names and takes an opts argument with an optional session prefix.' });
     L1 = queued.id;
@@ -1066,7 +1085,7 @@ describe('landing queue end to end: two agents and a lander', () => {
 
     const stats = await run(process.execPath, [HUB_CLI, 'landings', '--stats'], { cwd: A.wt, env: A.env() });
     expect(stats.code, stats.stderr).toBe(0);
-    expect(stats.stdout).toMatch(/Land → main per chain \(first land of a task to its landing\): median \d+ min, p90 \d+ min\./);
+    expect(stats.stdout).toMatch(/Land → main per chain \(first land of a task to its landing\): median \d+ (?:s|min), p90 \d+ (?:s|min)\./);
     expect(stats.stdout).toContain(`Landings in the last 7 days: ${landedInOrder.length} landed.`);
 
     // The lander stops gracefully (its lease goes back); a GC pass a week and a day later deletes every leftover ref:
@@ -1109,11 +1128,18 @@ describe('landing queue end to end: two agents and a lander', () => {
   });
 });
 
-/** Trunk's first-parent history after the seed is exactly the landings' squash commits, in order, each with its trailers. */
+/**
+ * Trunk's first-parent history after the seed is exactly the landings' squash
+ * commits, in order, each with its trailers; and the remote's update hook saw
+ * nothing else try to move main: the one refused bypass, then exactly those
+ * commits, each pushed by the lander.
+ */
 async function expectTrunkHistory(): Promise<void> {
   const commits = firstParents();
   const landings = await Promise.all(landedInOrder.map((id) => landing(id)));
   expect(commits).toEqual(landings.map((l) => l.trunk_sha));
+  expect(bypassSha).toMatch(/^[0-9a-f]{40}$/);
+  expect(trunkUpdates()).toEqual([bypassSha, ...commits]);
   const checked = sha256(CHECK).slice(0, 12);
   for (const [i, sha] of commits.entries()) {
     const l = landings[i]!;
@@ -1147,14 +1173,17 @@ async function expectAllDone(): Promise<void> {
 
 /**
  * With no lander running: one `run --once` whose clock is past every grace
- * period; then the remote has no land or candidate refs. `leftovers`: refs
- * that must be there before it (within their grace period), so the pass is
- * seen deleting something.
+ * period; then the remote has no land or candidate refs. `leftovers`: exactly
+ * the refs there before it (each matched once, nothing else), still within
+ * their grace periods. A landed landing's land ref went with its trunk push
+ * (§1.1) and its candidate with the lander's cleanup, so neither may be left
+ * for GC to find; and the pass is seen deleting what is.
  */
 async function expectNoRefsAfterGc(name: string, leftovers: RegExp[] = []): Promise<void> {
   expect(await leaseHolder()).toBeNull();
   const before = agenthubRefs();
-  for (const re of leftovers) expect(before.some((r) => re.test(r)), `${re} among ${JSON.stringify(before)}`).toBe(true);
+  expect(before, JSON.stringify(before)).toHaveLength(leftovers.length);
+  for (const re of leftovers) expect(before.filter((r) => re.test(r)), `${re} among ${JSON.stringify(before)}`).toHaveLength(1);
   const gc = startLander(name, { once: true, clockShiftMs: PAST_EVERY_GRACE_MS });
   expect(await gc.exited, gc.out).toEqual({ code: 0, signal: null });
   expect(agenthubRefs()).toEqual([]);

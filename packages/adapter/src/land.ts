@@ -251,6 +251,8 @@ async function queueMode(deps: LandDeps, opts: LandOptions, first: TeamConfig, f
     running,
     keepPlaceRetries: land.keepPlaceRetries,
     warnings,
+    structural: land.structural === 'auto',
+    resolver: land.resolver.enabled,
   });
   if (opts.wait_s && opts.wait_s > 0) {
     const waited = await waitForLanding(deps, res.landing.id, opts.wait_s * 1000);

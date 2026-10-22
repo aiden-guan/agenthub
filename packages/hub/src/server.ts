@@ -72,12 +72,14 @@ interface Credentials {
   /** A lander route (`required`), or a claim that names the lease key: whether the caller is a lander. */
   lander(ctx: RequestContext, required: boolean): boolean;
   /**
-   * Any other request a lander makes for its lease (heartbeat, release,
-   * events): on a hub with a lander token, an agent id under `lander/` must
-   * send it too (403 forbidden), so nobody can renew, release or follow a
-   * lease as a lander without it. Without a token, nothing is checked.
+   * Any other request from a lander/ agent id that can touch or follow its
+   * lease (heartbeat, a claim, which renews every lease of its agent, release,
+   * land, events and the WebSocket feed): on a hub with a lander token, an
+   * agent id under `lander/` must send it too (403 forbidden), so nobody can
+   * renew, release, move or follow a lease as a lander without it. Without a
+   * token, nothing is checked.
    */
-  landerAgent(ctx: RequestContext): void;
+  landerAgent(ctx: Pick<RequestContext, 'req' | 'agent'>): void;
   /** An approver route: the human the approver token belongs to. */
   approver(ctx: RequestContext): string;
 }
@@ -306,6 +308,8 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       hub.latestSeq(project); // validates the project id
       const agentParam = url.searchParams.get('agent') ?? (req.headers['x-hub-agent'] as string | undefined) ?? null;
       if (agentParam !== null) assertAgent(agentParam);
+      // A lander/ id heartbeats (on connect and in frames) and follows events here, so it needs the lander token too.
+      credentials.landerAgent({ req, agent: agentParam });
       const since = Number(url.searchParams.get('since') ?? NaN);
       wss.handleUpgrade(req, socket, head, (ws) => onFeed(ws, project, agentParam, Number.isFinite(since) ? since : null));
     } catch (err) {
@@ -501,7 +505,10 @@ function buildRoutes(hub: Hub, maxWaitMs: number, credentials: Credentials): Rou
       }),
     })),
     // The lander lease is a claim on a reserved key: that needs lander credentials.
+    // Any claim renews every lease its agent holds, so a lander/ id needs the
+    // token on a hub that has one, whatever the claim names.
     r('POST', '/claims', (c) => {
+      credentials.landerAgent(c);
       const isLander = credentials.lander(c, namesReservedPath(c.body));
       return hub.claim(c.project, me(c), c.body, { lander: isLander, approver: null });
     }),
@@ -520,7 +527,10 @@ function buildRoutes(hub: Hub, maxWaitMs: number, credentials: Credentials): Rou
     r('GET', '/decisions', (c) => ({ decisions: hub.listDecisions(c.project, c.query.has('limit') ? Number(c.query.get('limit')) : 20) })),
     r('POST', '/decisions', (c) => ({ decision: hub.decide(c.project, me(c), c.body as any) })),
 
-    r('POST', '/land', (c) => hub.land(c.project, me(c), c.body)),
+    r('POST', '/land', (c) => {
+      credentials.landerAgent(c);
+      return hub.land(c.project, me(c), c.body);
+    }),
 
     // Landings (design §1.7). The literal /landings/stats comes before /landings/:id.
     r('GET', '/landings', (c) => ({

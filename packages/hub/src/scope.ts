@@ -10,6 +10,17 @@ import type { Claim, ScopeEntry } from './protocol.js';
 // overlappingEntries, claimCovers); nothing here decides them differently.
 
 const MAX_MAPPER = 200;
+/**
+ * More distinct symbols than this for one file in one request (a claim, a
+ * check, a landing's scope) and the request names that whole file instead,
+ * as design §1.10 falls back to the whole file past `maxSymbolsPerEdit` (at
+ * most 100) or 40 keys of a landing diff (`too_many_symbols`). A conforming
+ * adapter or lander never sends more; the bound keeps the entry-by-entry
+ * comparisons, which are quadratic per file, from stalling the hub on one
+ * oversized request. The whole file is the safe side: it overlaps every entry
+ * the symbols could.
+ */
+export const MAX_SYMBOLS_PER_FILE = 100;
 /** Up to this many pairs of entries, comparing two scopes entry by entry is cheaper than indexing one by file. */
 const SMALL_PRODUCT = 64;
 
@@ -60,6 +71,7 @@ export function requestScope(req: { files?: unknown; scope?: unknown; mapper?: u
     return { file: path, symbol: key };
   });
   const whole = new Set(entries.filter((e) => e.symbol === undefined).map((e) => e.file));
+  for (const file of crowdedFiles(entries)) whole.add(file);
   const seen = new Set<string>();
   const scope: ScopeEntry[] = [];
   for (const e of entries) {
@@ -70,6 +82,32 @@ export function requestScope(req: { files?: unknown; scope?: unknown; mapper?: u
     scope.push(entry);
   }
   return { scope, mapper };
+}
+
+/** The files that have more than MAX_SYMBOLS_PER_FILE distinct symbol entries among `entries`. */
+export function crowdedFiles(entries: readonly ScopeEntry[]): Set<string> {
+  const symbols = new Map<string, Set<string>>();
+  const crowded = new Set<string>();
+  for (const e of entries) {
+    if (e.symbol === undefined) continue;
+    const seen = symbols.get(e.file) ?? symbols.set(e.file, new Set()).get(e.file)!;
+    seen.add(e.symbol);
+    if (seen.size > MAX_SYMBOLS_PER_FILE) crowded.add(e.file);
+  }
+  return crowded;
+}
+
+/** `entries` with each crowded file's entries (see crowdedFiles) replaced by its whole file, where its first entry was. */
+export function collapseCrowded(entries: ScopeEntry[]): ScopeEntry[] {
+  const crowded = crowdedFiles(entries);
+  if (crowded.size === 0) return entries;
+  const done = new Set<string>();
+  return entries.flatMap((e) => {
+    if (!crowded.has(e.file)) return [e];
+    if (done.has(e.file)) return [];
+    done.add(e.file);
+    return [{ file: e.file }];
+  });
 }
 
 /** The mapper a claim with these entries keeps: the request's when it names a symbol; null when every entry is a whole file. */

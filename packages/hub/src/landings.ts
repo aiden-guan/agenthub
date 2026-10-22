@@ -1,4 +1,4 @@
-import { FULL_SHA_RE, LANDER_LEASE_KEY, humanOf } from '@agenthub/contract';
+import { FULL_SHA_RE, LANDER_LEASE_KEY, RESERVED_PREFIX, humanOf } from '@agenthub/contract';
 import { HubError, capText, cleanText, entryName, idOf, normalizeRepoPath, unique, type HubInternals } from './common.js';
 import { holdsToLeases, moveHolds, planHolds, releaseHolds, setHolds, type HoldOwner } from './holds.js';
 import { assertNotReserved, normalizeLandingScope, type AdmitInput, type AdvanceInput, type ResolveInput } from './landing-requests.js';
@@ -153,11 +153,15 @@ export function queueLanding(ix: HubInternals, project: string, agent: string, r
 
   // The claims the Phase 1 land rule selects: those tied to the task, and those
   // tied to none once no other task of the agent's is in progress (all of them
-  // without a task). Holds never count: they belong to their landings.
+  // without a task). Holds never count: they belong to their landings. Nor
+  // does a claim under RESERVED_PREFIX (the lander lease): moved into a
+  // landing hold it would never expire (HOLD_EXPIRES), and a standby lander
+  // would wait behind that hold until the landing ended.
   const otherTasks = store.listTasks(project).filter((t) => t.owner === agent && t.status === 'in_progress' && t.id !== task?.id);
   const selected = req.release_claims
     ? store
         .listClaims(project, { statuses: ['active', 'queued'], holder: agent, landing_id: null })
+        .filter((c) => !c.scope.some((e) => e.file.startsWith(RESERVED_PREFIX)))
         .filter((c) => !task || c.task_id === task.id || (c.task_id === null && otherTasks.length === 0))
     : [];
   // A queued claim held nothing: only the active ones are continued by the hold.

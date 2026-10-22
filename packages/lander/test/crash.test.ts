@@ -201,8 +201,8 @@ afterEach(async () => {
 });
 
 /** What design §2.2.7's table says happens when the lander dies at each fault point. */
-// after-admit: the admission loop dies right after its admit answer; the attempt loop may have picked the
-// landing a moment before (its long-poll heard the admit too), which then makes it the after-next case.
+// after-admit: the admission round dies right after its admit answer, before anything picked the landing
+// (the first lander runs --once there, so its attempt loop hasn't started).
 const EXPECT: Record<FaultPoint, { hub: 'none' | 'lander_lost' | 'in_doubt' | 'landed'; attempt: number; lost: number; checkRuns: number }> = {
   'after-admit': { hub: 'none', attempt: 1, lost: 0, checkRuns: 1 },
   'after-next': { hub: 'lander_lost', attempt: 2, lost: 1, checkRuns: 1 },
@@ -222,7 +222,7 @@ describe.skipIf(process.platform !== 'linux')('crash tests (design §5.4)', () =
       `${point}: the lander is SIGKILLed there, a standby takes over after the 1 s lease, and the landing lands exactly once`,
       async () => {
         const sc = (s = await Scenario.create());
-        let want = EXPECT[point];
+        const want = EXPECT[point];
         const a = sc.clone('maya/claude-1');
         const task = sc.task(a, `Crash at ${point}`);
         const seedTip = sc.trunk();
@@ -231,7 +231,9 @@ describe.skipIf(process.platform !== 'linux')('crash tests (design §5.4)', () =
         if (point === 'during-checks') writeFileSync(path.join(sc.gate, 'block'), '');
         const L = sc.land(a, { task_id: task, summary: `survives ${point}` });
 
-        const first = lander(sc, { faults: `${point}:${L.id}`, prefix: 'lander/first' });
+        // after-admit: `run --once` runs its admission round and only then asks for next, so the lander dies
+        // with the landing admitted and not yet picked: its own row of the table, every time (CP2).
+        const first = lander(sc, { faults: `${point}:${L.id}`, prefix: 'lander/first', once: point === 'after-admit' });
         const died = await first.exited;
         expect(died.signal, first.log()).toBe('SIGKILL');
         expect(first.log()).toContain(`fault ${point} (${L.id}): SIGKILL`);
@@ -244,7 +246,10 @@ describe.skipIf(process.platform !== 'linux')('crash tests (design §5.4)', () =
           expect(existsSync(path.join(sc.workdir, 'runs', `${L.id}.1`)), 'the dead lander left its run directory').toBe(true);
         }
         const atDeath: Landing = sc.landing(L.id);
-        if (point === 'after-admit' && reasons(sc, L.id).includes('picked')) want = EXPECT['after-next'];
+        if (point === 'after-admit') {
+          expect(atDeath.status).toBe('queued');
+          expect(reasons(sc, L.id)).not.toContain('picked');
+        }
         const pushingCandidate = atDeath.phase === 'pushing' ? atDeath.candidate : null;
         if (point === 'after-trunk-push' || point === 'before-landed-ack') expect(sc.trunk()).toBe(pushingCandidate);
 

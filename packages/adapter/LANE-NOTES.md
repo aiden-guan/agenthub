@@ -96,3 +96,14 @@ No dependency requests and no contract-amendment requests.
 The suite and its notes are in `packages/e2e/` (`test/landing.e2e.test.ts`, `fixtures/**`, `LANE-NOTES.md`). No dependency requests and no contract-amendment requests.
 
 - **Test rig on H4's real server (the CP1 ruling).** `test/landing-hub.ts` `startLandingHub` now starts the real `Hub` behind `startServer({landerToken: LANDER_TOKEN, approvers: {name: 'sha256:<hex>'}, sweepIntervalMs: 100})` and nothing else; the test front that served the §1.7 routes until H4 was merged is gone. Without `approvers` the server answers `approvals_disabled`, as the front did. The adapter suite passes unchanged on it (247 passed, 1 skipped). `TestLander.takeLease` reads the epoch with a typed cast (the old line didn't type-check under a test tsconfig).
+
+## Integrator, CP2
+
+A5 merged with H5, L4 and L5. No contract-amendment or dependency requests were queued, so nothing was applied; the lockfile is unchanged.
+
+- **Test rig on the real server (the CP1 ruling): done in A5** (`test/landing-hub.ts` serves `startServer` with a lander token and approvers, no front). The whole adapter suite passes on it at CP2.
+- **CP1 dogfood UX nits fixed by the integrator** (`src/format.ts`, `src/land.ts`; tests in `landing-ux.test.ts`, one expectation in `land.test.ts`):
+  - **Durations under a minute** no longer read "1 min": `minutes()` says seconds below a minute (`20 s`, `59 s`, then `1 min`), in ETAs, "landed … after land", `hub landings` and the stats.
+  - **The resume instruction while paused for `trunk_rewritten`** is said once: `hub lander`'s pause line drops its own "An approver resumes it with …" when the hub's detail already says how (the hub's rewrite detail does), and the trailing period isn't doubled. The digest, status and `hub landings` lines name `hub lander resume --accept-trunk <sha>` for a rewrite (`resumeCommand`), plain `hub lander resume` otherwise.
+  - **The conflict heads-up of `land`** names only what trunk's config has the lander try: `LandContext` gained `structural` (trunk's `land.structural` is `auto`) and `resolver` (`land.resolver.enabled`). "a structural merge (if it has a structural driver)", "and then the AI resolver", either one alone, or, with neither, that it will come back with both sides unless trunk changes, and that `hub_sync {"mode": "merge"}` now saves the round trip.
+- Not changed (recorded at CP1, not in this stage's list): the protected-path texts still say "an approver" rather than naming who may approve.

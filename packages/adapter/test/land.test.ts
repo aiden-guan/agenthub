@@ -258,7 +258,7 @@ describe('land (queue mode)', () => {
     const res = await a.call('land', {});
     expect(res.isError).toBe(false);
     expect(res.text).toContain(
-      "Heads-up: git already sees a conflict with main in src/auth.ts (L-1 by sam/claude-1 changed it since your base). The lander tries a structural merge first; if that can't combine them, it comes back to you with both sides.",
+      "Heads-up: git already sees a conflict with main in src/auth.ts (L-1 by sam/claude-1 changed it since your base). The lander tries a structural merge (if it has a structural driver); if that can't combine them, it comes back to you with both sides.",
     );
     expect(hub.hub.getLanding(PROJECT, 'L-2')).toMatchObject({ files: ['src/auth.ts'] });
   });
@@ -432,7 +432,7 @@ describe('hub_wait {landing_id}', () => {
     const res = await waiting;
     expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
     expect(res.isError).toBe(false);
-    expect(res.text).toMatch(new RegExp(`^L-1 for ${t} landed on main as ${head.slice(0, 7)}, 1 min after land \\(checks 3m02s\\)\\. ${t} is done; ${after} is unblocked\\. Your holds are released\\.\\n`));
+    expect(res.text).toMatch(new RegExp(`^L-1 for ${t} landed on main as ${head.slice(0, 7)}, \\d+ s after land \\(checks 3m02s\\)\\. ${t} is done; ${after} is unblocked\\. Your holds are released\\.\\n`));
     expect(res.text).toContain('Your worktree updates to main at your next prompt (or call hub_sync now).');
 
     const t1 = Date.now();

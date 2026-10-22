@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LANDER_LEASE_KEY } from '@agenthub/contract';
 import { afterEach, describe, expect, it } from 'vitest';
+import WebSocket from 'ws';
 import { Hub, SqliteStore, approverTokenDigest, isLoopbackHost, parseApprovers, startServer, type HubEvent, type RunningServer, type ServerOptions } from '../src/index.js';
 
 // H4 (design §1.7, §1.2 hub-server flags, §6.3.7): the landing, lander and
@@ -78,6 +79,26 @@ async function call(base: string, method: string, route: string, body?: unknown,
 }
 
 const asLander: As = { agent: LANDER, landerToken: LANDER_TOKEN };
+
+/** Opens the demo feed as `agent` (with a lander token when given): 101 once it opened, else the refusal's status and body. */
+function feedAs(base: string, agent: string, landerToken?: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${base.replace('http', 'ws')}/v1/p/demo/feed?agent=${encodeURIComponent(agent)}`, {
+      headers: landerToken !== undefined ? { 'x-hub-lander-token': landerToken } : {},
+    });
+    ws.on('open', () => {
+      ws.close();
+      resolve({ status: 101, body: '' });
+    });
+    ws.on('unexpected-response', (_req, res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => (body += d));
+      res.on('end', () => resolve({ status: res.statusCode!, body }));
+    });
+    ws.on('error', reject);
+  });
+}
 const approver = (name: string): As => ({ approver: name, approverToken: TOKENS[name] });
 
 /** A running hub (lander token and approvers unless `opts` says otherwise) and the calls the tests make. */
@@ -735,6 +756,45 @@ describe('lander credentials (design §1.2, §1.7)', () => {
     const open = await world({});
     await open.ok('POST', '/heartbeat', {}, { agent: LANDER });
     await open.ok('GET', '/events?since=0', undefined, { agent: LANDER });
+  });
+
+  it('with a lander token, a lander/ agent id needs it on any claim, on land and on the WebSocket feed: none of them renews, moves or follows the lease without it (CP2)', async () => {
+    const w = await world({ landerToken: LANDER_TOKEN });
+    const lease = await w.takeLease();
+    const leaseClaim = () => w.s.hub.getClaim('demo', lease.lease_claim_id);
+    const before = leaseClaim().expires_at;
+    const sends: Array<[string, Record<string, unknown>]> = [
+      // A claim on an ordinary file renews every lease its agent holds, the lander lease included.
+      ['/claims', { files: ['x.ts'] }],
+      // A queue-mode land would take the agent's claims into its landing.
+      ['/land', { commit: sha('d'), queue: true, files: ['x.ts'] }],
+    ];
+    for (const bad of [undefined, 'wrong']) {
+      for (const [route, body] of sends) {
+        const err = await w.refused([403, 'forbidden'], 'POST', route, body, { agent: LANDER, landerToken: bad });
+        expect(err.message).toContain('x-hub-lander-token');
+        expect(err.message).not.toContain(LANDER_TOKEN);
+      }
+      const ws = await feedAs(w.s.url, LANDER, bad);
+      expect(ws.status).toBe(403);
+      expect(JSON.parse(ws.body).error.code).toBe('forbidden');
+    }
+    // Nothing renewed or moved the lease.
+    expect(leaseClaim()).toMatchObject({ status: 'active', expires_at: before, landing_id: null });
+    // With the token they work, and an agent's need none.
+    expect((await feedAs(w.s.url, LANDER, LANDER_TOKEN)).status).toBe(101);
+    expect((await feedAs(w.s.url, A)).status).toBe(101);
+    expect((await w.ok('POST', '/claims', { files: ['x.ts'] }, asLander)).status).toBe('granted');
+    expect((await w.ok('POST', '/claims', { files: ['y.ts'] }, { agent: A })).status).toBe('granted');
+    await w.ok('POST', '/land', { commit: sha('e'), queue: true, files: ['y.ts'] }, { agent: A });
+    // Even with the token, a lander/ id's land never takes the lease into its landing (see landings.queue.test.ts).
+    const landed = await w.ok('POST', '/land', { commit: sha('d'), queue: true, files: ['x.ts'] }, asLander);
+    expect(landed.released.map((c: { id: string }) => c.id)).not.toContain(lease.lease_claim_id);
+    expect(leaseClaim()).toMatchObject({ status: 'active', landing_id: null });
+    // A loopback hub without a token checks nothing, as before.
+    const open = await world({});
+    await open.ok('POST', '/claims', { files: ['x.ts'] }, { agent: LANDER });
+    expect((await feedAs(open.s.url, LANDER)).status).toBe(101);
   });
 
   it('on loopback without a token, lander/ agents may use the lander routes and claim the lease; other agents may not', async () => {

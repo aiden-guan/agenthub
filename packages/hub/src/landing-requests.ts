@@ -1,6 +1,7 @@
 import { FULL_SHA_RE, RESERVED_PREFIX, isValidSymbolKey } from '@agenthub/contract';
 import { HubError, cleanText, normalizeRepoPath, unique } from './common.js';
 import { PATH_FORBIDDEN_RE } from './protocol.js';
+import { collapseCrowded } from './scope.js';
 import type {
   ApprovalKind,
   ApprovalRequirement,
@@ -382,7 +383,8 @@ export function normalizeLandingScope(raw: unknown[], mapper: string | null): Sc
     seen.add(key);
     out.push(symbol === undefined ? { file } : { file, symbol });
   }
-  return out;
+  // Past MAX_SYMBOLS_PER_FILE symbols of one file, the landing names that whole file.
+  return collapseCrowded(out);
 }
 
 /** Paths under RESERVED_PREFIX belong to the lander lease: no landing may name them (403 forbidden). */
