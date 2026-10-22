@@ -505,6 +505,11 @@ export class ChecksRunner implements ChecksPort {
       this.state.add({ pgid, landing: req.landingId, attempt: req.attempt, dir: runDir, at: Date.now() });
       child.stdout.on('data', (d: Buffer) => sink.write(d));
       child.stderr.on('data', (d: Buffer) => sink.write(d));
+      try {
+        req.onStarted?.();
+      } catch {
+        // an observer's problem is not the check's
+      }
 
       const term = () => {
         if (termAt !== null) return;

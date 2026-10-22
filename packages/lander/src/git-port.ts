@@ -120,5 +120,53 @@ export function openGitPort(o: GitPortOptions): GitPort & { readonly git: Git } 
       if (!LOCAL_REF_RE.test(ref) || ref.includes('..')) throw new Error(`lander: bad ref ${JSON.stringify(ref)}`);
       await g.run(['update-ref', '-d', ref]);
     },
+
+    async listRemoteRefs(patterns: string[]): Promise<Array<{ ref: string; sha: string }>> {
+      for (const p of patterns) if (!REF_PATTERN_RE.test(p) || p.includes('..')) throw new Error(`lander: bad ref pattern ${JSON.stringify(p)}`);
+      if (patterns.length === 0) return [];
+      const r = await g.run(['ls-remote', '--refs', remote, ...patterns], { timeoutMs: fetchTimeoutMs });
+      return refLines(r.stdout, '\t');
+    },
+
+    async localRefs(prefix: string): Promise<Array<{ ref: string; sha: string }>> {
+      if (!LOCAL_REF_RE.test(prefix) || prefix.includes('..') || !prefix.endsWith('/')) throw new Error(`lander: bad ref prefix ${JSON.stringify(prefix)}`);
+      const r = await g.run(['for-each-ref', '--format=%(objectname) %(refname)', prefix]);
+      return refLines(r.stdout, ' ');
+    },
+
+    async committedAt(commit: string): Promise<number | null> {
+      const r = await g.run(['log', '-1', '--format=%ct', '--end-of-options', rev(commit), '--'], { ok: [0, 128] });
+      const s = Number(r.stdout.trim());
+      return r.code === 0 && r.stdout.trim() !== '' && Number.isFinite(s) ? s * 1000 : null;
+    },
+
+    async numstat(a: string, b: string): Promise<Array<{ path: string; added: number; removed: number }>> {
+      const r = await g.run(['diff-tree', '-r', '-z', '--numstat', '--no-renames', '--no-commit-id', rev(a), rev(b)]);
+      const out: Array<{ path: string; added: number; removed: number }> = [];
+      for (const rec of r.stdout.split('\0')) {
+        const m = /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(rec);
+        if (m) out.push({ path: m[3]!.normalize('NFC'), added: m[1] === '-' ? 0 : Number(m[1]), removed: m[2] === '-' ? 0 : Number(m[2]) });
+      }
+      return out;
+    },
+
+    async pruneWorktrees(): Promise<void> {
+      await g.run(['worktree', 'prune']);
+    },
   };
+}
+
+/** A ref pattern for ls-remote: a full ref name, optionally ending in `*`. */
+const REF_PATTERN_RE = /^refs\/[A-Za-z0-9._/-]+\*?$/;
+
+function refLines(stdout: string, sep: string): Array<{ ref: string; sha: string }> {
+  const out: Array<{ ref: string; sha: string }> = [];
+  for (const line of stdout.split('\n')) {
+    const i = line.indexOf(sep);
+    if (i <= 0) continue;
+    const sha = line.slice(0, i).trim();
+    const ref = line.slice(i + 1).trim();
+    if (/^[0-9a-f]{40,64}$/.test(sha) && ref.startsWith('refs/')) out.push({ ref, sha });
+  }
+  return out.sort((x, y) => (x.ref < y.ref ? -1 : x.ref > y.ref ? 1 : 0));
 }

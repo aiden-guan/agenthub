@@ -211,6 +211,16 @@ export interface GitPort {
   lsRemote(ref: string): Promise<string | null>;
   /** Deletes a ref in the mirror (no-op when it is missing). */
   deleteLocalRef(ref: string): Promise<void>;
+  /** `git ls-remote <remote> <patterns…>`: every remote ref the patterns match (GC, §2.2.7), sorted by name. */
+  listRemoteRefs(patterns: string[]): Promise<Array<{ ref: string; sha: string }>>;
+  /** Refs of the mirror under `prefix` (e.g. `refs/agenthub/`), sorted by name. */
+  localRefs(prefix: string): Promise<Array<{ ref: string; sha: string }>>;
+  /** The committer time of a commit in ms since the Unix epoch, or null when the mirror doesn't have it. */
+  committedAt(commit: string): Promise<number | null>;
+  /** Lines added and removed per path, a..b (`diff --numstat`, no renames; a binary file counts 0 and 0). */
+  numstat(a: string, b: string): Promise<Array<{ path: string; added: number; removed: number }>>;
+  /** `git worktree prune`: forgets check worktrees whose directories are gone. */
+  pruneWorktrees(): Promise<void>;
 }
 
 // ------------------------------------------------------------------ checks
@@ -237,6 +247,8 @@ export interface CheckRunRequest {
   trunkWatch?: { intervalMs: number; moved(): Promise<boolean> };
   /** Aborts the run from outside (not_lander, landing_stale, shutdown). */
   signal?: AbortSignal;
+  /** Called once the check command is running in its process group (the `during-checks` fault point). */
+  onStarted?: () => void;
 }
 
 export type CheckStatus =
