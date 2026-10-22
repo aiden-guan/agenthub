@@ -383,6 +383,12 @@ export function fakeGitPort(o: FakeGitPortOptions): GitPort {
       return out;
     },
 
+    async catBlob(oid: string): Promise<string> {
+      const text = db.blobs.get(oid);
+      if (text === undefined) throw new Error(`fake git: no blob ${oid}`);
+      return text;
+    },
+
     async mergeFile(blobs: { trunk: string | null; base: string | null; yours: string | null }): Promise<MergeFileResult> {
       const text = (id: string | null) => (id === null ? '' : (db.blobs.get(id) ?? ''));
       return { text: `<<<<<<< trunk\n${text(blobs.trunk)}\n||||||| base\n${text(blobs.base)}\n=======\n${text(blobs.yours)}\n>>>>>>> yours\n`, conflicts: 1, markerSize: 7 };

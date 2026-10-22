@@ -21,7 +21,9 @@ import { openGitPort } from '../src/git-port.js';
 import { HubClient } from '../src/hub-client.js';
 import { initWorkdir } from '../src/init.js';
 import { Lander } from '../src/lander.js';
-import type { Faults, GitPort, HubPort } from '../src/ports.js';
+import type { Faults, GitPort, HubPort, ResolverPort } from '../src/ports.js';
+import { AiResolver } from '../src/resolver.js';
+import type { ResolverInput } from '../src/resolver-protocol.js';
 import { BASE_TIME, LANDER, PROJECT, sh, testEnv, tmp, type Tmp } from './helpers.js';
 
 export const P = PROJECT;
@@ -102,6 +104,11 @@ export interface ScenarioOptions {
   wrapHub?: (hub: HubPort) => HubPort;
   /** Wraps the lander's git port. */
   wrapGit?: (git: GitPort) => GitPort;
+  /**
+   * The AI resolver as `--resolver-command "node stub-resolver.mjs <config>"`
+   * with this stub config (design §5 "The stub resolver"); none by default.
+   */
+  resolver?: { stub: Record<string, unknown>; maxPerHour?: number };
 }
 
 const SEED_FILES: Record<string, string> = {
@@ -125,6 +132,8 @@ export class Scenario {
   front!: RunningServer;
   lander!: Lander;
   binDir: string;
+  /** The stub resolver's config file (its call counter is <file>.calls). */
+  readonly stubConfig: string;
   private clones = 0;
   private bg: Promise<unknown> | null = null;
 
@@ -134,6 +143,8 @@ export class Scenario {
     this.gate = path.join(this.t.dir, 'gate');
     this.workdir = path.join(this.t.dir, 'lander');
     this.binDir = path.join(this.t.dir, 'bin');
+    this.stubConfig = path.join(this.t.dir, 'stub-resolver.json');
+    if (o.resolver) writeFileSync(this.stubConfig, JSON.stringify(o.resolver.stub));
     mkdirSync(this.gate);
     mkdirSync(this.binDir);
     this.hub = new Hub({ store: new SqliteStore(':memory:'), leaseTtlMs: 60_000, heartbeatIntervalMs: 15_000 });
@@ -186,18 +197,34 @@ export class Scenario {
     const mirror = path.join(this.workdir, 'mirror.git');
     const agent = o.agent ?? landerId('lander/test');
     const env = { ...process.env, PATH: this.PATH };
-    const hub: HubPort = new HubClient({ url: this.front.url, project: P, agent });
-    const git: GitPort = openGitPort({ mirror, remote: 'origin', env: { PATH: this.PATH } });
+    const client: HubPort = new HubClient({ url: this.front.url, project: P, agent });
+    const plainGit: GitPort = openGitPort({ mirror, remote: 'origin', env: { PATH: this.PATH } });
+    const hub = this.o.wrapHub ? this.o.wrapHub(client) : client;
+    const git = this.o.wrapGit ? this.o.wrapGit(plainGit) : plainGit;
+    const log = (line: string) => {
+      this.logs.push(line);
+      this.o.onLog?.(line);
+    };
+    const resolver: ResolverPort | null = this.o.resolver
+      ? new AiResolver({
+          git,
+          hub,
+          project: P,
+          command: `${process.execPath} ${path.join(FIXTURES, 'stub-resolver.mjs')} ${this.stubConfig}`,
+          apiKey: null,
+          maxPerHour: this.o.resolver.maxPerHour ?? 20,
+          scratchDir: path.join(this.workdir, 'runs'),
+          env: { PATH: this.PATH },
+          log,
+        })
+      : null;
     return new Lander({
-      hub: this.o.wrapHub ? this.o.wrapHub(hub) : hub,
-      git: this.o.wrapGit ? this.o.wrapGit(git) : git,
+      hub,
+      git,
       checks: new ChecksRunner({ workdir: this.workdir, mirror, env, killGraceMs: 2_000 }),
-      resolver: null,
+      resolver,
       faults: o.faults ?? this.o.faults,
-      log: (line) => {
-        this.logs.push(line);
-        this.o.onLog?.(line);
-      },
+      log,
       agent,
       project: P,
       committer: LANDER,
@@ -301,6 +328,22 @@ export class Scenario {
 
   landing(id: string): Landing {
     return this.hub.getLanding(P, id);
+  }
+
+  /** Rewrites the stub resolver's config (its mode) for the next calls. */
+  stub(config: Record<string, unknown>): void {
+    writeFileSync(this.stubConfig, JSON.stringify(config));
+  }
+
+  /** The stub resolver's calls so far: one conflicted path per call. */
+  resolverCalls(): string[] {
+    const f = `${this.stubConfig}.calls`;
+    return existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean) : [];
+  }
+
+  /** The ResolverInput of the stub resolver's last call. */
+  resolverInput(): ResolverInput {
+    return JSON.parse(readFileSync(`${this.stubConfig}.last.json`, 'utf8')) as ResolverInput;
   }
 
   /** The check-run log: one line per run, "<landing> <cwd>". */

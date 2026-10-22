@@ -12,7 +12,8 @@ import { approver, CHECK, P, Scenario, waitFor } from './scenario.js';
 // design §5.3: a real local bare remote (receive.denyNonFastForwards and an
 // update hook admitting only the lander's identity on trunk), a real hub on
 // port 0, and the real lander over HTTP, run --once or in the background,
-// with `node check.mjs` gated by signal files. The AI rows belong to L5.
+// with `node check.mjs` gated by signal files. The AI rows are in
+// lander.ai.integration.test.ts.
 
 const T = 60_000;
 

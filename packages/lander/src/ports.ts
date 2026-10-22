@@ -2,8 +2,8 @@
 // same code runs against real git and a real hub, and in the deterministic
 // simulation (§5.2) against fakes. HubPort is implemented over HTTP by
 // hub-client.ts, GitPort over @agenthub/gitops by git-port.ts, ChecksPort by
-// checks.ts; ResolverPort comes with the AI resolver (L5) and Faults with
-// faults.ts (L3). Only types and tiny defaults live here.
+// checks.ts, ResolverPort by resolver.ts (the AI resolver) and Faults by
+// faults.ts. Only types and tiny defaults live here.
 
 import type {
   ConflictEntry,
@@ -204,8 +204,10 @@ export interface GitPort {
   findLandingCommit(from: string | null, to: string, key: { landing: string; hub: string; source: string }): Promise<string | null>;
   /** First-parent commits in from..to that changed `path`, newest first, at most `limit`. */
   pathHistory(from: string, to: string, path: string, limit: number): Promise<PathChange[]>;
-  /** Three-way merge of blobs (null = absent), as `git merge-file -p --diff3 -L trunk -L base -L yours`. */
-  mergeFile(blobs: { trunk: string | null; base: string | null; yours: string | null }): Promise<MergeFileResult>;
+  /** Three-way merge of blobs (null = absent), as `git merge-file -p --diff3 -L trunk -L base -L yours` (or the labels given). */
+  mergeFile(blobs: { trunk: string | null; base: string | null; yours: string | null }, labels?: [string, string, string]): Promise<MergeFileResult>;
+  /** A blob's content by object id (`git cat-file blob`), decoded as UTF-8. */
+  catBlob(oid: string): Promise<string>;
   pushTrunk(o: { trunk: string; candidate: string; expected: string; deleteRef?: string }): Promise<PushOutcome>;
   pushRef(o: { prefix: string; sha: string | null; ref: string }): Promise<PushOutcome>;
   lsRemote(ref: string): Promise<string | null>;
@@ -277,7 +279,7 @@ export interface ChecksPort {
   killOrphans(): Promise<number[]>;
 }
 
-// ------------------------------------------------------------------ resolver (stage 3 of the merge ladder; completed in L5)
+// ------------------------------------------------------------------ resolver (stage 3 of the merge ladder, design §2.6; resolver.ts)
 
 export interface ResolveRequest {
   landing: Landing;
@@ -288,23 +290,43 @@ export interface ResolveRequest {
   base: string;
   trunk: string;
   head: string;
+  /** Trunk's land.resolver at T0. */
   config: ResolverConfig;
+  /** Trunk's protected rules at T0: protected paths never go to the resolver. */
   protectedRules: ProtectedRule[];
-  /** Approved ai_resolution requirements of this landing: byte-identical stages reuse their result blobs. */
-  approved: ApprovalRequirement[];
+  /** Trunk's land.approval.distinct: the ai_resolution rule's `distinct`. */
+  distinct: boolean;
+  /** The hub's epoch: a trunk commit is attributed to one of its landings only through trailers carrying it. */
+  epoch: string;
+  /**
+   * An earlier attempt's resolution the landing may reuse (design §2.6
+   * "Approval binding"): the landing's last staged candidate and its ref, whose
+   * tree holds that resolution, and the digests of the ai_resolution
+   * approvals granted to the landing. A resolution is reused only when the
+   * digest over the current stages and the candidate's blobs is one of them.
+   */
+  reuse: { candidate: string | null; candidateRef: string | null; approved: string[] };
+  /** Aborts the resolver command (lease lost, shutdown). */
+  signal?: AbortSignal;
 }
 
 export interface ResolveResult {
-  /** `tree` with every accepted resolution spliced in. */
+  /** `tree` with every accepted resolution spliced in (all of them, or none). */
   tree: string;
   resolved: string[];
   unresolved: Array<{ path: string; eligible: boolean; explanation: string | null }>;
   report: ResolverReport;
-  /** With resolver.requireApproval: the ai_resolution requirement over the resolved files. */
+  /** With resolver.requireApproval: the ai_resolution requirement over the resolved files (the pipeline binds it to the candidate). */
   requirement: ApprovalRequirement | null;
+  /** Lander-written notes for the landing report: why a file wasn't sent, which gate refused an output, a reused resolution. */
+  warnings: string[];
+  /** The trunk-side landings (and their authors) that changed the resolved files since the base: they are told when it lands. */
+  trunkSide: Array<{ landingId: string; agent: string }>;
+  /** path → the proposed hunk texts (≤ 8 KiB, untrusted model text): kept in the report as a suggestion when the checks fail on them. */
+  suggestions: Record<string, string>;
 }
 
-/** null in the pipeline means the AI stage is skipped (resolver off, no key, no command). */
+/** null in the pipeline means the AI stage is skipped (no key and no resolver command). */
 export interface ResolverPort {
   resolve(req: ResolveRequest): Promise<ResolveResult>;
 }

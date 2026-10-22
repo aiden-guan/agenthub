@@ -1063,6 +1063,9 @@ class StubResolver implements ResolverPort {
       unresolved,
       report: { model: 'stub', outcome: resolved.length > 0 ? 'resolved' : 'cannot_resolve', files: resolved, novel_lines: 0, input_tokens: 0, output_tokens: 0, explanations: {} },
       requirement: null,
+      warnings: [],
+      trunkSide: [],
+      suggestions: {},
     };
   }
 }

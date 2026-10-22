@@ -13,6 +13,7 @@ import type { LanderConfig } from './config.js';
 import { detectDrivers } from './drivers.js';
 import { openGitPort } from './git-port.js';
 import { isHubError, type HubPort } from './ports.js';
+import { probeResolver } from './resolver.js';
 import { readTrunkConfig, trunkLocalRef } from './trunk.js';
 
 export type CheckLevel = 'ok' | 'FAIL' | 'warn' | 'skip' | 'note';
@@ -26,6 +27,8 @@ export interface DoctorOptions {
   out: (line: string) => void;
   /** PATH for driver detection (default process.env.PATH). */
   PATH?: string;
+  /** The environment the resolver probe runs from (default process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 const PROBE_ENV = {
@@ -109,7 +112,14 @@ export async function doctor(o: DoctorOptions): Promise<number> {
     }
 
     if (config?.ok && config.land.resolver.enabled) {
-      line(o.cfg.anthropicApiKey || o.cfg.resolverCommand ? 'note' : 'warn', 'resolver', `trunk enables the AI resolver; ${o.cfg.resolverCommand ? `resolver command: ${o.cfg.resolverCommand}` : `ANTHROPIC_API_KEY is ${o.cfg.anthropicApiKey ? 'set' : 'not set'}`}. This lander build has no AI stage yet: conflicts it can't merge go back to their authors`);
+      if (o.cfg.resolverCommand === null && o.cfg.anthropicApiKey === null) {
+        line('warn', 'resolver', "trunk enables the AI resolver, but this lander has no ANTHROPIC_API_KEY and no resolverCommand: conflicts git can't merge go back to their authors");
+      } else {
+        // The key is never printed; the built-in command's probe makes no API call.
+        const what = o.cfg.resolverCommand !== null ? `the command ${o.cfg.resolverCommand}` : 'the built-in resolve-anthropic, ANTHROPIC_API_KEY set';
+        const r = await probeResolver({ command: o.cfg.resolverCommand, apiKey: o.cfg.anthropicApiKey, env: o.env }).catch((err: unknown) => ({ ok: false, detail: String(err) }));
+        line(r.ok ? 'ok' : 'FAIL', 'resolver', `${what}: ${r.detail}; at most ${o.cfg.resolverMaxPerHour} calls per hour`);
+      }
     } else line('skip', 'resolver', "the AI resolver is off in trunk's agenthub.json");
   }
 

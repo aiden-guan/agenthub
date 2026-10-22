@@ -111,7 +111,12 @@ export function openGitPort(o: GitPortOptions): GitPort & { readonly git: Git } 
     trunkTrailers: (from, to, limit) => trunkTrailers(g, from, to, limit),
     findLandingCommit: (from, to, key) => findLandingCommit(g, from, to, key),
     pathHistory: (from, to, p, limit) => pathHistory(g, from, to, p, limit),
-    mergeFile: (blobs) => mergeFile(g, blobs),
+    mergeFile: (blobs, labels) => mergeFile(g, blobs, labels),
+
+    async catBlob(oid: string): Promise<string> {
+      if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid)) throw new Error(`lander: bad object id ${JSON.stringify(oid)}`);
+      return (await g.run(['cat-file', 'blob', oid])).stdout;
+    },
     pushTrunk: (p) => pushTrunk(g, { remote, ...p }),
     pushRef: (p) => pushRef(g, { remote, ...p }),
     lsRemote: (ref) => lsRemote(g, remote, ref),
