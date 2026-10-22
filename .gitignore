@@ -5,3 +5,10 @@ dist/
 *.db-wal
 .hub.json
 .DS_Store
+
+# Environments
+.env*
+!.env.example
+
+# Local editor / agent worktrees
+.claude/
