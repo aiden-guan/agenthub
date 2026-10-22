@@ -176,7 +176,7 @@ Do this, in order:
 5. Checkpoint gate (design 6.6): ${CP.gate}
 ${CP.extra ? `6. Also: ${CP.extra}\n` : ''}7. Commit, and tag the commit ${CP.name} (git tag -f ${CP.name}).
 8. Sync every lane: for each lane worktree, git -C <wt> merge --ff-only phase23 (or a plain merge if a lane has commits the checkpoint didn't take, which shouldn't happen), then npm ci --no-audit --no-fund in that worktree, and confirm npm run build passes there.
-Don't push.`
+Don't push.${CP.resume ? `\n\nResuming an interrupted integration: ${CP.resume}` : ''}`
 let cp = await ask(cpPrompt, { label: `integrate:${CP.name}`, phase: 'Checkpoint', schema: CP_RESULT })
 
 phase('Checkpoint verify')
