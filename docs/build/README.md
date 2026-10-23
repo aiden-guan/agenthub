@@ -5,8 +5,20 @@ How Phases 2 and 3 of `docs/design-phase2-3.md` are being built, so the build ca
 ## Status
 
 - Phase 1 is finished on `fix/phase1-review` (PR #1 against `main`): 275 tests, typecheck and demo green.
-- Phase 2/3 is on branch `phase23`. Step 0 (design section 6.4) is done and tagged `cp0`: frozen contract, `@agenthub/contract`, skeletons for gitops, symbols, lander and e2e, pinned dependencies, 306 tests green.
-- Next: stage 1 (checkpoint `cp1a`). Nothing from stage 1 has been committed yet.
+- Phase 2/3 is on branch `phase23`. Stages 1 to 4 are done: Phases 2 and 3 are complete at checkpoint `cp3` (commit 0488876). npm test 1285 passed and 3 skipped, `AGENTHUB_E2E_PHASE=3 npm run test:e2e` 11 of 11, the 20,000-seed simulation green, and the demo runs all three parts. Checkpoint commits start with their name (`cp1a:`, `cp1:`, `cp2:`, `cp3:`); the tags themselves are local only (see below).
+- Stage 5 (the review) was stopped on purpose partway through, with no code changed:
+  - Find and dedup are done: 50 distinct findings (5 blocking, 20 major, 25 minor after the reproducers' corrections), in `review/findings.json`.
+  - 48 of the 50 are reproduced (47 reproduced, 1 plausible); R-46 and R-50 are not. Results are in `review/repro-results.json`, and each finding's top-level scripts are in `review/repros/<id>/`. A few scripts hard-code the old scratch path; they all take `AGENTHUB_ROOT`.
+  - No finding has been through the refutation step yet, and nothing is fixed.
+  - `review/known.json` lists 19 minor issues that step verifiers recorded and left open; they go straight to the fixers.
+- Next: resume stage 5 from `stage5-resume.json` (below), then push `phase23` and open a PR against `fix/phase1-review`.
+
+### Resuming stage 5
+
+1. Create the four lane worktrees from `phase23`'s head (`git worktree add <SCRATCH>/lanes23/<lane> -b p23/<lane> phase23`, or reuse existing `p23/*` branches after `git merge --ff-only phase23`), then `npm ci && npm run build` in each and in the repo.
+2. `git fetch origin fix/phase1-review` (the review's base is `origin/fix/phase1-review`).
+3. Replace `${REPO}` and `${SCRATCH}` in `stage5-resume.json` and run the Workflow tool with `scriptPath: docs/build/stage5.js` and that file's contents as `args`. With `resume` set, `stage5.js` skips Find and Dedup, reuses the saved reproductions, reproduces the rest, then refutes, fixes, integrates (tag `cp3r`) and runs the regression review.
+4. Check the result, run the gate yourself (`npm test`, `npm run typecheck`, `AGENTHUB_E2E_PHASE=3 npm run test:e2e`), push, and open the PR.
 
 ## How a stage runs
 

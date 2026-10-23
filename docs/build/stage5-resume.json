@@ -1,0 +1,600 @@
+{
+ "repo": "${REPO}",
+ "scratch": "${SCRATCH}",
+ "base": "origin/fix/phase1-review",
+ "head": "phase23",
+ "from": "cp3",
+ "tag": "cp3r",
+ "lanes": {
+  "hub": {
+   "wt": "${SCRATCH}/lanes23/hub",
+   "branch": "p23/hub"
+  },
+  "lander": {
+   "wt": "${SCRATCH}/lanes23/lander",
+   "branch": "p23/lander"
+  },
+  "adapter": {
+   "wt": "${SCRATCH}/lanes23/adapter",
+   "branch": "p23/adapter"
+  },
+  "symbols": {
+   "wt": "${SCRATCH}/lanes23/symbols",
+   "branch": "p23/symbols"
+  }
+ },
+ "known": [
+  {
+   "title": "A landing reconciled from a trunk report (T16) records no landed symbol changes and leaves the author's in-progress rows in_progress",
+   "lane": "hub",
+   "files": [
+    "packages/hub/src/lander-control.ts",
+    "packages/hub/src/landings.ts"
+   ],
+   "severity": "minor",
+   "claim": "completeLanding with reconciled:true skips symbol_changes, while advance/resolve landed with symbol_changes [] supersede the author's in-progress rows, so the two landed paths disagree.",
+   "scenario": "A landing found on trunk via a trunk report (T16) completes; GET /symbol-changes still shows the author's in-progress rows for that task as in_progress. Reported by the H6 step verifier and the CP3 checkpoint verifier.",
+   "design_ref": "T16 ('landed effects as far as they still apply'), 2.5"
+  },
+  {
+   "title": "The hub silently drops lander symbol_changes entries it cannot record",
+   "lane": "hub",
+   "files": [
+    "packages/hub/src/symbol-changes.ts",
+    "packages/hub/src/landing-requests.ts"
+   ],
+   "severity": "minor",
+   "claim": "Entries with a bad key or path, an unknown kind, or past 1000 are dropped with nothing logged or reported, so a hub/lander contract mismatch goes unnoticed.",
+   "scenario": "The lander sends a symbol_changes entry with a key symbols emits but the hub rejects; the landed report succeeds and the change is silently lost.",
+   "design_ref": "2.5, 1.7"
+  },
+  {
+   "title": "queueView is recomputed for every landing returned and every event",
+   "lane": "hub",
+   "files": [
+    "packages/hub/src/landings.ts",
+    "packages/hub/src/hub.ts"
+   ],
+   "severity": "minor",
+   "claim": "shownLanding and emitUpdated recompute queueView per landing and per event; listLandings is about 40% of the simulation's CPU, which makes the 2,000-seed simulation take about 160 s and the full test suite about 300 s.",
+   "scenario": "Profile the lander simulation: listLandings dominates. Caching queueView per write() would make the simulation several times faster.",
+   "design_ref": "5.2 (simulation budget 'a few seconds')"
+  },
+  {
+   "title": "Fix-it reports find no hunks in CRLF files",
+   "lane": "lander",
+   "files": [
+    "packages/lander/src/report.ts"
+   ],
+   "severity": "minor",
+   "claim": "parseConflictMarkers does not recognise the '=======\\r' separator, so a conflict in a CRLF file produces no hunks (and no hunk symbols) in the fix-it report, while conflictRegions in regions.ts handles CRLF.",
+   "scenario": "git merge-file -p --diff3 on CRLF files emits CRLF markers; parseConflictMarkers returns no hunks for them.",
+   "design_ref": "2.2.9, 2.2.6"
+  },
+  {
+   "title": "resolveInDoubt reads trunk's symbols config from the current trunk tip instead of the landed commit's parent",
+   "lane": "lander",
+   "files": [
+    "packages/lander/src/recovery.ts"
+   ],
+   "severity": "minor",
+   "claim": "In resolveInDoubt step 2 the symbols section comes from the fetched current trunk, not from T0, so landed symbol changes can be computed under the wrong enabled/exclude settings.",
+   "scenario": "symbols.enabled or exclude changes on trunk between the push and the in-doubt resolution.",
+   "design_ref": "2.2.7, 2.5"
+  },
+  {
+   "title": "Some landed symbol_changes paths in the lander have no test",
+   "lane": "lander",
+   "files": [
+    "packages/lander/src/pipeline.ts",
+    "packages/lander/src/recovery.ts"
+   ],
+   "severity": "minor",
+   "claim": "resolve {landed} after a stale push (pipeline.ts afterStale), the in-doubt 'already on trunk' path, and the rule that a no-op landing sends [] are untested; mutations there are not caught.",
+   "scenario": "Remove symbol_changes from the afterStale resolve call: all tests still pass.",
+   "design_ref": "5.1, 6.5 L6"
+  },
+  {
+   "title": "The simulation's mutation guards have no control runs",
+   "lane": "lander",
+   "files": [
+    "packages/lander/test/simulation.test.ts",
+    "packages/lander/test/sim/world.ts"
+   ],
+   "severity": "minor",
+   "claim": "Each mutation guard runs under its own tuned fault profile, and no control test shows that same profile staying green without the mutation, so a broken profile that always fails would still count as a catch.",
+   "scenario": "Make a guard's fault profile itself violate an invariant: the guard test still 'catches' it.",
+   "design_ref": "5.2"
+  },
+  {
+   "title": "claim with path#name misreads a not-yet-existing file as a declaration",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/symbol-scope.ts"
+   ],
+   "severity": "minor",
+   "claim": "splitTarget splits at the last '#' when the suffix is a valid symbol key and the whole path doesn't exist, so `claim docs/a#b.md` for a file not created yet claims docs/a with symbol b.md.",
+   "scenario": "hub claim 'docs/a#b.md' before creating that file.",
+   "design_ref": "1.10, 2.3.2"
+  },
+  {
+   "title": "A Write to a file missing from this worktree is told to use Edit",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/symbol-scope.ts"
+   ],
+   "severity": "minor",
+   "claim": "editScope returns whole_file_write before checking whether the file exists, so the deny reason tells the agent to use Edit on a file it cannot Edit.",
+   "scenario": "Another agent added src/x.ts and holds declarations in it; this agent's Write of src/x.ts (absent here) is denied with 'use Edit for the parts you change'.",
+   "design_ref": "2.3.6"
+  },
+  {
+   "title": "hooks-symbols.test.ts depends on test order",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/test/hooks-symbols.test.ts"
+   ],
+   "severity": "minor",
+   "claim": "Later tests rely on claims and worktree state left by earlier it blocks, so running one test alone with -t fails or tests the wrong thing.",
+   "scenario": "npx vitest run packages/adapter/test/hooks-symbols.test.ts -t 'denies the same function'",
+   "design_ref": "5.1"
+  },
+  {
+   "title": "who_uses throws for declarations named like Object.prototype properties",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/impact.ts"
+   ],
+   "severity": "minor",
+   "claim": "whoUses reads entry?.ids[name] on a plain object, so names like toString, valueOf, constructor or hasOwnProperty throw, and the tool error is reported as a hub error.",
+   "scenario": "who_uses on a method named toString.",
+   "design_ref": "2.5"
+  },
+  {
+   "title": "The feed's impact state survives a hub that comes back on a new database",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/feed.ts"
+   ],
+   "severity": "minor",
+   "claim": "resetHistory() clears the buffer but not listing, impactJobs or impactTold, so new symbol.changed events are evaluated against the old database's changes until the new seq passes the old listing's seq.",
+   "scenario": "Hub restarts on a fresh database; the agent's impact notices are wrong or missing for a while.",
+   "design_ref": "2.3.4, 2.5"
+  },
+  {
+   "title": "who_uses reports everything as free when the hub's claims cannot be read",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/impact.ts"
+   ],
+   "severity": "minor",
+   "claim": "When the claims request fails or times out, whoUses treats the list as empty and says 'nobody else holds it: update it yourself', listing every place in callers_free. Unknown is not free.",
+   "scenario": "Hub down or slow beyond the 2 s budget; who_uses tells the agent to edit callers other agents may hold.",
+   "design_ref": "2.5 (callers_free)"
+  },
+  {
+   "title": "The reference cache can be poisoned by a concurrent write",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/impact.ts"
+   ],
+   "severity": "minor",
+   "claim": "Blob ids are taken for all candidates first and each file is read and parsed later, so a file changed in between gets its new content's identifier index stored under the old blob id, including in the committed index blob shared by other worktrees.",
+   "scenario": "A file changes between blobIds() and refEntry(); later lookups for the old blob return the wrong identifiers.",
+   "design_ref": "2.5 (an entry can never be wrong)"
+  },
+  {
+   "title": "The 'unacked first' impact order is not really tested",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/test/impact.test.ts"
+   ],
+   "severity": "minor",
+   "claim": "In the test the acknowledged change is also the older one, so newest-first ordering alone passes; removing the isAcked comparator from sortImpacts still passes.",
+   "scenario": "Mutation: drop the isAcked term in sortImpacts; tests stay green.",
+   "design_ref": "2.3.4, 2.5"
+  },
+  {
+   "title": "post-edit claims others are told of a signature change after an edit restores the signature",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/hooks.ts",
+    "packages/adapter/src/impact.ts"
+   ],
+   "severity": "minor",
+   "claim": "When an edit brings a signature back to its original shape the hub withdraws the row, but post-edit still says 'you changed the signature ... X holds it and is told of your change ... Record the new shape with decide'.",
+   "scenario": "Change login's signature, then change it back; the second post-edit text is wrong.",
+   "design_ref": "2.5, 2.3.6"
+  },
+  {
+   "title": "Pruning held markers after 7 days can hold the agent twice for one landing",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/hooks.ts"
+   ],
+   "severity": "minor",
+   "claim": "markHeld prunes G/agenthub/held/* by mtime after 7 days, but a landing can stay queued that long when no lander runs (R13), so it can hold the agent a second time, breaking 'at most once per landing'.",
+   "scenario": "holdTurn on, landing L-7 queued 8 days with no lander; the next Stop holds again.",
+   "design_ref": "2.3.6"
+  },
+  {
+   "title": "A symbol claim_conflict at land tells the agent to wait on the whole file",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/land.ts",
+    "packages/adapter/src/format.ts"
+   ],
+   "severity": "minor",
+   "claim": "When land is refused with claim_conflict over a symbol, the text names a hub_wait on the whole file rather than on the held symbol (path#Symbol).",
+   "scenario": "Another agent holds src/auth.ts#login; land is refused; the advice is hub_wait files ['src/auth.ts'].",
+   "design_ref": "2.3.3, 1.10"
+  },
+  {
+   "title": "Two agents' feeds race to fetch trunk into the shared refs/remotes/origin/main",
+   "lane": "adapter",
+   "files": [
+    "packages/adapter/src/feed.ts",
+    "packages/adapter/src/sync.ts"
+   ],
+   "severity": "minor",
+   "claim": "Worktrees of one repository share refs/remotes/origin/main; both feeds fetch into it at once and one logs 'cannot lock ref'.",
+   "scenario": "Two agents in worktrees of one clone; trunk moves; one feed logs a lock error.",
+   "design_ref": "2.3.5"
+  }
+ ],
+ "resume": {
+  "dir": "docs/build/review",
+  "findings": [
+   {
+    "id": "R-1",
+    "lane": "lander",
+    "severity": "blocking",
+    "title": "After a check, the lander runs git inside the check's worktree, so a check can make the lander process run its commands outside checkWrapper"
+   },
+   {
+    "id": "R-2",
+    "lane": "lander",
+    "severity": "blocking",
+    "title": "An agent's change lands unapproved in a protected file that trunk renamed it into"
+   },
+   {
+    "id": "R-3",
+    "lane": "lander",
+    "severity": "major",
+    "title": "A landing whose landed signature changes exceed the hub's 1 MB body limit stays stuck in pushing forever after its trunk push"
+   },
+   {
+    "id": "R-4",
+    "lane": "lander",
+    "severity": "blocking",
+    "title": "A lander crashes (uncaught) on any git output longer than V8's maximum string; a >512 MiB file in a landing crash-loops admission"
+   },
+   {
+    "id": "R-5",
+    "lane": "symbols",
+    "severity": "blocking",
+    "title": "Quadratic outline and signature work: a modest file stalls mapping for minutes (lander loses its lease, edits blocked, commits hang)"
+   },
+   {
+    "id": "R-6",
+    "lane": "adapter",
+    "severity": "blocking",
+    "title": "Sync's HEAD compare-and-swap runs before the slow status and in-the-way checks, so a commit made in that window is dropped from the branch"
+   },
+   {
+    "id": "R-7",
+    "lane": "lander",
+    "severity": "major",
+    "title": "One landing whose admit request the hub refuses (413, or 400/403 on a path) stops admission for every landing queued behind it"
+   },
+   {
+    "id": "R-8",
+    "lane": "adapter",
+    "severity": "major",
+    "title": "The approver token goes to whatever hub URL the checkout's agenthub.json names, and `hub cancel` sends it without a TTY"
+   },
+   {
+    "id": "R-9",
+    "lane": "adapter",
+    "severity": "major",
+    "title": "`hub approve` passes hub-supplied shas and refs into git argv unchecked: a hostile hub can write files or run commands on the approver's machine"
+   },
+   {
+    "id": "R-10",
+    "lane": "frozen",
+    "severity": "major",
+    "title": "A .gitattributes below the root is not protected, so a landing can change merge attributes without human approval"
+   },
+   {
+    "id": "R-11",
+    "lane": "lander",
+    "severity": "major",
+    "title": "externalPushes: pause is bypassed by any hand-pushed commit that carries agenthub trailers, and nothing tests the pause"
+   },
+   {
+    "id": "R-12",
+    "lane": "lander",
+    "severity": "major",
+    "title": "Protected paths whose names git stores in NFD get a content-free approval digest, so an approval carries over to any later content"
+   },
+   {
+    "id": "R-13",
+    "lane": "adapter",
+    "severity": "major",
+    "title": "hub approve / hub reject can never act on a stacked landing whose protected path the landing it waits for also changed"
+   },
+   {
+    "id": "R-14",
+    "lane": "lander",
+    "severity": "major",
+    "title": "A conflict in many files produces a fix-it report over the hub's 512 KiB limit; the landing comes back as lander_error, and three in a row pause the project"
+   },
+   {
+    "id": "R-15",
+    "lane": "hub",
+    "severity": "minor",
+    "title": "A lander_error send-back counts against keepPlaceRetries, so infrastructure failures cost the agent its queue place"
+   },
+   {
+    "id": "R-16",
+    "lane": "lander",
+    "severity": "major",
+    "title": "An approved resume runs the merge ladder and the AI resolver again, and can fail a parked candidate that already passed its checks"
+   },
+   {
+    "id": "R-17",
+    "lane": "lander",
+    "severity": "major",
+    "title": "Cancelling or superseding a landing during its checks (or the resolver) does not stop it; the queue stays blocked until the step ends"
+   },
+   {
+    "id": "R-18",
+    "lane": "lander",
+    "severity": "major",
+    "title": "parseMergeTree throws on submodule conflicts (git appends free-form advice), so such landings fail as lander_error forever"
+   },
+   {
+    "id": "R-19",
+    "lane": "adapter",
+    "severity": "major",
+    "title": "Sync moves submodule gitlinks without updating initialized submodules; land then tells the agent to commit, which reverts trunk's submodule bump"
+   },
+   {
+    "id": "R-20",
+    "lane": "adapter",
+    "severity": "major",
+    "title": "A reset --keep that fails part-way leaves the worktree half-synced; sync reports 'nothing changed', drops the backup ref and the hooks say nothing"
+   },
+   {
+    "id": "R-21",
+    "lane": "adapter",
+    "severity": "major",
+    "title": "A sync whose CAS refuses because HEAD moved reports needs_human and blocks every edit until a human runs `hub sync --recover`"
+   },
+   {
+    "id": "R-22",
+    "lane": "hub",
+    "severity": "major",
+    "title": "Hold planning is quadratic in a landing's size, so a large land, supersede or admission stalls every hub write for seconds"
+   },
+   {
+    "id": "R-23",
+    "lane": "hub",
+    "severity": "major",
+    "title": "Every landing write, status and stats call scans and sorts the project's whole landing history with every report"
+   },
+   {
+    "id": "R-24",
+    "lane": "hub",
+    "severity": "major",
+    "title": "An author can't edit a file its own live landing holds once another agent queues for that file"
+   },
+   {
+    "id": "R-25",
+    "lane": "symbols",
+    "severity": "major",
+    "title": "DocCache evicts a document still in use; it stays cached with a deleted tree, so later lookups on that text fail or read freed WASM memory"
+   },
+   {
+    "id": "R-26",
+    "lane": "adapter",
+    "severity": "major",
+    "title": "Constructor signature changes never reach callers; who_uses reports no callers for a constructor"
+   },
+   {
+    "id": "R-27",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "A lost compare-and-swap race (for example two landers pushing the same C) is classified `rejected`, which pauses the whole project"
+   },
+   {
+    "id": "R-28",
+    "lane": "hub",
+    "severity": "minor",
+    "title": "The hub's pushing gate merges requirements that share a kind and digest, so a second protected rule over the same paths is not enforced at the hub"
+   },
+   {
+    "id": "R-29",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "The idle trunk watch scans from the control `next` returned before the attempt's own trunk report"
+   },
+   {
+    "id": "R-30",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "GC can delete the land ref of a landing being submitted at that moment if its commit is more than a day old"
+   },
+   {
+    "id": "R-31",
+    "lane": "hub",
+    "severity": "minor",
+    "title": "On a hub with a lander token, any agent can post messages, tasks, decisions and symbol changes as lander/…"
+   },
+   {
+    "id": "R-32",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "The AI resolver prompt puts the agent-chosen file path outside the nonce-tagged untrusted parts"
+   },
+   {
+    "id": "R-33",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "A trunk report over 1 MB fails every attempt as lander_error and pauses landing"
+   },
+   {
+    "id": "R-34",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "A foreign trunk commit with a malformed Agenthub-* trailer makes every trunk report fail, so every attempt fails as lander_error and landing pauses"
+   },
+   {
+    "id": "R-35",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "Lander git isolation still reads the global and system gitattributes files, so merge attributes don't come only from trunk"
+   },
+   {
+    "id": "R-36",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "An AI-resolved file loses the incoming side's mode change (chmod +x) because the splice uses trunk's mode"
+   },
+   {
+    "id": "R-37",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "The lander's mirror is never garbage-collected; objects from every merge, candidate and fetch build up without limit"
+   },
+   {
+    "id": "R-38",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "A multi-commit cherry-pick or revert in progress (sequencer) is not seen as a git operation by sync or land"
+   },
+   {
+    "id": "R-39",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "Sync's fetch passes --no-write-fetch-head (git 2.29+), so on older git every sync is fetch_failed instead of the fast-forward fallback"
+   },
+   {
+    "id": "R-40",
+    "lane": "symbols",
+    "severity": "minor",
+    "title": "Lossy UTF-8 decoding hides changes to non-UTF-8 bytes, narrowing admission holds and guard checks"
+   },
+   {
+    "id": "R-41",
+    "lane": "symbols",
+    "severity": "minor",
+    "title": "Edits to code swallowed by a persisting contained parse error claim only the swallowing declaration"
+   },
+   {
+    "id": "R-42",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "post-edit posts every signature change of a Write in one request; over 200 the hub rejects all of them"
+   },
+   {
+    "id": "R-43",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "land sends paths the hub refuses and tells the agent the hub and CLI are 'probably different versions'"
+   },
+   {
+    "id": "R-44",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "After a hub database reset the feed still keys landing notices by bare landing id, so the new database's L-n notices are dropped"
+   },
+   {
+    "id": "R-45",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "hub_wait/landing_status tell whoever reads another agent's failed landing to fix 'your change' and land again"
+   },
+   {
+    "id": "R-46",
+    "lane": "lander",
+    "severity": "minor",
+    "title": "I4 (config from trunk) and the test-weakening warning (§4.1 #7, #8) have no test at the lander"
+   },
+   {
+    "id": "R-47",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "Sync's HEAD and tracked-file compare-and-swap before reset --keep is never exercised"
+   },
+   {
+    "id": "R-48",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "hub approve's digest-mismatch refusal and `hub lander resume`'s terminal checks have no test"
+   },
+   {
+    "id": "R-49",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "The e2e gate command silently drops the Phase 3 scenarios when an internal dist file is renamed"
+   },
+   {
+    "id": "R-50",
+    "lane": "adapter",
+    "severity": "minor",
+    "title": "Two hub_wait tests use fixed sleeps instead of waiting for the wait to begin, so on a slow machine they pass without exercising what they claim"
+   }
+  ],
+  "reproduced": {
+   "R-2": "reproduced",
+   "R-1": "reproduced",
+   "R-4": "plausible",
+   "R-3": "reproduced",
+   "R-6": "reproduced",
+   "R-7": "reproduced",
+   "R-5": "reproduced",
+   "R-9": "reproduced",
+   "R-10": "reproduced",
+   "R-8": "reproduced",
+   "R-12": "reproduced",
+   "R-11": "reproduced",
+   "R-13": "reproduced",
+   "R-14": "reproduced",
+   "R-15": "reproduced",
+   "R-16": "reproduced",
+   "R-18": "reproduced",
+   "R-17": "reproduced",
+   "R-19": "reproduced",
+   "R-21": "reproduced",
+   "R-20": "reproduced",
+   "R-23": "reproduced",
+   "R-22": "reproduced",
+   "R-24": "reproduced",
+   "R-26": "reproduced",
+   "R-25": "reproduced",
+   "R-28": "reproduced",
+   "R-27": "reproduced",
+   "R-29": "reproduced",
+   "R-30": "reproduced",
+   "R-31": "reproduced",
+   "R-32": "reproduced",
+   "R-33": "reproduced",
+   "R-34": "reproduced",
+   "R-35": "reproduced",
+   "R-36": "reproduced",
+   "R-37": "reproduced",
+   "R-38": "reproduced",
+   "R-39": "reproduced",
+   "R-40": "reproduced",
+   "R-42": "reproduced",
+   "R-41": "reproduced",
+   "R-43": "reproduced",
+   "R-44": "reproduced",
+   "R-45": "reproduced",
+   "R-47": "reproduced",
+   "R-48": "reproduced",
+   "R-49": "reproduced"
+  }
+ }
+}

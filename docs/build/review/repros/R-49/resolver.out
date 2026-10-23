@@ -1,0 +1,27 @@
+work dir: /tmp/r49-QU7egH
+refactor resolver: packages/lander/src/resolver.ts -> src/ai-resolver.ts (6 importing files updated)
+running: npm run test:e2e  (in the copy, AGENTHUB_E2E_PHASE unset; log /tmp/r49-QU7egH/test-e2e.log)
+npm run test:e2e exited 0 after 61 s
+copy's build: packages/lander/dist/ai-resolver.js exists, dist/resolver.js absent
+exports of /home/user/agenthub/packages/lander/dist/resolver.js vs the copy's dist/ai-resolver.js: identical [AiResolver, BUILTIN_ARGV, EXPLANATION_MAX, MAX_RESOLVER_HUNKS, MAX_TRUNK_INTENTS, NOVELTY_FLOOR, NOVELTY_SHARE, RESOLVER_TIMEOUT_MS, SUGGESTION_MAX_BYTES, cleanExplanation, conflictRegions, drawNonce, gitBlobId, languageOf, prepareFile, probeResolver, runResolverCommand, spliceRegions, verifyOutput]
+
+scenarios as the gate reported them:
+  passed   1. symbol parallelism: two agents edit different functions of one file; the same function is denied, naming th
+  passed   2. impact: maya's agent changes login's signature; sam's agent, holding handleLogin (which calls it), hears it
+  passed   3. maya's agent lands: L-1 lands, its holds are released, sam's queued claim is granted, and sam's feed hears 
+  passed   4. dirty sync: sam's worktree has uncommitted edits; its prompt's sync reports behind_dirty and leaves every f
+  passed   5. clean sync: sam's agent commits, and the next prompt replays its branch onto trunk
+  passed   6. send-back: sam's landing fails its checks and comes back as a fix-it brief; the re-land keeps its place and
+  passed   7. protected path: a migration waits for a human approval, given through a pseudo-terminal; not through MCP, n
+  skipped  8. conflict + AI: both agents change the same line; the stub resolver (union) combines them; it lands resolved
+  passed   9. sync/edit exclusion both ways: an edit while a sync holds the lock is denied with "retry"; a sync while an 
+  passed   10. final: trunk is exactly the squash commits with their trailers; every landing landed and every task done; 
+  passed   then: the lander is killed during the checks of one more landing; a second lander lands it exactly once
+
+vitest summary: 10 passed, 0 failed, 1 skipped, 0 todo; success=true
+root package.json test:e2e = "npm run build && vitest run --config vitest.e2e.config.ts" (sets AGENTHUB_E2E_PHASE: no)
+vitest.e2e.config.ts: passWithNoTests true; sets AGENTHUB_E2E_PHASE: no; stale "no tests until ... A5" comment: yes
+
+DEFECT: `npm run test:e2e` exited 0 after a behaviour-neutral resolver refactor, but the §5.5 Phase 3 scenarios did not run:
+  - 8. conflict + AI: skipped
+exit 1

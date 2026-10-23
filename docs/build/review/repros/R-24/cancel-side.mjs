@@ -1,0 +1,10 @@
+import { setup, P, A, B, sha } from '../find-hub/h.mjs';
+const { hub } = setup();
+hub.claim(P, A, { files: ['x.ts'] });
+const r = hub.land(P, A, { queue: true, commit: sha('1'), files: ['x.ts'] });
+hub.claim(P, B, { files: ['x.ts'], queue: true });
+console.log('A before cancel:', hub.claim(P, A, { files: ['x.ts'] }).status);
+const c = hub.cancelLanding(P, A, r.landing.id, {}, { lander: false, approver: null });
+console.log('cancel ->', c.landing?.status);
+const after = hub.claim(P, A, { files: ['x.ts'] });
+console.log('A after cancel:', after.status, after.renewed, after.claims.map((x) => x.id + ':' + x.landing_id));

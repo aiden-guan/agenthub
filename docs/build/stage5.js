@@ -128,45 +128,57 @@ const DIMENSIONS = [
 const KNOWN = (args.known || []).map((f, i) => ({ ...f, id: `K-${i + 1}` }))
 const knownNote = KNOWN.length ? `\n\nAlready known and queued for fixing (don't report these again): ${JSON.stringify(KNOWN.map(f => `${f.id} ${f.title}`))}` : ''
 
-phase('Find')
-const findPrompt = (d) => `${CONTEXT}${knownNote}
+// Resuming after an interruption: args.resume = {dir, findings: [{id, lane, severity, title}], reproduced: {id: status}}.
+// The full findings, the saved reproduction results and their scripts are committed under dir in the repo.
+const RES = args.resume || null
+const savedNote = (f) => !RES ? '' : `\nThe full text of finding ${f.id} is in ${REPO}/${RES.dir}/findings.json. ${RES.reproduced[f.id] ? `Its saved reproduction result is in ${REPO}/${RES.dir}/repro-results.json and its scripts in ${REPO}/${RES.dir}/repros/${f.id}/ (rerun them with AGENTHUB_ROOT set; replace any absolute scratch paths they contain).` : 'It has not been reproduced yet.'} Read them first.`
 
-You are one of ${DIMENSIONS.length} independent reviewers. Your dimension: ${d.focus}
-
-Read the design sections named above, then the code: git -C "${REPO}" diff ${BASE}..${HEAD_REF} -- <paths> and the files themselves (the tree is checked out at ${HEAD_REF}; read it, don't edit it). You may run npm test, npx vitest and small scripts (put them under ${WORK}/find-${d.key}/) to confirm a suspicion; the packages are built in ${REPO}/packages/*/dist.
-
-Report real defects only: behavior that is wrong against the design, unsafe, or will fail in use. For each give the concrete scenario that triggers it (inputs or an interleaving) and the wrong outcome, the files, the design section it violates, and the lane that owns the fix (${LANE_OF}). Severity: blocking = a safety invariant breaks or the hub/lander crashes or corrupts state; major = wrong behavior a user will hit; minor = an edge case with a cheap fix. Leave out style, naming and speculation you cannot tie to a scenario. Be thorough: a missed defect ships.`
-const found = (await parallel(DIMENSIONS.map(d => () => ask(findPrompt(d), { label: `find:${d.key}`, phase: 'Find', schema: FINDINGS })))).filter(Boolean)
-let raw = found.flatMap(r => r.findings)
-log(`${raw.length} raw findings from ${found.length}/${DIMENSIONS.length} reviewers`)
-
-const critic = await ask(`${CONTEXT}${knownNote}
-
-${DIMENSIONS.length} reviewers each reviewed one dimension of git diff ${BASE}..${HEAD_REF}. Their findings so far:
-${JSON.stringify(raw.map(f => ({ title: f.title, files: f.files, claim: f.claim })), null, 1)}
-
-You are the completeness critic. Find what they missed: code in the diff no finding touches, safety rules of design section 4 and invariants of 0.2 that no finding examined, flows of section 3 nobody traced end to end, interactions between packages (hub with lander, lander with gitops, adapter with hub and symbols). Trace those yourself in the code and report only new, concrete defects in the same format (scenario, wrong outcome, files, design section, owning lane: ${LANE_OF}). Scripts go under ${WORK}/find-critic/.`, { label: 'find:critic', phase: 'Find', schema: FINDINGS })
-if (critic) raw = raw.concat(critic.findings)
-log(`${raw.length} raw findings including the critic's`)
-
-phase('Dedup')
+let raw = []
 let findings = []
-if (raw.length) {
-  const dd = await ask(`Merge duplicate code-review findings. Two findings are duplicates when fixing one fixes the other. Keep every distinct finding; never drop one because it seems unlikely. For a merged group keep the clearest title and scenario, the union of files, the highest severity, and set sources to the group size. Number the results R-1, R-2, ... in order of severity (blocking first).
+if (RES) {
+  findings = RES.findings
+  raw = findings
+  log(`resuming with ${findings.length} saved findings, ${Object.keys(RES.reproduced).length} already reproduced`)
+} else {
+  phase('Find')
+  const findPrompt = (d) => `${CONTEXT}${knownNote}
 
-Findings:
-${JSON.stringify(raw, null, 1)}`, { label: 'dedup', phase: 'Dedup', schema: DEDUPED })
-  findings = dd ? dd.findings : raw.map((f, i) => ({ ...f, id: `R-${i + 1}`, sources: 1 }))
+  You are one of ${DIMENSIONS.length} independent reviewers. Your dimension: ${d.focus}
+
+  Read the design sections named above, then the code: git -C "${REPO}" diff ${BASE}..${HEAD_REF} -- <paths> and the files themselves (the tree is checked out at ${HEAD_REF}; read it, don't edit it). You may run npm test, npx vitest and small scripts (put them under ${WORK}/find-${d.key}/) to confirm a suspicion; the packages are built in ${REPO}/packages/*/dist.
+
+  Report real defects only: behavior that is wrong against the design, unsafe, or will fail in use. For each give the concrete scenario that triggers it (inputs or an interleaving) and the wrong outcome, the files, the design section it violates, and the lane that owns the fix (${LANE_OF}). Severity: blocking = a safety invariant breaks or the hub/lander crashes or corrupts state; major = wrong behavior a user will hit; minor = an edge case with a cheap fix. Leave out style, naming and speculation you cannot tie to a scenario. Be thorough: a missed defect ships.`
+  const found = (await parallel(DIMENSIONS.map(d => () => ask(findPrompt(d), { label: `find:${d.key}`, phase: 'Find', schema: FINDINGS })))).filter(Boolean)
+  raw = found.flatMap(r => r.findings)
+  log(`${raw.length} raw findings from ${found.length}/${DIMENSIONS.length} reviewers`)
+
+  const critic = await ask(`${CONTEXT}${knownNote}
+
+  ${DIMENSIONS.length} reviewers each reviewed one dimension of git diff ${BASE}..${HEAD_REF}. Their findings so far:
+  ${JSON.stringify(raw.map(f => ({ title: f.title, files: f.files, claim: f.claim })), null, 1)}
+
+  You are the completeness critic. Find what they missed: code in the diff no finding touches, safety rules of design section 4 and invariants of 0.2 that no finding examined, flows of section 3 nobody traced end to end, interactions between packages (hub with lander, lander with gitops, adapter with hub and symbols). Trace those yourself in the code and report only new, concrete defects in the same format (scenario, wrong outcome, files, design section, owning lane: ${LANE_OF}). Scripts go under ${WORK}/find-critic/.`, { label: 'find:critic', phase: 'Find', schema: FINDINGS })
+  if (critic) raw = raw.concat(critic.findings)
+  log(`${raw.length} raw findings including the critic's`)
+
+  phase('Dedup')
+  if (raw.length) {
+    const dd = await ask(`Merge duplicate code-review findings. Two findings are duplicates when fixing one fixes the other. Keep every distinct finding; never drop one because it seems unlikely. For a merged group keep the clearest title and scenario, the union of files, the highest severity, and set sources to the group size. Number the results R-1, R-2, ... in order of severity (blocking first).
+
+  Findings:
+  ${JSON.stringify(raw, null, 1)}`, { label: 'dedup', phase: 'Dedup', schema: DEDUPED })
+    findings = dd ? dd.findings : raw.map((f, i) => ({ ...f, id: `R-${i + 1}`, sources: 1 }))
+  }
 }
 log(`${findings.length} distinct findings: ${['blocking', 'major', 'minor'].map(s => `${findings.filter(f => f.severity === s).length} ${s}`).join(', ')}`)
 
 phase('Verify')
 const verified = await pipeline(
   findings,
-  (f) => ask(`${CONTEXT}
+  (f) => RES && RES.reproduced[f.id] ? Promise.resolve({ status: RES.reproduced[f.id], evidence: `saved in ${RES.dir}/repro-results.json`, repro_path: `${REPO}/${RES.dir}/repros/${f.id}/` }) : ask(`${CONTEXT}
 
 Reproduce this review finding against ${HEAD_REF} in ${REPO} (read-only: don't edit tracked files there).
-${JSON.stringify(f, null, 2)}
+${JSON.stringify(f, null, 2)}${savedNote(f)}
 
 Write a reproduction under ${WORK}/repro-${f.id}/: a node script (.mjs) or vitest file that imports the built packages from \${AGENTHUB_ROOT}/packages/*/dist (default AGENTHUB_ROOT=${REPO}), builds whatever state it needs (temp dirs, a local bare remote, an in-process hub on port 0, the stub resolver), triggers the scenario, and exits non-zero (or fails) exactly when the defect is present. Run it. It must not need the network or an API key.
 - reproduced: the script shows the defect. Give the command (it must honour AGENTHUB_ROOT so it can be rerun against a fixed checkout).
@@ -181,7 +193,7 @@ Correct the severity if the finding over- or under-states it.`, { label: `repro:
 
 Try to refute this review finding. A reproducer reported:
 Finding: ${JSON.stringify(f, null, 2)}
-Reproduction: ${JSON.stringify(rep, null, 2)}
+Reproduction: ${JSON.stringify(rep, null, 2)}${savedNote(f)}
 
 Read the code, the reproduction (${rep.repro_path || 'none'}) and the design. Refute it only with a concrete reason: a design section that allows or requires this behavior, a trace showing no real caller or input reaches it, or a flaw in the reproduction that makes it show something other than the claimed defect (rerun it to check). If the reproduction is sound and the behavior violates the design, refuted=false.${rep.status === 'plausible' ? ' This one was not triggered, only traced: check the trace step by step, and refute it if any step is wrong.' : ''}`, { label: `refute:${f.id}`, phase: 'Verify', schema: REFUTE })
     return { f: { ...f, severity: sev }, rep, ref, confirmed: !!ref && !ref.refuted }
@@ -215,7 +227,7 @@ async function fixBatch(lane, batch, n) {
 
 ${laneRules(lane)}
 
-Fix batch ${n} of lane ${lane}: findings ${ids}. Findings with an R- id were reproduced and survived an attempt to refute it. Findings with a K- id were recorded by an earlier step verifier and not reproduced here: confirm each one first (write the failing regression test), and mark it not_a_defect with your evidence if it doesn't hold. To rerun a reproduction against your worktree, set AGENTHUB_ROOT=${L.wt} after npm run build there.
+Fix batch ${n} of lane ${lane}: findings ${ids}. Findings with an R- id were reproduced and survived an attempt to refute it. Findings with a K- id were recorded by an earlier step verifier and not reproduced here: confirm each one first (write the failing regression test), and mark it not_a_defect with your evidence if it doesn't hold. To rerun a reproduction against your worktree, set AGENTHUB_ROOT=${L.wt} after npm run build there.${RES ? ` Full finding texts are in ${REPO}/${RES.dir}/findings.json, saved reproduction results in repro-results.json there, and scripts under repros/<id>/.` : ''}
 ${JSON.stringify(items, null, 2)}`, { label: `fix:${lane}:${n}`, phase: 'Fix', schema: FIX_RESULT })
   if (!res) return { lane, ids, res: null, ver: null }
   let ver = null
