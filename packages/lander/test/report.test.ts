@@ -154,6 +154,11 @@ describe('conflict hunks', () => {
     ]);
   });
 
+  it('parses the regions of a CRLF file and keeps the line endings of each side', () => {
+    const text = ['keep', '<<<<<<< trunk', 't1', '||||||| base', 'b1', '=======', 'y1', '>>>>>>> yours', ''].join('\r\n');
+    expect(parseConflictMarkers(text, 7)).toEqual([{ start_line: 2, end_line: 8, trunk: 't1\r\n', base: 'b1\r\n', yours: 'y1\r\n' }]);
+  });
+
   it('caps each side at 80 lines or 4 KiB', () => {
     const many = Array.from({ length: 200 }, (_, i) => `line ${i}`).join('\n') + '\n';
     const capped = capSide(many);

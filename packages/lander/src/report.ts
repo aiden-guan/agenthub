@@ -184,7 +184,9 @@ export interface MarkedHunk {
  */
 export function parseConflictMarkers(text: string, markerSize = 7): MarkedHunk[] {
   const [lt, bar, eq, gt] = ['<', '|', '=', '>'].map((c) => c.repeat(markerSize)) as [string, string, string, string];
-  const isMarker = (line: string, m: string) => line === m || line.startsWith(`${m} `);
+  // A CRLF file's marker lines end in '\r'; the sides keep their line endings as they are.
+  const bare = (line: string) => (line.endsWith('\r') ? line.slice(0, -1) : line);
+  const isMarker = (line: string, m: string) => bare(line) === m || line.startsWith(`${m} `);
   const join = (ls: string[]) => ls.map((l) => `${l}\n`).join('');
   const out: MarkedHunk[] = [];
   const lines = text.split('\n');
@@ -201,7 +203,7 @@ export function parseConflictMarkers(text: string, markerSize = 7): MarkedHunk[]
         sides = { trunk: [], base: [], yours: [] };
       }
     } else if (side === 'trunk' && isMarker(line, bar)) side = 'base';
-    else if (side !== 'yours' && line === eq) side = 'yours';
+    else if (side !== 'yours' && bare(line) === eq) side = 'yours';
     else if (side === 'yours' && isMarker(line, gt)) {
       out.push({ start_line: start, end_line: i + 1, trunk: join(sides.trunk), base: join(sides.base), yours: join(sides.yours) });
       side = null;

@@ -128,7 +128,7 @@ const DIMENSIONS = [
 const KNOWN = (args.known || []).map((f, i) => ({ ...f, id: `K-${i + 1}` }))
 const knownNote = KNOWN.length ? `\n\nAlready known and queued for fixing (don't report these again): ${JSON.stringify(KNOWN.map(f => `${f.id} ${f.title}`))}` : ''
 
-// Resuming after an interruption: args.resume = {dir, findings: [{id, lane, severity, title}], reproduced: {id: status}}.
+// Resuming after an interruption: args.resume = {dir, findings: [{id, lane, severity, title}], reproduced: {id: status}, refuted?: {id: {refuted, reason}}}.
 // The full findings, the saved reproduction results and their scripts are committed under dir in the repo.
 const RES = args.resume || null
 const savedNote = (f) => !RES ? '' : `\nThe full text of finding ${f.id} is in ${REPO}/${RES.dir}/findings.json. ${RES.reproduced[f.id] ? `Its saved reproduction result is in ${REPO}/${RES.dir}/repro-results.json and its scripts in ${REPO}/${RES.dir}/repros/${f.id}/ (rerun them with AGENTHUB_ROOT set; replace any absolute scratch paths they contain).` : 'It has not been reproduced yet.'} Read them first.`
@@ -189,7 +189,8 @@ Correct the severity if the finding over- or under-states it.`, { label: `repro:
     if (!rep || rep.status === 'not_reproduced') return { f, rep, ref: null, confirmed: false }
     const sev = rep.corrected_severity || f.severity
     if (sev === 'minor' && rep.status === 'reproduced') return { f: { ...f, severity: sev }, rep, ref: null, confirmed: true }
-    const ref = await ask(`${CONTEXT}
+    const saved = RES && RES.refuted && RES.refuted[f.id]
+    const ref = saved || await ask(`${CONTEXT}
 
 Try to refute this review finding. A reproducer reported:
 Finding: ${JSON.stringify(f, null, 2)}

@@ -9,8 +9,8 @@ How Phases 2 and 3 of `docs/design-phase2-3.md` are being built, so the build ca
 - Stage 5 (the review) was stopped on purpose partway through, with no code changed:
   - Find and dedup are done: 50 distinct findings (5 blocking, 20 major, 25 minor after the reproducers' corrections), in `review/findings.json`.
   - 48 of the 50 are reproduced (47 reproduced, 1 plausible); R-46 and R-50 are not. Results are in `review/repro-results.json`, and each finding's top-level scripts are in `review/repros/<id>/`. A few scripts hard-code the old scratch path; they all take `AGENTHUB_ROOT`.
-  - No finding has been through the refutation step yet, and nothing is fixed.
-  - `review/known.json` lists 19 minor issues that step verifiers recorded and left open; they go straight to the fixers.
+  - Refutation: 4 of the 5 blocking findings (R-1, R-2, R-4, R-5) went through it on 2026-10-29 and none was refuted; results are in `review/refute-results.json`, and `stage5-resume.json` passes them as `resume.refuted` so they are not redone. The rest of the findings have not been through it, and nothing from the review is fixed yet.
+  - `review/known.json` lists 18 minor issues that step verifiers recorded and left open; they go straight to the fixers. (A 19th, CRLF conflicts giving fix-it reports with no hunks, was fixed directly on 2026-10-29 in `packages/lander/src/report.ts`, with a test in `report.test.ts`.)
 - Since the pause (as of 2026-10-29): PR #1 was merged into `main` (8909c9e), and `main` gained two commits of the owner's own: fc788b8 (README rewrite, CHANGELOG.md, LICENSE, .env.example, .gitignore) and ae03f72 (README hero banner, assets/readme/hero.png). They are docs and assets only. `phase23` does not have them yet.
 - Next:
   1. Resume stage 5 from `stage5-resume.json` (below).
