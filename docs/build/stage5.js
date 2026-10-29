@@ -282,7 +282,7 @@ ${JSON.stringify(fixSummary, null, 2)}
 Confirmed findings that need frozen files (yours to fix):
 ${JSON.stringify(frozen.map(v => ({ ...v.f, reproduction: v.rep })), null, 2)}
 
-The full review ledger (every finding and its verdict):
+${RES ? `Full finding texts are in ${REPO}/${RES.dir}/findings.json (the ledger below has only ids and titles for them); saved reproductions are in ${RES.dir}/repro-results.json and ${RES.dir}/repros/<id>/.\n\n` : ''}The full review ledger (every finding and its verdict):
 ${JSON.stringify(ledger, null, 1)}
 
 Do this, in order:
@@ -304,7 +304,7 @@ for (let round = 0; round < 3; round++) {
 
 The review fixes were integrated on ${HEAD_REF} in ${REPO} and tagged ${TAG}. The integrator reported: ${JSON.stringify(cp, null, 2)}
 
-Check that every confirmed finding is really fixed on ${HEAD_REF}: after npm run build in ${REPO}, rerun each reproduction listed below with AGENTHUB_ROOT=${REPO} (don't edit tracked files; scratch under ${WORK}/regress-repro-r${round}/). Each must no longer show the defect, or REVIEW.md must say why it stays open. Also run npm test, npm run typecheck and npm run test:e2e, and check that REVIEW.md's ledger matches the verdicts below.
+Check that every confirmed finding is really fixed on ${HEAD_REF}: after npm run build in ${REPO}, rerun each reproduction listed below with AGENTHUB_ROOT=${REPO} (don't edit tracked files; scratch under ${WORK}/regress-repro-r${round}/). Each must no longer show the defect, or REVIEW.md must say why it stays open.${RES ? ` Saved reproductions for the R- findings are under ${REPO}/${RES.dir}/repros/<id>/ (results in ${RES.dir}/repro-results.json).` : ''} Also run npm test, npm run typecheck and npm run test:e2e, and check that REVIEW.md's ledger matches the verdicts below.
 Confirmed findings: ${JSON.stringify(confirmed.map(v => ({ id: v.f.id, title: v.f.title, repro: v.rep.repro_path, command: v.rep.command })), null, 1)}
 ok=true only if no blocking or major problem remains.`, { label: `regress:repro:r${round}`, phase: 'Regression review', schema: VERIFY_RESULT }),
     () => ask(`${CONTEXT}

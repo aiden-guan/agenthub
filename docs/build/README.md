@@ -11,14 +11,18 @@ How Phases 2 and 3 of `docs/design-phase2-3.md` are being built, so the build ca
   - 48 of the 50 are reproduced (47 reproduced, 1 plausible); R-46 and R-50 are not. Results are in `review/repro-results.json`, and each finding's top-level scripts are in `review/repros/<id>/`. A few scripts hard-code the old scratch path; they all take `AGENTHUB_ROOT`.
   - No finding has been through the refutation step yet, and nothing is fixed.
   - `review/known.json` lists 19 minor issues that step verifiers recorded and left open; they go straight to the fixers.
-- Next: resume stage 5 from `stage5-resume.json` (below), then push `phase23` and open a PR against `fix/phase1-review`.
+- Since the pause (as of 2026-10-29): PR #1 was merged into `main` (8909c9e), and `main` gained two commits of the owner's own: fc788b8 (README rewrite, CHANGELOG.md, LICENSE, .env.example, .gitignore) and ae03f72 (README hero banner, assets/readme/hero.png). They are docs and assets only. `phase23` does not have them yet.
+- Next:
+  1. Resume stage 5 from `stage5-resume.json` (below).
+  2. Merge `origin/main` into `phase23`. README.md will conflict: keep the owner's rewritten structure and wording, and fold in the Phase 2/3 sections (landing queue, host guide, Phase 3, release notes). Add a Phase 2/3 entry to CHANGELOG.md. Check that the new `.gitignore` rules (`.env*`, `.claude/`) don't hide anything the build or tests need.
+  3. Run the gate (build, typecheck, npm test, `AGENTHUB_E2E_PHASE=3 npm run test:e2e`, demo), push, and open the PR from `phase23` into `main` (`fix/phase1-review` is merged, so it is no longer the target).
 
 ### Resuming stage 5
 
 1. Create the four lane worktrees from `phase23`'s head (`git worktree add <SCRATCH>/lanes23/<lane> -b p23/<lane> phase23`, or reuse existing `p23/*` branches after `git merge --ff-only phase23`), then `npm ci && npm run build` in each and in the repo.
 2. `git fetch origin fix/phase1-review` (the review's base is `origin/fix/phase1-review`).
 3. Replace `${REPO}` and `${SCRATCH}` in `stage5-resume.json` and run the Workflow tool with `scriptPath: docs/build/stage5.js` and that file's contents as `args`. With `resume` set, `stage5.js` skips Find and Dedup, reuses the saved reproductions, reproduces the rest, then refutes, fixes, integrates (tag `cp3r`) and runs the regression review.
-4. Check the result, run the gate yourself (`npm test`, `npm run typecheck`, `AGENTHUB_E2E_PHASE=3 npm run test:e2e`), push, and open the PR.
+4. Check the result, run the gate yourself (`npm test`, `npm run typecheck`, `AGENTHUB_E2E_PHASE=3 npm run test:e2e`), then do steps 2 and 3 of "Next" above: merge `origin/main`, rerun the gate, push, and open the PR into `main`.
 
 ## How a stage runs
 
@@ -30,7 +34,7 @@ How Phases 2 and 3 of `docs/design-phase2-3.md` are being built, so the build ca
 | 2 | `stage2.json` | `cp1a` | hub H4, lander L2–L3, adapter A1–A2 | `cp1` |
 | 3 | `stage3.json` | `cp1` | hub H5, lander L4–L5, adapter A5 (Phase 2 scenarios) | `cp2` (Phase 2 complete, plus CP3a) |
 | 4 | `stage4.json` | `cp2` | hub H6, lander L6, adapter A3, A4, A5 (Phase 3), A6 | `cp3` (Phase 3 complete) |
-| 5 | `stage5.js` (its own script; args below) | `cp3` | adversarial review of `fix/phase1-review..phase23`: find, reproduce, refute, fix by lane, re-verify, integrate, regression review | `cp3r`; then push `phase23` and open a PR against `fix/phase1-review` |
+| 5 | `stage5.js` (its own script; args below) | `cp3` | adversarial review of `fix/phase1-review..phase23`: find, reproduce, refute, fix by lane, re-verify, integrate, regression review | `cp3r`; then merge `origin/main`, push `phase23` and open a PR against `main` |
 
 ## Running a stage
 
