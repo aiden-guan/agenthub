@@ -12,8 +12,9 @@ Usage: hub-server [--port 7077] [--host 127.0.0.1] [--db ./hub.db]
                   [--lease-ttl-ms 120000] [--heartbeat-ms 30000] [--token SECRET]
                   [--allow-origin https://dash.example.com]... [--allow-host hub.example.com]...
 
-Requests from browsers (anything sending an Origin header) are refused unless
-their origin is given with --allow-origin, which may be repeated.
+Open the server URL in a browser for the built-in dashboard. Requests from
+other browser origins are refused unless given with --allow-origin, which may
+be repeated. The dashboard accepts your bearer token in connection settings.
 On a loopback address (the default), requests must address the hub by IP
 address, localhost or the --host name. Give any other name clients use in their
 hub URL with --allow-host, which may be repeated (agents in Docker Desktop

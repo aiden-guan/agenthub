@@ -20,7 +20,8 @@
   },
   "files": [
     "bin",
-    "dist"
+    "dist",
+    "ui"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

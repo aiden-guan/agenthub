@@ -1,6 +1,7 @@
 import { createServer, STATUS_CODES, type IncomingMessage, type ServerResponse } from 'node:http';
 import { isIP, type AddressInfo } from 'node:net';
 import { timingSafeEqual } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { Hub, HubError, assertAgent, isVisibleTo } from './hub.js';
 import type { EventsResult, FeedClientFrame, FeedServerFrame, HubEvent, TaskStatus } from './protocol.js';
@@ -18,8 +19,10 @@ export interface ServerOptions {
   /**
    * Browser origins (`scheme://host[:port]`) allowed to call the hub. HTTP
    * requests and feed upgrades that carry any other `Origin` header are refused
-   * with 403, so a web page can't reach a hub on localhost through the
-   * developer's browser. Node clients send no Origin. Default: none.
+   * with 403. The built-in dashboard's own origin is accepted when its Host
+   * can't be rebound (an IP address, localhost or an allowHosts name);
+   * unrelated web pages cannot reach the hub. Node clients
+   * send no Origin. Default: no additional origins.
    */
   allowOrigins?: string[];
   /**
@@ -48,6 +51,15 @@ const REPLAY_PAGE = 500;
 const MAX_REPLAY_BUFFERED = 1_000_000;
 /** New events a feed holds back while it replays; a client that falls this far behind is dropped. */
 const MAX_HELD_EVENTS = 10_000;
+
+// An explicit asset table avoids exposing source files or arbitrary filesystem paths.
+const dashboardAssets = new Map([
+  ['/', { name: 'index.html', type: 'text/html; charset=utf-8' }],
+  ['/dashboard.css', { name: 'dashboard.css', type: 'text/css; charset=utf-8' }],
+  ['/dashboard.js', { name: 'dashboard.js', type: 'text/javascript; charset=utf-8' }],
+  ['/favicon.svg', { name: 'favicon.svg', type: 'image/svg+xml' }],
+  ['/geist-latin.woff2', { name: 'geist-latin.woff2', type: 'font/woff2' }],
+]);
 
 type Handler = (ctx: RequestContext) => unknown | Promise<unknown>;
 
@@ -103,19 +115,28 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   function checkOrigin(req: IncomingMessage): string | null {
     // Sec-WebSocket-Origin is what browsers sent before RFC 6455 renamed it Origin.
     for (const origin of [req.headers.origin, req.headers['sec-websocket-origin'] as string | undefined]) {
-      if (origin !== undefined && !allowedOrigins.has(origin)) {
+      // The dashboard's own origin, trusted only for a Host that can't be rebound:
+      // otherwise a page on a rebound name would look same-origin.
+      const host = req.headers.host;
+      const sameOrigin = host !== undefined && origin === `http://${host}` && unrebindable(hostnameOf(host));
+      if (origin !== undefined && !sameOrigin && !allowedOrigins.has(origin)) {
         throw new HubError('forbidden_origin', `requests from origin ${JSON.stringify(origin)} are not allowed (see hub-server --allow-origin)`, 403);
       }
     }
     return req.headers.origin ?? null;
   }
 
-  /** Throws unless the Host header is an IP address, a localhost name or an allowed name: none of these can be rebound. */
+  /** Whether a Host name is an IP address, a localhost name or an allowed name: none of these can be rebound. */
+  function unrebindable(name: string | null): boolean {
+    return name !== null && (isIP(name.replace(/^\[(.*)\]$/, '$1')) !== 0 || name === 'localhost' || name.endsWith('.localhost') || allowedHosts.has(name));
+  }
+
+  /** Throws unless the Host header can't be rebound (see unrebindable). */
   function checkHost(req: IncomingMessage): void {
     const header = req.headers.host;
     if (!hostCheck || header === undefined) return;
     const name = hostnameOf(header);
-    if (name !== null && (isIP(name.replace(/^\[(.*)\]$/, '$1')) !== 0 || name === 'localhost' || name.endsWith('.localhost') || allowedHosts.has(name))) return;
+    if (unrebindable(name)) return;
     const fix = name !== null && HOSTNAME.test(name) ? ` If clients use this name in their hub URL, restart the hub with: hub-server --allow-host ${name}` : ' Names clients use in their hub URL are allowed with hub-server --allow-host <name>';
     throw new HubError(
       'forbidden_host',
@@ -144,8 +165,23 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     if (req.method === 'GET' && url.pathname === '/healthz') {
       return sendJson(res, 200, { ok: true, now: hub.now() });
     }
+    const asset = req.method === 'GET' ? dashboardAssets.get(url.pathname) : undefined;
+    if (asset) {
+      const content = readFileSync(new URL(`../ui/${asset.name}`, import.meta.url));
+      res.writeHead(200, {
+        'content-type': asset.type,
+        'cache-control': 'no-cache',
+        'x-content-type-options': 'nosniff',
+        'referrer-policy': 'no-referrer',
+        'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+      });
+      return void res.end(content);
+    }
     if (!authorized(req.headers.authorization, opts.token)) {
       throw new HubError('unauthorized', 'missing or wrong bearer token', 401);
+    }
+    if (req.method === 'GET' && url.pathname === '/v1/projects') {
+      return sendJson(res, 200, { projects: hub.store.listProjects() });
     }
     const m = /^\/v1\/p\/([^/]+)(\/.*)$/.exec(url.pathname);
     if (!m) throw new HubError('not_found', `no route for ${req.method} ${url.pathname}`, 404);
