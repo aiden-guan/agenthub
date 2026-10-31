@@ -16,7 +16,7 @@
 
 <br/>
 
-![agenthub Hero Banner](assets/readme/hero.png)
+<img src="assets/readme/hero.png" alt="agenthub: the dashboard coordination map with three connected agents, and the real PreToolUse deny and git-guard output from npm run demo" width="100%"/>
 
 </div>
 
