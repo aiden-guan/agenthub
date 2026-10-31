@@ -5,6 +5,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 ---
 
+## [Unreleased] — 2026-10-30
+
+### Summary
+`hub-server` now serves a built-in web dashboard at its root URL, so a team can see agents, file leases, tasks, decisions, and activity without a separate frontend.
+
+### Architectural & Functional Highlights
+| Component / Layer | Change | Impact |
+| :--- | :--- | :--- |
+| **Hub server** | Serves `packages/hub/ui/` from a fixed five-entry asset table with CSP, `nosniff`, and `no-referrer` | Browser UI with no filesystem path mapping and no new dependency |
+| **Origin policy** | Accepts a request whose `Origin` is `http://<Host>` when Host is an IP address, a localhost name, or an `--allow-host` name | The dashboard can call the API. Other origins and pages on rebound names are refused on every bind address |
+| **REST API** | Adds authenticated `GET /v1/projects` | The dashboard can list and switch between every project on a hub |
+| **Tooling** | `npm run dashboard` and `npm run demo:dashboard` | One command to view a real hub or a disposable sample workspace |
+
+### Detailed Changes
+
+#### Added
+- **Dashboard**: Overview, Agents, Tasks, File claims, Decisions, and Activity views, plus ⌘K search, a project switcher, and *Connect an agent* instructions for the current hub. Data refreshes every 5 s while the tab is visible.
+- **Dashboard writes**: *New task* (with an optional dependency) and *Record decision*, through the same validated API the CLI uses.
+- **Credentials**: Bearer token entered in connection settings and held in page memory only. Identity kept in `sessionStorage`.
+- **Sample workspace**: `scripts/dashboard-demo.mjs` seeds an in-memory SQLite hub (3 agents, 8 tasks, 3 leases, 2 decisions) through the real `Hub` API.
+- **Packaging**: `@agenthub/hub` publishes `ui/` alongside `bin` and `dist`. The Geist font ships with its SIL OFL 1.1 license.
+
+#### Fixed
+- **Dashboard**: `dashboard.js` attached listeners to `#mobile-settings` and `#header-search`, which `index.html` does not contain. The resulting `TypeError` stopped the module before its first refresh and left the page on "Opening your workspace". Those lookups are now optional.
+
+- **Origin policy**: The first same-origin rule trusted any `Host`. On `--host 0.0.0.0` without `--token` or `--allow-host`, the hub does not check Host, so a page on a DNS-rebound name could read hub data (`/v1/projects` returned 200). Same-origin now requires a Host that can't be rebound. Tests cover both bind modes and both HTTP and the feed.
+
+#### Documentation & Presentation
+- **README**: New *Built-in Dashboard* section with 2x captures, a fourth engineering deep dive (serving a browser UI from a hub that refuses browsers), the dashboard in the architecture diagram, and a configuration table.
+- **Accuracy**: Removed unmeasured throughput and latency figures, and corrected the test count to the actual 278.
+
+### Verification Proof
+- `npm test`: 7 files, 278 tests passed, including three new dashboard tests (public shell headers, authenticated `/v1/projects`, origin and rebind refusal) and rebound same-origin assertions for `0.0.0.0` binds, which fail without the fix.
+- Dashboard loaded in a browser against `npm run demo:dashboard` with no console errors after the fix. Every view was captured over the DevTools protocol.
+- `validate_readme.py README.md --strict` passed.
+
+---
+
 ## [v0.1.0] — 2026-10-22
 
 ### Summary

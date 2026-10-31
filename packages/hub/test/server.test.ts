@@ -501,6 +501,48 @@ describe('push feed', () => {
   });
 });
 
+describe('built-in dashboard', () => {
+  it('serves a public static shell and local assets without exposing authenticated data', async () => {
+    const s = await start({ token: 'dashboard-test-token' });
+    const page = await fetch(s.url);
+    expect(page.status).toBe(200);
+    expect(page.headers.get('content-type')).toContain('text/html');
+    expect(page.headers.get('content-security-policy')).toContain("script-src 'self'");
+    expect(page.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+    expect(await page.text()).toContain('Workspace overview');
+    for (const [asset, type] of [['dashboard.js', 'text/javascript'], ['dashboard.css', 'text/css'], ['favicon.svg', 'image/svg+xml'], ['geist-latin.woff2', 'font/woff2']]) {
+      const response = await fetch(`${s.url}/${asset}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain(type);
+      expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    }
+    expect((await fetch(`${s.url}/v1/projects`)).status).toBe(401);
+    expect((await fetch(`${s.url}/v1/p/demo/status`)).status).toBe(401);
+    expect((await fetch(`${s.url}/src/server.ts`)).status).toBe(401);
+  });
+
+  it('lists actual projects only after authentication', async () => {
+    const s = await start({ token: 'dashboard-test-token' });
+    await api(s.url, 'POST', '/tasks', { title: 'A real project task' }, A, 'dashboard-test-token');
+    const response = await fetch(`${s.url}/v1/projects`, { headers: { authorization: 'Bearer dashboard-test-token' } });
+    expect(await response.json()).toEqual({ projects: ['demo'] });
+  });
+
+  it('accepts the dashboard origin while refusing other origins and rebound hosts', async () => {
+    const s = await start();
+    const response = await fetch(`${s.url}/v1/p/demo/tasks`, {
+      method: 'POST', headers: { origin: s.url, 'x-hub-agent': A, 'content-type': 'application/json' },
+      body: JSON.stringify({ title: 'Created from the dashboard' }),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json() as any).task.title).toBe('Created from the dashboard');
+    expect(await upgradeStatus(s.url, { origin: s.url })).toBe(101);
+    expect((await fetch(`${s.url}/v1/projects`, { headers: { origin: 'https://evil.example' } })).status).toBe(403);
+    expect((await requestAs(s.port, `rebind.evil.example:${s.port}`, '/', { origin: `http://rebind.evil.example:${s.port}` })).status).toBe(403);
+    expect((await fetch(`${s.url}/dashboard.js/../server.ts`)).status).toBe(404);
+  });
+});
+
 describe('browser origins', () => {
   it('refuses feed upgrades and HTTP requests that carry an Origin header that is not allowed', async () => {
     const s = await start();
@@ -630,6 +672,13 @@ describe('browser origins', () => {
     // Browser origins are still refused.
     expect((await requestAs(s.port, lan, '/healthz', { origin: 'https://evil.example' })).status).toBe(403);
     expect(await upgradeStatus(s.url, { host: lan, origin: 'https://evil.example' })).toBe(403);
+    // Host is unchecked here, so a page on a rebound name that matches its own origin is refused too.
+    const rebound = `rebind.evil.example:${s.port}`;
+    expect((await requestAs(s.port, rebound, '/v1/projects', { origin: `http://${rebound}` })).status).toBe(403);
+    expect(await upgradeStatus(s.url, { host: rebound, origin: `http://${rebound}` })).toBe(403);
+    // The dashboard opened by IP address still reaches the API: an IP can't be rebound.
+    expect((await fetch(`${s.url}/v1/projects`, { headers: { origin: s.url } })).status).toBe(200);
+    expect(await upgradeStatus(s.url, { origin: s.url })).toBe(101);
   });
 
   it('checks Host on a network address once names are given with allowHosts', async () => {
@@ -638,6 +687,10 @@ describe('browser origins', () => {
     expect((await requestAs(s.port, `127.0.0.1:${s.port}`, '/v1/p/demo/status')).status).toBe(200);
     expect((await requestAs(s.port, `rebind.evil.example:${s.port}`, '/v1/p/demo/status')).status).toBe(403);
     expect(await upgradeStatus(s.url, { host: `rebind.evil.example:${s.port}` })).toBe(403);
+    // With Host checked, the dashboard served under an allowed name can call the API.
+    const dashboard = `devbox.lan:${s.port}`;
+    expect((await requestAs(s.port, dashboard, '/v1/projects', { origin: `http://${dashboard}` })).status).toBe(200);
+    expect(await upgradeStatus(s.url, { host: dashboard, origin: `http://${dashboard}` })).toBe(101);
   });
 
   it('rejects an allowlist entry that is not an origin', async () => {

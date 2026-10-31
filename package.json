@@ -16,7 +16,9 @@
     "test": "npm run build && vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p packages/hub --noEmit && tsc -p packages/adapter --noEmit",
-    "demo": "bash scripts/demo.sh"
+    "demo": "bash scripts/demo.sh",
+    "dashboard": "npm run build && node packages/hub/dist/cli.js",
+    "demo:dashboard": "npm run build && node scripts/dashboard-demo.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
